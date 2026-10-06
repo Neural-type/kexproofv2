@@ -1,4 +1,5 @@
 #import "KPRunner.h"
+#import "exploit/kexploit_opa334.h"   // kexploit_restore_krw
 #import "KPLog.h"
 #import "KPDump.h"
 
@@ -464,6 +465,13 @@ static BOOL sHasKRW = NO;
     [log appendFormat:@"[E9 auto] uid сейчас: %d (%s)", getuid(), getuid() == 0 ? "ROOT!" : "не root"];
 
     [log append:@"Этапы 1-3 готовы, KRW жив. Дамп — отдельной кнопкой (дамп пишется инкрементально, паника не сотрёт готовые секции)."];
+    // kexproofv2 2.0.37: восстанавливаем повреждённый icmp6filt-сокет (сам KRW-
+    // примитив) ДО выхода — его teardown при смерти процесса = zfree-паника
+    // (BUG.1, zalloc.c:1308 per-cpu). После restore дамп недостоверен —
+    // для дампа запусти эксплойт заново.
+    kexploit_restore_krw();
+    sHasKRW = NO;
+    [log append:@"[RESTORE] KRW-сокет восстановлен (анти-zfree при выходе). Для дампа — повторный запуск эксплойта."];
     return YES;
 }
 
