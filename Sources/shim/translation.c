@@ -183,22 +183,31 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		struct tt_level *lvlp = &arm_tt_level[curLevel];
 		uint64_t tteIndex = (va & lvlp->indexMask) >> lvlp->shift;
 		uint64_t tteEntry = 0;
+		uint64_t tteSlot = 0;
 		if (physical) {
-			uint64_t tte_pa = tte_ttep + (tteIndex * sizeof(uint64_t));
-			if (kpFrameDeadly(tte_pa)) {   // 1.9.178b: не читаем deadly-таблицу (0x37/0xb — поймано census'ом)
-				kp_lastDeadlyTte = tte_pa;   // 1.9.252: форж прочитает её через DART-копию
+			tteSlot = tte_ttep + (tteIndex * sizeof(uint64_t));
+			if (kpFrameDeadly(tteSlot)) {   // 1.9.178b: не читаем deadly-таблицу (0x37/0xb — поймано census'ом)
+				kp_lastDeadlyTte = tteSlot;   // 1.9.252: форж прочитает её через DART-копию
 				kp_lastDeadlyLvl = (int)curLevel;
 				errno = 1042;
 				return 0;
 			}
-			tteEntry = early_kread64(phystokv(tte_pa));
-			if (leaf_tte_ttep) *leaf_tte_ttep = tte_pa;
+			uint64_t tteKV = phystokv(tteSlot);
+			if (!tteKV) {
+				// 2.0.4: phystokv не дал alias — PA вне карты, не лезем
+				kp_lastDeadlyTte = tteSlot;
+				kp_lastDeadlyLvl = (int)curLevel;
+				errno = 1042;
+				return 0;
+			}
+			tteEntry = early_kread64(tteKV);
+			if (leaf_tte_ttep) *leaf_tte_ttep = tteSlot;
 			if (leaf_level) *leaf_level = curLevel;
 		}
 		else if (gPrimitives.kreadbuf && !physical) {
-			uint64_t tte_va = tte_ttep + (tteIndex * sizeof(uint64_t));
-			tteEntry = early_kread64(tte_va);
-			if (leaf_tte_ttep) *leaf_tte_ttep = tte_va;
+			tteSlot = tte_ttep + (tteIndex * sizeof(uint64_t));
+			tteEntry = early_kread64(tteSlot);
+			if (leaf_tte_ttep) *leaf_tte_ttep = tteSlot;
 			if (leaf_level) *leaf_level = curLevel;
 		}
 		else {
@@ -212,9 +221,27 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 			return 0;
 		}
 
+		// kexproofv2 2.0.4: poison-PTE (0x5a5a… — DART-чтение мимо окна) и
+		// мусорные PA больше не превращаются в walk. Раньше leaf=0x5a5a… давал
+		// PA за пределами DRAM → phystokv+kread → LLC Bus error / aperture
+		// fault (паники 10-05/10-06). Валидируем PA на каждом уровне.
+		if ((tteEntry & 0xFFFFFFFF00000000ULL) == 0x5a5a5a5a00000000ULL ||
+		    tteEntry == 0x5a5a5a5a5a5a5a5aULL) {
+			kp_lastDeadlyTte = tteSlot;
+			kp_lastDeadlyLvl = (int)curLevel;
+			errno = 1042;
+			return 0;
+		}
+
 		if ((tteEntry & lvlp->typeMask) == lvlp->typeBlock) {
 			// Found block mapping, no matter what level we are in, this is the end
-			return ((tteEntry & ARM_TTE_PA_MASK & ~lvlp->offMask) | (va & lvlp->offMask));
+			uint64_t blkPA = ((tteEntry & ARM_TTE_PA_MASK & ~lvlp->offMask) | (va & lvlp->offMask));
+			uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
+			if (pS && (blkPA < pB || blkPA >= pB + pS)) {
+				errno = 1042;
+				return 0;
+			}
+			return blkPA;
 		}
 
 		if (physical) {
@@ -222,6 +249,12 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		}
 		else {
 			tte_ttep = phystokv(tteEntry & ARM_TTE_TABLE_MASK);
+		}
+		// 2.0.4: следующий уровень должен быть валидным PA/VA — иначе walk
+		// уедет в мусор и kread по нему убьёт девайс.
+		if (!tte_ttep) {
+			errno = 1042;
+			return 0;
 		}
 	}
 

