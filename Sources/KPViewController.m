@@ -741,7 +741,7 @@
         NSString *fp = [docs stringByAppendingPathComponent:fn];
         NSDictionary *attrs = [fm attributesOfItemAtPath:fp error:nil];
         if (!attrs) continue;
-        [out appendFormat:@"\n\n========== FILE: %@ (%@ байт, mtime=%@) ==========\n",
+        [out appendFormat:@"\n\n========== FILE: %@ (%llu байт, mtime=%@) ==========\n",
             fn, attrs.fileSize, attrs.fileModificationDate];
         NSString *body = [NSString stringWithContentsOfFile:fp encoding:NSUTF8StringEncoding error:nil];
         if (!body) body = [NSString stringWithContentsOfFile:fp encoding:NSISOLatin1StringEncoding error:nil];
