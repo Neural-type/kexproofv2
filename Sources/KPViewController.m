@@ -235,6 +235,15 @@
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (!self.jobRunning && !KPRunner.hasKRW) {
+            // kexproofv2 2.0.2: страж мёртвого прогона. Флаг ставится при старте
+            // эксплойта и снимается только при дописанном отчёте/успехе. Есть
+            // флаг = прошлый прогон умер (ребут/паника) → НЕ автостартим:
+            // сначала «Поделиться», иначе новый прогон опять собьёт логи.
+            NSString *crashFlag = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-crash.flag"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:crashFlag]) {
+                [[KPLog shared] append:@"[auto] ⚠ прошлый прогон не дописан (флаг kexproof-crash.flag) — сначала прожми «Поделиться отчётом», потом «Эксплойт» вручную. Автостарт пропущен."];
+                return;
+            }
             // 1.9.267: страж того же бута — повторный прогон на загрязнённом
             // драйвере обречён (258/259 и 262c/264 — одинаковый slide в обоих
             // парах). kern.boottime в NSUserDefaults живёт между запусками и
@@ -396,6 +405,9 @@
         self.reportPath = path;
         self.shareButton.enabled = YES;
         self.shareButton.alpha = 1.0;
+        // kexproofv2 2.0.2: отчёт дописан = прогон завершён → флаг снят
+        NSString *crashFlag = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-crash.flag"];
+        [[NSFileManager defaultManager] removeItemAtPath:crashFlag error:nil];
         [[KPLog shared] appendFormat:@"Отчёт записан: %@", path];
     }
     else {
@@ -413,6 +425,14 @@
 // race is a lottery; tapping is not the user's job.
 - (void)exploitTappedWithRetry:(int)attempt {
     if (![self beginJob]) return;
+    // kexproofv2 2.0.2: флаг живого прогона — снимается только при дописанном
+    // отчёте/успехе. Ребут посреди прогона оставляет флаг → следующий запуск
+    // не автостартит и даёт спасти логи.
+    if (attempt == 0) {
+        NSString *crashFlag = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-crash.flag"];
+        [[NSString stringWithFormat:@"started %@ boot-pending\n", [NSDate date]]
+            writeToFile:crashFlag atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
     self.statusLabel.text = attempt
         ? [NSString stringWithFormat:@"Авто-повтор #%d… (гонка идёт)", attempt]
         : @"Выполняется… (эксплойт может идти несколько минут)";
@@ -682,31 +702,65 @@
 }
 
 - (void)shareTapped {
-    NSMutableArray *items = [NSMutableArray array];
-    if (self.reportPath) {
-        [items addObject:[NSURL fileURLWithPath:self.reportPath]];
+    // kexproofv2 2.0.2: ОДИН консолидированный файл на момент тапа. Живой
+    // транскрипт + все дисковые логи (live + все prev-* + stage-файлы) —
+    // ничего не обрезается и не теряется при ротации. Жалоба 2.0.x: «лог
+    // обрезан, части от полного нет» — это был cap транскрипта 192KB и
+    // reportPath от ПРЕДЫДУЩЕГО прогона.
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    df.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *bundleName = [NSString stringWithFormat:@"kexproof-share-%@.txt", [df stringFromDate:[NSDate date]]];
+    NSString *bundlePath = [docs stringByAppendingPathComponent:bundleName];
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendFormat:@"=== KexProofV2 consolidated share @ %@ ===\n", [NSDate date]];
+    [out appendFormat:@"[экранный транскрипт текущей сессии: %lu байт]\n", (unsigned long)[KPLog shared].transcript.length];
+    [out appendString:@"\n----- TRANSCRIPT (in-memory, screen) -----\n"];
+    [out appendString:[KPLog shared].transcript ?: @"(пуст)"];
+    [out appendString:@"\n\n"];
+
+    NSMutableArray<NSString *> *diskFiles = [NSMutableArray array];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    // все prev-ротации (самые свежие первыми) + live + stage-файлы + отчёт
+    NSArray<NSString *> *all = [fm contentsOfDirectoryAtPath:docs error:nil] ?: @[];
+    NSArray<NSString *> *sorted = [all sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+    for (NSString *fn in [sorted reverseObjectEnumerator]) {
+        if ([fn hasPrefix:@"kexproof-prev"] && [fn hasSuffix:@".log"]) [diskFiles addObject:fn];
     }
-    NSString *live = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-live.log"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:live]) {
-        [items addObject:[NSURL fileURLWithPath:live]];
+    [diskFiles addObject:@"kexproof-live.log"];
+    for (NSString *fn in @[ @"kexproof-paswap.txt", @"kexproof-gart.txt", @"kexproof-pac.txt",
+                            @"kexproof-m2teardown.txt", @"kexproof-jpeg.txt", @"kexproof-reachability.txt",
+                            @"kexproof-m2oracle.txt", @"kexproof-dump.txt", @"kexproof-e9.txt" ]) {
+        if (![diskFiles containsObject:fn]) [diskFiles addObject:fn];
     }
-    // 1.2.2: previous session's log (survives reboots via rotation) — the file
-    // that actually matters after a panic.
-    NSString *prev = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-prev.log"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:prev]) {
-        [items addObject:[NSURL fileURLWithPath:prev]];
+    if (self.reportPath.lastPathComponent.length) [diskFiles addObject:self.reportPath.lastPathComponent];
+
+    for (NSString *fn in diskFiles) {
+        NSString *fp = [docs stringByAppendingPathComponent:fn];
+        NSDictionary *attrs = [fm attributesOfItemAtPath:fp error:nil];
+        if (!attrs) continue;
+        [out appendFormat:@"\n\n========== FILE: %@ (%@ байт, mtime=%@) ==========\n",
+            fn, attrs.fileSize, attrs.fileModificationDate];
+        NSString *body = [NSString stringWithContentsOfFile:fp encoding:NSUTF8StringEncoding error:nil];
+        if (!body) body = [NSString stringWithContentsOfFile:fp encoding:NSISOLatin1StringEncoding error:nil];
+        [out appendString:body ?: @"(не прочитался)"];
     }
-    // инкрементальные файлы стадий (переживают панику)
-    for (NSString *fn in @[@"kexproof-gart.txt", @"kexproof-pac.txt", @"kexproof-m2teardown.txt", @"kexproof-jpeg.txt", @"kexproof-reachability.txt", @"kexproof-m2oracle.txt", @"kexproof-paswap.txt"]) {
-        NSString *fp = [NSHomeDirectory() stringByAppendingPathComponent:[@"Documents/" stringByAppendingString:fn]];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:fp]) {
-            [items addObject:[NSURL fileURLWithPath:fp]];
-        }
-    }
-    if (items.count == 0) {
-        self.statusLabel.text = @"Пока нечем делиться (ни отчёта, ни live-лога)";
+
+    NSError *werr = nil;
+    if (![out writeToFile:bundlePath atomically:YES encoding:NSUTF8StringEncoding error:&werr]) {
+        self.statusLabel.text = @"Не удалось собрать бандл — см. журнал";
+        [[KPLog shared] appendFormat:@"[share] ошибка записи бандла: %@", werr];
         return;
     }
+    [[KPLog shared] appendFormat:@"[share] собран консолидированный бандл: %@ (%lu байт) — кидай на PC целиком",
+        bundleName, (unsigned long)out.length];
+    // логи спасены → флаг мёртвого прогона можно снять
+    NSString *crashFlag = [docs stringByAppendingPathComponent:@"kexproof-crash.flag"];
+    [[NSFileManager defaultManager] removeItemAtPath:crashFlag error:nil];
+
+    NSArray *items = @[ [NSURL fileURLWithPath:bundlePath] ];
     UIActivityViewController *activity = [[UIActivityViewController alloc] initWithActivityItems:items applicationActivities:nil];
     activity.popoverPresentationController.sourceView = self.shareButton;
     [self presentViewController:activity animated:YES completion:nil];

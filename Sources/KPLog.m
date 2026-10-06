@@ -30,8 +30,14 @@ static BOOL KPOpenLiveLog(void) {
         return NO;
     }
     if (!gKPRotationDone) {
-        NSString *prevPath = [docs stringByAppendingPathComponent:@"kexproof-prev.log"];
-        // Atomic replacement keeps the old live file intact if rotation fails.
+        // kexproofv2 2.0.2: таймстамп-имя — старый prev НИКОГДА не затирается.
+        // 2.0.0/2.0.1: rename(live, prev) при каждом старте съедал хвост
+        // упавшего прогона, если пользователь не успевал поделиться.
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        df.dateFormat = @"yyyyMMdd-HHmmss";
+        NSString *prevPath = [docs stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"kexproof-prev-%@.log", [df stringFromDate:[NSDate date]]]];
         if (rename(gKPLivePath.fileSystemRepresentation, prevPath.fileSystemRepresentation) != 0 && errno != ENOENT) {
             int error = errno;
             KPReportLogFailure([NSString stringWithFormat:@"rotation: %s", strerror(error)]);
