@@ -9120,12 +9120,12 @@ if (0) {  // 2.0.35: записи в cred-пространство выреза�
                 } else if (!inplRoot && paOK) {
                     kpNote(r, [NSString stringWithFormat:@"  [FORGE] ucred слишком глубоко в странице (uoff=%#x > 0xf40) — нужен src > 4КБ, следующий билд", uoff]);
                 }
+                }
             }
         }
     } else {
         kpNote(r, @"=== контрольная не изменилась — см. выше ===");
     }
-                }
     // 1.9.219: restore DEP-хитов после форжа (яд формы ucredPFN не живёт дальше)
     if (changed) for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // === 1.9.160 фаза 2: DART PTE patch с живым mapping (раунд 36) ===
