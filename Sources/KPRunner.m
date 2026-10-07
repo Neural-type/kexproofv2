@@ -84,7 +84,7 @@ static void kpAppendCapturedLine(NSData *chunk)
     NSString *line = [[NSString alloc] initWithData:chunk encoding:NSUTF8StringEncoding];
     if (!line) line = [[NSString alloc] initWithData:chunk encoding:NSISOLatin1StringEncoding];
     // Ignore any legacy NSLog stderr echoes, including an unterminated tail.
-    if (line.length && [line rangeOfString:@"KexProofV2["].location == NSNotFound) {
+    if (line.length && [line rangeOfString:@"KexProof["].location == NSNotFound) {
         [[KPLog shared] append:line];
     }
 }
@@ -353,7 +353,7 @@ static BOOL sHasKRW = NO;
 
     struct utsname u;
     uname(&u);
-    [log appendFormat:@"=== KexProofV2 %@ — %s, Darwin %s ===",
+    [log appendFormat:@"=== KexProof %@ — %s, Darwin %s ===",
         [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"], u.machine, u.release];
     [log appendFormat:@"iOS %@", [UIDevice currentDevice].systemVersion];
 

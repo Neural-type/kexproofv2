@@ -59,12 +59,10 @@ int kpFrameTypeOf(uint64_t pa)
 int kpFrameDeadly(uint64_t pa)
 {
 	int t = kpFrameTypeOf(pa);
-	// 1.9.227: + 0x15 и 0x18 — census поймал их последними перед смертью.
-	// 2.0.21: 0x15 СНЯТ с deadly — это тип L3-таблиц (tte=0x1000c0dbf90 и т.п.,
-	// PA 140-200MB, ВНЕ мины 8-108MB). Гейт не давал walker'у прочитать L3 →
-	// pagePA=0. Aperture-чтения 0x18/0xb/0x37 на похожих PA уже выживали
-	// (T18-DUMP, сканы). 0x37/0xb/0x18 остаются — исторические.
-	return t == 0x37 || t == 0xb || t == 0x18;
+	// 1.9.227: + 0x15 и 0x18 — census поймал их последними перед смертью
+	// (1.9.226, pid 549: walker/kpSafeToRead читает табличную страницу этих
+	// типов — PPL-read-защита, та же семья что 0xb). Возвращаем errno, не смерть.
+	return t == 0x37 || t == 0xb || t == 0x15 || t == 0x18;
 }
 
 // 1.9.252: адрес и уровень последней deadly-таблицы, на которой walker встал.
@@ -185,31 +183,22 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		struct tt_level *lvlp = &arm_tt_level[curLevel];
 		uint64_t tteIndex = (va & lvlp->indexMask) >> lvlp->shift;
 		uint64_t tteEntry = 0;
-		uint64_t tteSlot = 0;
 		if (physical) {
-			tteSlot = tte_ttep + (tteIndex * sizeof(uint64_t));
-			if (kpFrameDeadly(tteSlot)) {   // 1.9.178b: не читаем deadly-таблицу (0x37/0xb — поймано census'ом)
-				kp_lastDeadlyTte = tteSlot;   // 1.9.252: форж прочитает её через DART-копию
+			uint64_t tte_pa = tte_ttep + (tteIndex * sizeof(uint64_t));
+			if (kpFrameDeadly(tte_pa)) {   // 1.9.178b: не читаем deadly-таблицу (0x37/0xb — поймано census'ом)
+				kp_lastDeadlyTte = tte_pa;   // 1.9.252: форж прочитает её через DART-копию
 				kp_lastDeadlyLvl = (int)curLevel;
 				errno = 1042;
 				return 0;
 			}
-			uint64_t tteKV = phystokv(tteSlot);
-			if (!tteKV) {
-				// 2.0.4: phystokv не дал alias — PA вне карты, не лезем
-				kp_lastDeadlyTte = tteSlot;
-				kp_lastDeadlyLvl = (int)curLevel;
-				errno = 1042;
-				return 0;
-			}
-			tteEntry = early_kread64(tteKV);
-			if (leaf_tte_ttep) *leaf_tte_ttep = tteSlot;
+			tteEntry = early_kread64(phystokv(tte_pa));
+			if (leaf_tte_ttep) *leaf_tte_ttep = tte_pa;
 			if (leaf_level) *leaf_level = curLevel;
 		}
 		else if (gPrimitives.kreadbuf && !physical) {
-			tteSlot = tte_ttep + (tteIndex * sizeof(uint64_t));
-			tteEntry = early_kread64(tteSlot);
-			if (leaf_tte_ttep) *leaf_tte_ttep = tteSlot;
+			uint64_t tte_va = tte_ttep + (tteIndex * sizeof(uint64_t));
+			tteEntry = early_kread64(tte_va);
+			if (leaf_tte_ttep) *leaf_tte_ttep = tte_va;
 			if (leaf_level) *leaf_level = curLevel;
 		}
 		else {
@@ -223,27 +212,9 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 			return 0;
 		}
 
-		// kexproofv2 2.0.4: poison-PTE (0x5a5a… — DART-чтение мимо окна) и
-		// мусорные PA больше не превращаются в walk. Раньше leaf=0x5a5a… давал
-		// PA за пределами DRAM → phystokv+kread → LLC Bus error / aperture
-		// fault (паники 10-05/10-06). Валидируем PA на каждом уровне.
-		if ((tteEntry & 0xFFFFFFFF00000000ULL) == 0x5a5a5a5a00000000ULL ||
-		    tteEntry == 0x5a5a5a5a5a5a5a5aULL) {
-			kp_lastDeadlyTte = tteSlot;
-			kp_lastDeadlyLvl = (int)curLevel;
-			errno = 1042;
-			return 0;
-		}
-
 		if ((tteEntry & lvlp->typeMask) == lvlp->typeBlock) {
 			// Found block mapping, no matter what level we are in, this is the end
-			uint64_t blkPA = ((tteEntry & ARM_TTE_PA_MASK & ~lvlp->offMask) | (va & lvlp->offMask));
-			uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
-			if (pS && (blkPA < pB || blkPA >= pB + pS)) {
-				errno = 1042;
-				return 0;
-			}
-			return blkPA;
+			return ((tteEntry & ARM_TTE_PA_MASK & ~lvlp->offMask) | (va & lvlp->offMask));
 		}
 
 		if (physical) {
@@ -251,12 +222,6 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 		}
 		else {
 			tte_ttep = phystokv(tteEntry & ARM_TTE_TABLE_MASK);
-		}
-		// 2.0.4: следующий уровень должен быть валидным PA/VA — иначе walk
-		// уедет в мусор и kread по нему убьёт девайс.
-		if (!tte_ttep) {
-			errno = 1042;
-			return 0;
 		}
 	}
 
