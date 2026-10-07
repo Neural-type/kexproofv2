@@ -3102,18 +3102,19 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     // ---- 2.0.91: N1 count-only + kernel_task PAC keys (read-only) ----
     [r appendString:@"=== KCALL-BOOT 2.0.91 ===\n"];
     {
-        // 1) FTE histogram + 0x1a count (БЕЗ чтения контента 0x1a)
+        // 2.0.92: гистограмму урезали (500k kread не успевала). Только 4000 кадров + 0x1a count.
         uint64_t wB = kconstant(physBase), wS = kconstant(physSize);
         uint32_t hist[64]; memset(hist, 0, sizeof(hist));
-        uint32_t n1a = 0;
-        for (uint64_t pa = wB; pa < wB + wS; pa += 0x4000) {
+        uint32_t n1a = 0, nSc = 0;
+        for (uint64_t pa = wB; pa < wB + wS && nSc < 4000; pa += 0x4000) {
             int t = kpFrameTypeOf(pa);
+            nSc++;
             if (t >= 0 && t < 64) { hist[t]++; if (t == 0x1a) n1a++; }
         }
         NSMutableString *hs = [NSMutableString string];
         for (int i = 0; i < 64; i++) if (hist[i]) [hs appendFormat:@" 0x%x=%u", i, hist[i]];
-        kpNote(r, [NSString stringWithFormat:@"  [BOOT] FTE histogram:%@", hs]);
-        kpNote(r, [NSString stringWithFormat:@"  [BOOT] type-0x1a count=%u (контент НЕ читали)", n1a]);
+        kpNote(r, [NSString stringWithFormat:@"  [BOOT] FTE sample=%u:%@", nSc, hs]);
+        kpNote(r, [NSString stringWithFormat:@"  [BOOT] type-0x1a count=%u (в выборке)", n1a]);
 
         // 2) kernel_task (pid=1) → thread → PAC keys (rop_pid/jop_pid)
         uint64_t ldProc = [self findSelfProcByPidFast:1 log:nil];
