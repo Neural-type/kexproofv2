@@ -360,9 +360,9 @@
         NSString *report = [KPDump fgAttackReport];
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:report];
-            BOOL win = [report containsString:@"ROOT-FS WIN"] || [report containsString:@"ROOT (filesystem) WIN"];
-            [[KPLog shared] appendFormat:win ? @"[RESULT] АТАКА: УСПЕШЕН ★★" : @"[RESULT] АТАКА: FAIL — см. [FGATTACK] строки выше"];
-            self.statusLabel.text = win ? @"АТАКА УСПЕШНА — root (filesystem)" : @"Атака не прошла — см. лог";
+            BOOL win = [report containsString:@"ROOT-FS WIN"] || [report containsString:@"ROOT (filesystem) WIN"] || [report containsString:@"SOCKET-ROOT WIN"];
+            [[KPLog shared] appendFormat:win ? @"[RESULT] АТАКА: УСПЕШЕН ★★" : @"[RESULT] АТАКА: FAIL — см. [ATK] step7/step10 (PA/type)"];
+            self.statusLabel.text = win ? @"АТАКА УСПЕШНА — root" : @"Атака не прошла — см. лог";
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });

