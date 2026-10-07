@@ -248,12 +248,23 @@ uint64_t vtophys_lvl(uint64_t tte_ttep, uint64_t va, uint64_t *leaf_level, uint6
 
 		if (physical) {
 			tte_ttep = tteEntry & ARM_TTE_TABLE_MASK;
+			// 2.0.44: спуск ТОЛЬКО на PA внутри DRAM — мусорный ненулевой
+			// указатель на следующую таблицу давал kread по мусорному kVA
+			// и мгновенный ребут (апертура-фолт).
+			uint64_t pB2 = kconstant(physBase), pS2 = kconstant(physSize);
+			if (pS2 && (tte_ttep < pB2 || tte_ttep >= pB2 + pS2)) {
+				errno = 1042;
+				return 0;
+			}
 		}
 		else {
-			tte_ttep = phystokv(tteEntry & ARM_TTE_TABLE_MASK);
+			uint64_t nextTbl = tteEntry & ARM_TTE_TABLE_MASK;
+			tte_ttep = phystokv(nextTbl);
+			if (tte_ttep && ((tte_ttep & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL)) {
+				errno = 1042;
+				return 0;
+			}
 		}
-		// 2.0.4: следующий уровень должен быть валидным PA/VA — иначе walk
-		// уедет в мусор и kread по нему убьёт девайс.
 		if (!tte_ttep) {
 			errno = 1042;
 			return 0;

