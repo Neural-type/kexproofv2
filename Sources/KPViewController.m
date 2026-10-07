@@ -10,6 +10,7 @@
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *exploitButton;
 @property (nonatomic, strong) UIButton *attackButton;
+@property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UIButton *dumpButton;
 @property (nonatomic, strong) UIButton *sptmButton;
 @property (nonatomic, strong) UIButton *sptmTableButton;
@@ -77,6 +78,12 @@
                                    color:[UIColor colorWithRed:0.65 green:0.20 blue:0.20 alpha:1.0]];
     [self.attackButton addTarget:self action:@selector(attackTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    self.shareButton = [self makeButton:@"Поделиться логом"
+                                  color:[UIColor colorWithRed:0.25 green:0.35 blue:0.60 alpha:1.0]];
+    [self.shareButton addTarget:self action:@selector(shareTapped) forControlEvents:UIControlEventTouchUpInside];
+    self.shareButton.enabled = YES;
+    self.shareButton.alpha = 1.0;
+
 
     [self updateExperimentButtons];
 
@@ -86,6 +93,7 @@
     [self.view addSubview:self.logView];
     [self.view addSubview:self.exploitButton];
     [self.view addSubview:self.attackButton];
+    [self.view addSubview:self.shareButton];
 
     UILayoutGuide *safe = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -114,7 +122,12 @@
         [self.attackButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.attackButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.attackButton.heightAnchor constraintEqualToConstant:46],
-        [self.attackButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
+        [self.attackButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-8],
+
+        [self.shareButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.shareButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.shareButton.heightAnchor constraintEqualToConstant:40],
+        [self.shareButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
     ]];
 
     __weak typeof(self) weakSelf = self;

