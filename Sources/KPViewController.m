@@ -10,7 +10,6 @@
 @property (nonatomic, strong) UITextView *logView;
 @property (nonatomic, strong) UIButton *exploitButton;
 @property (nonatomic, strong) UIButton *attackButton;
-@property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UIButton *dumpButton;
 @property (nonatomic, strong) UIButton *sptmButton;
 @property (nonatomic, strong) UIButton *sptmTableButton;
