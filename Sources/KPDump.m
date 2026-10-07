@@ -2675,6 +2675,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 }
             }
             // ищем, кто держит указатель на firstHitVA (только 0x21 кадры)
+            uint64_t gW501RefVA = 0;
             {
                 uint64_t wB2 = kconstant(physBase), wS2 = kconstant(physSize);
                 uint32_t refHits = 0;
@@ -2686,6 +2687,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                         uint64_t q = kp_untag_ptr(early_kread64(al + o));
                         if (q == firstHitVA) {
                             refHits++;
+                            if (!gW501RefVA) gW501RefVA = al + o;
                             kpNote(r, [NSString stringWithFormat:@"  [W501] REF ★ %#llx+%#x → table",
                                       (unsigned long long)(al + o), o]);
                         }
