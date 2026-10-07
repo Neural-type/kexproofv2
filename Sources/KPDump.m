@@ -2684,8 +2684,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 for (uint64_t pa = wB2; pa < wB2 + wS2 && refHits < 8; pa += 0x4000) {
                     int t = kpFrameTypeOf(pa);
                     if (t != 0x21 && t != 0x0b) continue;
-                    if (t == 0x21) { frames21++; if (frames21 > 800) continue; }
-                    else { framesB++; if (framesB > 200) continue; }
+                    if (t == 0x21) { frames21++; if (frames21 > 25000) continue; }
+                    else { framesB++; if (framesB > 400) continue; }
                     uint64_t al = phystokv(pa);
                     if (!al) continue;
                     for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
