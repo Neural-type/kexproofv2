@@ -282,6 +282,21 @@
 }
 
 - (void)exploitTapped {
+    // kexproofv2 2.0.45: гвард свежего бута — вернулся после удаления автостарта.
+    // Гонка pe_v1 валит девайс на загрязнённом драйвере (паники 07:06 и др.:
+    // смерть посреди 'pe_v1 spray/race'). Оригинальный ритуал: ребут между
+    // попытками. Без гварда кнопка позволяла жать на том же буте.
+    struct timeval bt = {0}; size_t bsz = sizeof(bt);
+    long curBoot = 0;
+    if (sysctlbyname("kern.boottime", &bt, &bsz, NULL, 0) == 0) curBoot = bt.tv_sec;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    long lastBoot = [ud integerForKey:@"kexLastBoot"];
+    if (curBoot && lastBoot && curBoot == lastBoot) {
+        [[KPLog shared] append:@"[RESULT] ЭКСПЛОЙТ: SKIP — ТОТ ЖЕ БУТ, драйвер загрязнён прошлым прогоном. РЕБУТНИ телефон и запусти снова."];
+        self.statusLabel.text = @"Нужен ребут телефона перед следующей попыткой";
+        return;
+    }
+    if (curBoot) [ud setInteger:curBoot forKey:@"kexLastBoot"];
     [self exploitTappedWithRetry:0];
 }
 
