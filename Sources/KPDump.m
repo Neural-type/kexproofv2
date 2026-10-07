@@ -2674,26 +2674,34 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     kpNote(r, [NSString stringWithFormat:@"  [W501] back+(-10)=%#llx :%@", (unsigned long long)back, bd]);
                 }
             }
-            // ищем, кто держит указатель на firstHitVA (только 0x21 кадры)
+            // ищем, кто держит указатель на таблицу (0x21 + 0x0b, несколько адресов)
             uint64_t gW501RefVA = 0;
             {
                 uint64_t wB2 = kconstant(physBase), wS2 = kconstant(physSize);
-                uint32_t refHits = 0;
+                uint64_t cands[4] = { firstHitVA, firstHitVA - 0x18, firstHitVA - 0x20, firstHitVA - firstHitOff };
+                const char *candNm[4] = { "hit", "hit-18", "hit-20", "page0" };
+                uint32_t refHits = 0, frames21 = 0, framesB = 0;
                 for (uint64_t pa = wB2; pa < wB2 + wS2 && refHits < 8; pa += 0x4000) {
-                    if (kpFrameTypeOf(pa) != 0x21) continue;
+                    int t = kpFrameTypeOf(pa);
+                    if (t != 0x21 && t != 0x0b) continue;
+                    if (t == 0x21) { frames21++; if (frames21 > 800) continue; }
+                    else { framesB++; if (framesB > 200) continue; }
                     uint64_t al = phystokv(pa);
                     if (!al) continue;
                     for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
                         uint64_t q = kp_untag_ptr(early_kread64(al + o));
-                        if (q == firstHitVA) {
-                            refHits++;
-                            if (!gW501RefVA) gW501RefVA = al + o;
-                            kpNote(r, [NSString stringWithFormat:@"  [W501] REF ★ %#llx+%#x → table",
-                                      (unsigned long long)(al + o), o]);
+                        for (int c = 0; c < 4; c++) {
+                            if (q == cands[c] && cands[c]) {
+                                refHits++;
+                                if (!gW501RefVA) gW501RefVA = al + o;
+                                kpNote(r, [NSString stringWithFormat:@"  [W501] REF ★ %#llx+%#x → %s (%#llx) t=%d",
+                                          (unsigned long long)(al + o), o, candNm[c], (unsigned long long)q, t]);
+                            }
                         }
                     }
                 }
-                kpNote(r, [NSString stringWithFormat:@"  [W501] refs=%u", refHits]);
+                kpNote(r, [NSString stringWithFormat:@"  [W501] refs=%u (scanned21=%u scannedB=%u)",
+                          refHits, frames21, framesB]);
             }
             // 2.0.66: дамп владельца ссылки + его соседей (кто держит таблицу)
             {
