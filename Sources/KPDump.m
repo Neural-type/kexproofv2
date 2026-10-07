@@ -3129,8 +3129,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 int guardCnt = 0;
                 while (kpLooksLikeKernelPointer(e) && guardCnt++ < 3) {
                     uint64_t th = e - off_thread_task_threads_next;
-                    uint64_t rop = off_thread_machine_rop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid)) : 0;
-                    uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
+                    if (!kpLooksLikeKernelPointer(th)) { kpNote(r, @"  [BOOT] bad kthread — skip"); break; }
+                    uint64_t rop = 0, jop = 0;
+                    if (off_thread_machine_rop_pid && kpLooksLikeKernelPointer(th + off_thread_machine_rop_pid))
+                        rop = kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid));
+                    if (off_thread_machine_jop_pid && kpLooksLikeKernelPointer(th + off_thread_machine_jop_pid))
+                        jop = kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid));
                     kpNote(r, [NSString stringWithFormat:@"  [BOOT] kthread=%#llx rop_pid=%#llx jop_pid=%#llx",
                               (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
                     e = kp_untag_ptr(early_kread64(e));
@@ -3148,10 +3152,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 uint64_t e = kp_untag_ptr(early_kread64(taskVA + off_task_threads_next));
                 if (kpLooksLikeKernelPointer(e)) {
                     uint64_t th = e - off_thread_task_threads_next;
-                    uint64_t rop = kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid));
-                    uint64_t jop = kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid));
-                    kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfThread=%#llx rop_pid=%#llx jop_pid=%#llx",
-                              (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
+                    if (kpLooksLikeKernelPointer(th)) {
+                        uint64_t rop = off_thread_machine_rop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid)) : 0;
+                        uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
+                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfThread=%#llx rop_pid=%#llx jop_pid=%#llx",
+                                  (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
+                    }
                 }
             }
         }
