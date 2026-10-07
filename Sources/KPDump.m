@@ -2972,7 +2972,13 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             ttM2 = pm2 ? kp_untag_ptr(early_kread64(kp_untag_ptr(pm2) + koffsetof(pmap, ttep))) : 0;
                             uint64_t spc2 = tk2 ? early_kread64(kp_untag_ptr(tk2) + off_task_itk_space) : 0;
                             uint64_t tb2 = spc2 ? early_kread64(kp_untag_ptr(spc2) + off_ipc_space_is_table) : 0;
-                            if (tb2) isTable2 = kp_untag_ptr(tb2);
+                            if (tb2) {
+                                isTable2 = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                                          ? kp_untag_ptr(kpSMRDecode(tb2)) : kp_untag_ptr(tb2);
+                                kpNote(r, [NSString stringWithFormat:@"  [PTE] is_table raw=%#llx → %#llx (smr_base=%llu t1sz=%llu)",
+                                          (unsigned long long)tb2, (unsigned long long)isTable2,
+                                          (unsigned long long)smr_base, (unsigned long long)t1sz_boot]);
+                            }
                             kpNote(r, [NSString stringWithFormat:@"  [PTE] dma-ctx ttM=%#llx isTable=%#llx",
                                       (unsigned long long)ttM2, (unsigned long long)isTable2]);
                         }
