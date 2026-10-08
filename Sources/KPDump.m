@@ -2464,11 +2464,9 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                             kpNote(r, [NSString stringWithFormat:@"  [KCALL] task_set_exc_ports kr=0x%x", epr]);
                                         }
                                         if (epr != KERN_SUCCESS) {
-                                            kpNote(r, @"  [KCALL] exception port FAIL — не resume, иначе процесс умрёт");
-                                            early_kwrite64(oVA, o0);
+                                            kpNote(r, @"  [KCALL] exception port FAIL — skip resume");
                                             mach_port_deallocate(mach_task_self(), excport);
-                                            goto kcall_done;
-                                        }
+                                        } else {
                                         uint64_t oVA = hK + 0xC0;
                                         uint64_t o0 = early_kread64(oVA);
                                         early_kwrite64(oVA, o0 | 0x8000ULL);
@@ -2518,10 +2516,10 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         early_kwrite64(oVA, o0);
                                         thread_terminate(hp);
                                         mach_port_deallocate(mach_task_self(), excport);
+                                        }
                                     }
                                 }
                             }
-                            kcall_done: ;
                                                     }
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
                         NSMutableString *tdd = [NSMutableString string];
