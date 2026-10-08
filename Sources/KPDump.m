@@ -2365,7 +2365,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             uint64_t tbT = spT ? early_kread64(kp_untag_ptr(spT) + off_ipc_space_is_table) : 0;
                             if (tbT) isT = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
                                          ? kp_untag_ptr(kpSMRDecode(tbT)) : kp_untag_ptr(tbT);
-                            kpNote(r, [NSString stringWithFormat:@"  [BOOT] port=0x%x isTable=%#llx", myPort, (unsigned long long)isT]);
+                            kpNote(r, [NSString stringWithFormat:@"  [BOOT] isTable=%#llx", (unsigned long long)isT]);
                             uint64_t thK = 0;
                             if (isT && tkr == KERN_SUCCESS && threads && tcount > 0) {
                                 // берём первый thread-порт и резолвим через isTable
@@ -2415,8 +2415,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 }
                                 kpNote(r, [NSString stringWithFormat:@"  [BOOT] offsets:%@", found]);
                             }
-                            mach_port_deallocate(mach_task_self(), myPort);
-                        }
+                                                    }
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
                         NSMutableString *tdd = [NSMutableString string];
                         for (uint32_t o = 0; o < 0x200; o += 8) {
