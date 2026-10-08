@@ -2436,11 +2436,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 // файловый лог — переживает crash
                                 NSString *kfPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
                                 [@"=== KCALL START ===\n" writeToFile:kfPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                                                                // thread_create → свежий порт (гарантированно валидный)
+                                                                // используем thK из BOOT (УЖЕ валидирован через tro→task)
                                 mach_port_t hp = MACH_PORT_NULL;
-                                kern_return_t ckr = thread_create(mach_task_self(), &hp);
-                                uint64_t hK = 0;
-                                { NSString *s = [NSString stringWithFormat:@"thread_create kr=0x%x port=0x%x\n", ckr, hp]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                uint64_t hK = thK;   // берём готовый thread*
+                                // порт: threads[0] (первый из task_threads)
+                                if (threads && tcount > 0) hp = threads[0];
+                                { NSString *s = [NSString stringWithFormat:@"use BOOT thK=%#llx port=0x%x\n", (unsigned long long)hK, hp]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                 // fallback: mach_thread_self() — ПРОВЕРЕННЫЙ путь (2.0.105/108)
                                 mach_port_t selfPort = mach_thread_self();
                                 uint64_t sva = isT + (uint64_t)sizeof_ipc_entry * (selfPort >> 8);
