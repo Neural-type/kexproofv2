@@ -2337,7 +2337,9 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         // 2.0.96: наш поток — PAC keys (это они нужны для PACIBSP/RETAB)
         {
             uint64_t taskVA = 0;
-            uint64_t pr2 = early_kread64(selfProc + koffsetof(proc, proc_ro));
+            uint64_t myProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:nil];
+            if (!kpLooksLikeKernelPointer(myProc)) myProc = [self findSelfProcByPidFast:1 log:nil];
+            uint64_t pr2 = myProc ? early_kread64(myProc + koffsetof(proc, proc_ro)) : 0;
             if (kpLooksLikeKernelPointer(pr2))
                 taskVA = kp_untag_ptr(early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task));
             if (kpLooksLikeKernelPointer(taskVA)) {
