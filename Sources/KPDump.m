@@ -2427,6 +2427,10 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             // natural_t state: x[29]*2, fp*2, lr*2, sp*2, pc*2, cpsr, pad = 68 u32
                             // pc@state+64*4=0x100, lr@0xf0, sp@0xf8, cpsr@0x108
                             if (thK && tkr == KERN_SUCCESS && threads && tcount > 1) {
+                                // файловый лог — переживает crash
+                                NSString *kfPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
+                                [@"=== KCALL START ===\n" writeToFile:kfPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                                #define KCLOG(s) do { NSString *l = [NSString stringWithFormat:@"%s\n", s];                                     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath];                                     if (fh) { [fh seekToEndOfFile]; [fh writeData:[l dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }                                     kpNote(r, [NSString stringWithFormat:@"  [KCALL] %s", s]); } while(0)
                                 mach_port_t hp = threads[1];
                                 uint64_t hK = 0;
                                 uint64_t heVA = isT + (uint64_t)sizeof_ipc_entry * (hp >> 8);
@@ -2442,22 +2446,22 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         }
                                     }
                                 }
-                                kpNote(r, [NSString stringWithFormat:@"  [KCALL] helper port=0x%x thread*=%#llx", hp, (unsigned long long)hK]);
+                                KCLOG([[NSString stringWithFormat:@"helper port=0x%x thread*=%#llx", hp, (unsigned long long)hK] UTF8String]);
                                 if (hK) {
                                     uint64_t kstack = kp_untag_ptr(early_kread64(hK + 0xe8));
                                     uint64_t spin = 0;
                                     uint64_t kb2 = kconstant(base);
                                     for (uint64_t a = kb2; a < kb2 + 0x200000 && !spin; a += 4)
                                         if ((uint32_t)early_kread64(a) == 0x14000000) spin = a;
-                                    kpNote(r, [NSString stringWithFormat:@"  [KCALL] kstack=%#llx spin=%#llx", (unsigned long long)kstack, (unsigned long long)spin]);
+                                    KCLOG([[NSString stringWithFormat:@"kstack=%#llx spin=%#llx", (unsigned long long)kstack, (unsigned long long)spin] UTF8String]);
                                     mach_port_t excport = MACH_PORT_NULL;
                                     mach_port_options_t popts = { .flags = MPO_INSERT_SEND_RIGHT | 0x8000, .mpl = { .mpl_qlimit = 5 } };
                                     kern_return_t ekr = mach_port_construct(mach_task_self(), &popts, 0, &excport);
-                                    kpNote(r, [NSString stringWithFormat:@"  [KCALL] excport kr=0x%x", ekr]);
+                                    KCLOG([[NSString stringWithFormat:@"excport kr=0x%x", ekr] UTF8String]);
                                     if (ekr == KERN_SUCCESS && excport && spin && kstack) {
                                         // EXCEPTION_STATE + проверка kr
                                         kern_return_t epr = thread_set_exception_ports(hp, EXC_MASK_ALL, excport, EXCEPTION_STATE, ARM_THREAD_STATE64);
-                                        kpNote(r, [NSString stringWithFormat:@"  [KCALL] set_exc_ports kr=0x%x", epr]);
+                                        KCLOG([[NSString stringWithFormat:@"set_exc_ports kr=0x%x", epr] UTF8String]);
                                         if (epr != KERN_SUCCESS) {
                                             // fallback: task-level
                                             epr = task_set_exception_ports(mach_task_self(), EXC_MASK_ALL, excport, EXCEPTION_STATE, ARM_THREAD_STATE64);
@@ -2476,13 +2480,13 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         st.__opaque_pc = (void *)(uintptr_t)0x301;
                                         st.__opaque_lr = (void *)(uintptr_t)0x401;
                                         kern_return_t ssr = thread_set_state(hp, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
-                                        kpNote(r, [NSString stringWithFormat:@"  [KCALL] set_state FAKE_PC kr=0x%x — resume", ssr]);
+                                        KCLOG([[NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x — resume", ssr] UTF8String]);
                                         thread_resume(hp);
                                         // Request: 2406, до 0x40+68*4 = 0x150 байт достаточно
                                         uint8_t req[0x200]; memset(req, 0, sizeof(req));
                                         mach_msg_header_t *rh = (mach_msg_header_t *)req;
                                         kern_return_t wkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 0x200, excport, 500, MACH_PORT_NULL);
-                                        kpNote(r, [NSString stringWithFormat:@"  [KCALL] recv kr=0x%x id=%u size=%u", wkr, rh->msgh_id, rh->msgh_size]);
+                                        KCLOG([[NSString stringWithFormat:@"recv kr=0x%x id=%u size=%u", wkr, rh->msgh_id, rh->msgh_size] UTF8String]);
                                         if (wkr == KERN_SUCCESS && rh->msgh_id == 2406) {
                                             // Reply 2506
                                             uint8_t rep[0x200]; memset(rep, 0, sizeof(rep));
