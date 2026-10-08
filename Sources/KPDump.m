@@ -2360,6 +2360,23 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 [tdd appendFormat:@" +%x:%#018llx", o, (unsigned long long)q];
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread-dump (kptrs):%@", tdd]);
+                        // 2.0.98: kcall step 1 — TH_IN_MACH_EXCEPTION (0x8000) в options (+0xC0)
+                        // Сначала read/сравнение, потом write-test с restore.
+                        {
+                            uint64_t optsVA = th + 0xC0;
+                            uint64_t opts0 = early_kread64(optsVA);
+                            kpNote(r, [NSString stringWithFormat:@"  [KCALL1] options@+c0=%#018llx", (unsigned long long)opts0]);
+                            uint64_t newOpts = opts0 | 0x8000ULL;
+                            early_kwrite64(optsVA, newOpts);
+                            uint64_t opts1 = early_kread64(optsVA);
+                            kpNote(r, [NSString stringWithFormat:@"  [KCALL1] set TH_IN_MACH_EXCEPTION readback=%#018llx → %@",
+                                      (unsigned long long)opts1,
+                                      (opts1 & 0x8000ULL) ? @"FLAG ПОСТАВЛЕН ★★" : @"не село"]);
+                            // restore
+                            early_kwrite64(optsVA, opts0);
+                            uint64_t opts2 = early_kread64(optsVA);
+                            kpNote(r, [NSString stringWithFormat:@"  [KCALL1] restored=%#018llx", (unsigned long long)opts2]);
+                        }
                     }
                 }
             }
