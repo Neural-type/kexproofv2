@@ -2457,6 +2457,15 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         }
                                     }
                                 }
+                                // дамп sie+0x00..0x60 — смотрим что внутри ipc_port
+                                {
+                                    NSMutableString *dd = [NSMutableString string];
+                                    for (uint32_t o = 0; o < 0x60; o += 8) {
+                                        uint64_t q = kp_untag_ptr(early_kread64(sie + o));
+                                        [dd appendFormat:@" +%x:%#llx", o, (unsigned long long)q];
+                                    }
+                                    { NSString *s = [NSString stringWithFormat:@"ie_obj dump:%@\n", dd]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                }
                                 { NSString *s = [NSString stringWithFormat:@"selfPort thread*=%#llx (via mach_thread_self)\n", (unsigned long long)hK]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                 // если selfPort нашёл thread*, используем его
                                 if (hK) hp = selfPort;
