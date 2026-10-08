@@ -2378,14 +2378,20 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     for (uint32_t ko = 0x18; ko <= 0x50; ko += 8) {
                                         uint64_t cand = kp_untag_ptr(early_kread64(ieObj + ko));
                                         if (!kpLooksLikeKernelPointer(cand)) continue;
-                                        // валидация: в thread* есть наш task
-                                        for (uint32_t o = 0; o < 0x400; o += 8) {
-                                            if (kp_untag_ptr(early_kread64(cand + o)) == tkT) {
-                                                thK = cand;
-                                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] ★ thread*=%#llx via port kobj+%x field+%x (has TASK)",
-                                                          (unsigned long long)cand, ko, o]);
-                                                break;
+                                        // валидация: thread* → tro → tro_task == task
+                                        for (uint32_t o = 0; o < 0x480; o += 8) {
+                                            uint64_t troC = kp_untag_ptr(early_kread64(cand + o));
+                                            if (!kpLooksLikeKernelPointer(troC)) continue;
+                                            // ищем task внутри tro
+                                            for (uint32_t o2 = 0; o2 < 0x80; o2 += 8) {
+                                                if (kp_untag_ptr(early_kread64(troC + o2)) == tkT) {
+                                                    thK = cand;
+                                                    kpNote(r, [NSString stringWithFormat:@"  [BOOT] ★ thread*=%#llx kobj+%x tro@+x%x tro+0x%x=TASK",
+                                                              (unsigned long long)cand, ko, o, o2]);
+                                                    break;
+                                                }
                                             }
+                                            if (thK) break;
                                         }
                                         if (thK) break;
                                     }
