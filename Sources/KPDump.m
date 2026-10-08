@@ -2350,9 +2350,16 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     if (kpLooksLikeKernelPointer(th)) {
                         uint64_t rop = off_thread_machine_rop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid)) : 0;
                         uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
-                        uint64_t kstack = kp_untag_ptr(early_kread64(th + 0x140)); // machine.kstackptr
-                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfTh=%#llx rop=%#llx jop=%#llx kstack=%#llx",
-                                  (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop, (unsigned long long)kstack]);
+                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfTh=%#llx rop=%#llx jop=%#llx",
+                                  (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
+                        // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
+                        NSMutableString *tdd = [NSMutableString string];
+                        for (uint32_t o = 0; o < 0x200; o += 8) {
+                            uint64_t q = early_kread64(th + o);
+                            if (kpLooksLikeKernelPointer(q) || q == 0x14000000ULL)
+                                [tdd appendFormat:@" +%x:%#018llx", o, (unsigned long long)q];
+                        }
+                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread-dump (kptrs):%@", tdd]);
                     }
                 }
             }
