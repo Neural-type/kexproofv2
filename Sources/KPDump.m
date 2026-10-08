@@ -2381,16 +2381,25 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 }
                             }
                             if (thK) {
-                                uint64_t kstack = kp_untag_ptr(early_kread64(thK + 0x148));
-                                uint64_t opts = early_kread64(thK + 0xC0);
-                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] kstack@148=%#llx opts@c0=%#llx",
-                                          (unsigned long long)kstack, (unsigned long long)opts]);
-                                NSMutableString *td = [NSMutableString string];
-                                for (uint32_t o = 0; o < 0x200; o += 8) {
-                                    uint64_t q = early_kread64(thK + o);
-                                    if (kpLooksLikeKernelPointer(q)) [td appendFormat:@" +%x:%#018llx", o, (unsigned long long)q];
+                                // 2.0.106: offset-finder — ищем в thread* известные указатели
+                                uint64_t myProc = prT;
+                                uint64_t myTask = tkT;
+                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] known: proc=%#llx task=%#llx",
+                                          (unsigned long long)myProc, (unsigned long long)myTask]);
+                                NSMutableString *found = [NSMutableString string];
+                                for (uint32_t o = 0; o < 0x500; o += 8) {
+                                    uint64_t q = kp_untag_ptr(early_kread64(thK + o));
+                                    if (!q) continue;
+                                    if (q == myProc) [found appendFormat:@" +x%x=PROC", o];
+                                    else if (q == myTask) [found appendFormat:@" +x%x=TASK", o];
+                                    else if (q == thK) [found appendFormat:@" +x%x=SELF", o];
+                                    else if (kpLooksLikeKernelPointer(q)) {
+                                        // может быть thread_ro, stack и т.д. — логируем первые 20
+                                        int nk = 0;
+                                        if (nk++ < 20) [found appendFormat:@" +x%x:%#llx", o, (unsigned long long)q];
+                                    }
                                 }
-                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread-dump:%@", td]);
+                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] offsets:%@", found]);
                             }
                             mach_port_deallocate(mach_task_self(), myPort);
                         }
