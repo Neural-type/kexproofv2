@@ -2350,8 +2350,17 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                     if (kpLooksLikeKernelPointer(th)) {
                         uint64_t rop = off_thread_machine_rop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid)) : 0;
                         uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
-                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfTh=%#llx rop=%#llx jop=%#llx",
-                                  (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
+                        // 2.0.104: точные offset'ы A17 iOS18: kstack=0x148 rop=0x1b8 jop=0x1c0
+                        uint64_t kstack = kp_untag_ptr(early_kread64(th + 0x148));
+                        uint64_t rop2 = kp_untag_ptr(early_kread64(th + 0x1b8));
+                        uint64_t jop2 = kp_untag_ptr(early_kread64(th + 0x1c0));
+                        uint64_t opts2 = early_kread64(th + 0xC0);
+                        uint64_t opts3 = early_kread64(th + 0x180);
+                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfTh=%#llx kstack@148=%#llx rop@1b8=%#llx jop@1c0=%#llx",
+                                  (unsigned long long)th, (unsigned long long)kstack,
+                                  (unsigned long long)rop2, (unsigned long long)jop2]);
+                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] opts@c0=%#llx opts@180=%#llx",
+                                  (unsigned long long)opts2, (unsigned long long)opts3]);
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
                         NSMutableString *tdd = [NSMutableString string];
                         for (uint32_t o = 0; o < 0x200; o += 8) {
