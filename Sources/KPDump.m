@@ -2367,6 +2367,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                          ? kp_untag_ptr(kpSMRDecode(tbT)) : kp_untag_ptr(tbT);
                             kpNote(r, [NSString stringWithFormat:@"  [BOOT] isTable=%#llx", (unsigned long long)isT]);
                             uint64_t thK = 0;
+                            mach_port_t savedThPort = MACH_PORT_NULL;
                             if (isT && tkr == KERN_SUCCESS && threads && tcount > 0) {
                                 // берём первый thread-порт и резолвим через isTable
                                 mach_port_t tp = threads[0];
@@ -2396,6 +2397,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         if (thK) break;
                                     }
                                 }
+                                // сохраняем порт ДО deallocate
+                                if (tcount > 0 && threads) savedThPort = threads[0];
                                 for (mach_msg_type_number_t i = 0; i < tcount; i++)
                                     mach_port_deallocate(mach_task_self(), threads[i]);
                                 vm_deallocate(mach_task_self(), (vm_address_t)threads, tcount * sizeof(mach_port_t));
@@ -2440,7 +2443,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 mach_port_t hp = MACH_PORT_NULL;
                                 uint64_t hK = thK;   // берём готовый thread*
                                 // порт: threads[0] (первый из task_threads)
-                                if (threads && tcount > 0) hp = threads[0];
+                                hp = savedThPort;
                                 { NSString *s = [NSString stringWithFormat:@"use BOOT thK=%#llx port=0x%x\n", (unsigned long long)hK, hp]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                 // hK = thK из BOOT, hp = threads[0]. НЕ перезаписываем hp!
                                 { NSString *s = [NSString stringWithFormat:@"helper port=0x%x thread*=%#llx nports=%u\n", hp, (unsigned long long)hK, tcount]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
