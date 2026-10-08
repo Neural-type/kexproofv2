@@ -2436,22 +2436,23 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 // файловый лог — переживает crash
                                 NSString *kfPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
                                 [@"=== KCALL START ===\n" writeToFile:kfPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                                                                // перебираем ВСЕ thread-порты, берём первый с валидным thread*
+                                                                // thread_create → свежий порт (гарантированно валидный)
                                 mach_port_t hp = MACH_PORT_NULL;
+                                kern_return_t ckr = thread_create(mach_task_self(), &hp);
                                 uint64_t hK = 0;
-                                for (mach_msg_type_number_t ti = 0; ti < tcount && !hK; ti++) {
-                                    mach_port_t tp = threads[ti];
-                                    if (tp < 0x100) continue;
-                                    uint64_t heVA = isT + (uint64_t)sizeof_ipc_entry * (tp >> 8);
+                                { NSString *s = [NSString stringWithFormat:@"thread_create kr=0x%x port=0x%x\n", ckr, hp]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                if (ckr == KERN_SUCCESS && hp) {
+                                    uint64_t heVA = isT + (uint64_t)sizeof_ipc_entry * (hp >> 8);
                                     uint64_t hie = kp_untag_ptr(early_kread64(heVA + off_ipc_entry_ie_object));
-                                    if (!kpLooksLikeKernelPointer(hie)) continue;
-                                    for (uint32_t ko = 0x18; ko <= 0x50 && !hK; ko += 8) {
-                                        uint64_t cand = kp_untag_ptr(early_kread64(hie + ko));
-                                        if (!kpLooksLikeKernelPointer(cand)) continue;
-                                        for (uint32_t o = 0; o < 0x480; o += 8) {
-                                            uint64_t troC = kp_untag_ptr(early_kread64(cand + o));
-                                            if (kpLooksLikeKernelPointer(troC) &&
-                                                kp_untag_ptr(early_kread64(troC + 0x48)) == tkT) { hK = cand; hp = tp; break; }
+                                    if (kpLooksLikeKernelPointer(hie)) {
+                                        for (uint32_t ko = 0x18; ko <= 0x50 && !hK; ko += 8) {
+                                            uint64_t cand = kp_untag_ptr(early_kread64(hie + ko));
+                                            if (!kpLooksLikeKernelPointer(cand)) continue;
+                                            for (uint32_t o = 0; o < 0x480; o += 8) {
+                                                uint64_t troC = kp_untag_ptr(early_kread64(cand + o));
+                                                if (kpLooksLikeKernelPointer(troC) &&
+                                                    kp_untag_ptr(early_kread64(troC + 0x48)) == tkT) { hK = cand; break; }
+                                            }
                                         }
                                     }
                                 }
