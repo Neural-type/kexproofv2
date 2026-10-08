@@ -2426,6 +2426,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             // Reply   (2506): Head@0 NDR@18 Ret@20 flavor@24 newCnt@28 state@2c
                             // natural_t state: x[29]*2, fp*2, lr*2, sp*2, pc*2, cpsr, pad = 68 u32
                             // pc@state+64*4=0x100, lr@0xf0, sp@0xf8, cpsr@0x108
+                            {
+                                NSString *kfPath2 = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
+                                NSString *pre = [NSString stringWithFormat:@"pre-check thK=%#llx tkr=%d threads=%p tcount=%u\n", (unsigned long long)thK, tkr, threads, tcount];
+                                [pre writeToFile:kfPath2 atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                                kpNote(r, [NSString stringWithFormat:@"  [KCALL] pre-check thK=%#llx tkr=%d tcount=%u", (unsigned long long)thK, tkr, tcount]);
+                            }
                             if (thK && tkr == KERN_SUCCESS && threads && tcount > 1) {
                                 // файловый лог — переживает crash
                                 NSString *kfPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
