@@ -2360,22 +2360,26 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 [tdd appendFormat:@" +%x:%#018llx", o, (unsigned long long)q];
                         }
                         kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread-dump (kptrs):%@", tdd]);
-                        // 2.0.98: kcall step 1 — TH_IN_MACH_EXCEPTION (0x8000) в options (+0xC0)
-                        // Сначала read/сравнение, потом write-test с restore.
+                        // 2.0.99: ищем настоящий options (маленькое число, не указатель)
                         {
-                            uint64_t optsVA = th + 0xC0;
+                            // 2.0.97 dump: +180 = 0xffffffff00000030 — похоже на флаги
+                            uint32_t cand[4] = { 0x180, 0x178, 0x188, 0xC0 };
+                            for (int ci = 0; ci < 4; ci++) {
+                                uint64_t va = th + cand[ci];
+                                uint64_t v = early_kread64(va);
+                                kpNote(r, [NSString stringWithFormat:@"  [KCALL2] +%x=%#018llx", cand[ci], (unsigned long long)v]);
+                            }
+                            // write-test на +0x180: OR 0x8000, readback, restore
+                            uint64_t optsVA = th + 0x180;
                             uint64_t opts0 = early_kread64(optsVA);
-                            kpNote(r, [NSString stringWithFormat:@"  [KCALL1] options@+c0=%#018llx", (unsigned long long)opts0]);
-                            uint64_t newOpts = opts0 | 0x8000ULL;
+                            uint64_t newOpts = (opts0 & 0xffffffffULL) | 0x8000ULL;
+                            if ((opts0 >> 32) != 0xffffffffULL) newOpts = opts0 | 0x8000ULL;
                             early_kwrite64(optsVA, newOpts);
                             uint64_t opts1 = early_kread64(optsVA);
-                            kpNote(r, [NSString stringWithFormat:@"  [KCALL1] set TH_IN_MACH_EXCEPTION readback=%#018llx → %@",
-                                      (unsigned long long)opts1,
-                                      (opts1 & 0x8000ULL) ? @"FLAG ПОСТАВЛЕН ★★" : @"не село"]);
-                            // restore
+                            kpNote(r, [NSString stringWithFormat:@"  [KCALL2] +180 write-test %#llx→%#llx %@",
+                                      (unsigned long long)opts0, (unsigned long long)opts1,
+                                      opts1 != opts0 ? @"ИЗМЕНИЛОСЬ ★★" : @"без изменений"]);
                             early_kwrite64(optsVA, opts0);
-                            uint64_t opts2 = early_kread64(optsVA);
-                            kpNote(r, [NSString stringWithFormat:@"  [KCALL1] restored=%#018llx", (unsigned long long)opts2]);
                         }
                     }
                 }
