@@ -2442,34 +2442,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 // порт: threads[0] (первый из task_threads)
                                 if (threads && tcount > 0) hp = threads[0];
                                 { NSString *s = [NSString stringWithFormat:@"use BOOT thK=%#llx port=0x%x\n", (unsigned long long)hK, hp]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                // fallback: mach_thread_self() — ПРОВЕРЕННЫЙ путь (2.0.105/108)
-                                mach_port_t selfPort = mach_thread_self();
-                                uint64_t sva = isT + (uint64_t)sizeof_ipc_entry * (selfPort >> 8);
-                                uint64_t sie = kp_untag_ptr(early_kread64(sva + off_ipc_entry_ie_object));
-                                { NSString *s = [NSString stringWithFormat:@"selfPort=0x%x svа=%#llx sie=%#llx\n", selfPort, (unsigned long long)sva, (unsigned long long)sie]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                if (kpLooksLikeKernelPointer(sie)) {
-                                    for (uint32_t ko = 0x18; ko <= 0x50 && !hK; ko += 8) {
-                                        uint64_t cand = kp_untag_ptr(early_kread64(sie + ko));
-                                        if (!kpLooksLikeKernelPointer(cand)) continue;
-                                        for (uint32_t o = 0; o < 0x480; o += 8) {
-                                            uint64_t troC = kp_untag_ptr(early_kread64(cand + o));
-                                            if (kpLooksLikeKernelPointer(troC) &&
-                                                kp_untag_ptr(early_kread64(troC + 0x48)) == tkT) { hK = cand; break; }
-                                        }
-                                    }
-                                }
-                                // дамп sie+0x00..0x60 — смотрим что внутри ipc_port
-                                {
-                                    NSMutableString *dd = [NSMutableString string];
-                                    for (uint32_t o = 0; o < 0x60; o += 8) {
-                                        uint64_t q = kp_untag_ptr(early_kread64(sie + o));
-                                        [dd appendFormat:@" +%x:%#llx", o, (unsigned long long)q];
-                                    }
-                                    { NSString *s = [NSString stringWithFormat:@"ie_obj dump:%@\n", dd]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                }
-                                { NSString *s = [NSString stringWithFormat:@"selfPort thread*=%#llx (via mach_thread_self)\n", (unsigned long long)hK]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                // если selfPort нашёл thread*, используем его
-                                if (hK) hp = selfPort;
+                                // hK = thK из BOOT, hp = threads[0]. НЕ перезаписываем hp!
                                 { NSString *s = [NSString stringWithFormat:@"helper port=0x%x thread*=%#llx nports=%u\n", hp, (unsigned long long)hK, tcount]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                 if (hK) {
                                     uint64_t kstack = kp_untag_ptr(early_kread64(hK + 0xe8));
