@@ -2451,21 +2451,18 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     uint64_t kstack = kp_untag_ptr(early_kread64(hK + 0xe8));
                                     uint64_t spin = 0;
                                     uint64_t kb2 = kconstant(base);
-                                    // 2.0.128: логируем base + пробуем известный offset 0x15242e8
-                                    uint64_t known = kb2 + 0x15242e8;
-                                    uint64_t kv = early_kread64(known);
-                                    { NSString *s = [NSString stringWithFormat:@"kb2=%#llx known=%#llx val=%#llx\n", (unsigned long long)kb2, (unsigned long long)known, (unsigned long long)kv]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                    if ((uint32_t)kv == 0x14000000) spin = known;
-                                    else if ((uint32_t)(kv >> 32) == 0x14000000) spin = known + 4;
-                                    // fallback: быстрый поиск окна 0x1500000..0x1550000
-                                    if (!spin) {
-                                        for (uint64_t a = kb2 + 0x1500000; a < kb2 + 0x1550000 && !spin; a += 8) {
-                                            uint64_t q = early_kread64(a);
-                                            if ((uint32_t)q == 0x14000000) { spin = a; break; }
-                                            if ((uint32_t)(q >> 32) == 0x14000000) { spin = a + 4; break; }
+                                    // 2.0.129: сканируем base..base+2MB, логируем ПЕРВЫЕ 8 хитов 0x14000000
+                                    int nHit = 0;
+                                    for (uint64_t a = kb2; a < kb2 + 0x200000 && nHit < 8; a += 8) {
+                                        uint64_t q = early_kread64(a);
+                                        if ((uint32_t)q == 0x14000000 && !spin) { spin = a; nHit++;
+                                            { NSString *s = [NSString stringWithFormat:@"hit32 lo @%#llx\n", (unsigned long long)a]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                        }
+                                        if ((uint32_t)(q >> 32) == 0x14000000 && !spin) { spin = a + 4; nHit++;
+                                            { NSString *s = [NSString stringWithFormat:@"hit32 hi @%#llx\n", (unsigned long long)(a+4)]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                         }
                                     }
-                                    { NSString *s = [NSString stringWithFormat:@"spin=%#llx\n", (unsigned long long)spin]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                    { NSString *s = [NSString stringWithFormat:@"spin=%#llx hits=%d kb2=%#llx\n", (unsigned long long)spin, nHit, (unsigned long long)kb2]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                     { NSString *s = [NSString stringWithFormat:@"kstack=%#llx spin=%#llx\n", (unsigned long long)kstack, (unsigned long long)spin]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                     mach_port_t excport = MACH_PORT_NULL;
                                     mach_port_options_t popts = { .flags = MPO_INSERT_SEND_RIGHT | 0x8000, .mpl = { .mpl_qlimit = 5 } };
