@@ -72,7 +72,16 @@
                                     color:[UIColor colorWithRed:0.20 green:0.55 blue:0.35 alpha:1.0]];
     [self.exploitButton addTarget:self action:@selector(exploitTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    // kexproofv2 2.0.42: ровно две кнопки — Эксплойт и Атака. Всё лишнее убрано.
+    // 2.0.142: E11 primary (proc_ro-swap) + DMA/T18 gated. Audit: methods existed
+    // without UI buttons — wire them here.
+    self.e11Button = [self makeButton:@"E11 root (proc_ro-swap)"
+                                color:[UIColor colorWithRed:0.20 green:0.45 blue:0.55 alpha:1.0]];
+    [self.e11Button addTarget:self action:@selector(e11Tapped) forControlEvents:UIControlEventTouchUpInside];
+
+    self.dmaButton = [self makeButton:@"T18 / DMA (paswap)"
+                               color:[UIColor colorWithRed:0.45 green:0.30 blue:0.55 alpha:1.0]];
+    [self.dmaButton addTarget:self action:@selector(dmaTapped) forControlEvents:UIControlEventTouchUpInside];
+
     self.attackButton = [self makeButton:@"Атака (f_cred → root)"
                                    color:[UIColor colorWithRed:0.65 green:0.20 blue:0.20 alpha:1.0]];
     [self.attackButton addTarget:self action:@selector(attackTapped) forControlEvents:UIControlEventTouchUpInside];
@@ -91,6 +100,8 @@
     [self.view addSubview:self.statusLabel];
     [self.view addSubview:self.logView];
     [self.view addSubview:self.exploitButton];
+    [self.view addSubview:self.e11Button];
+    [self.view addSubview:self.dmaButton];
     [self.view addSubview:self.attackButton];
     [self.view addSubview:self.shareButton];
 
@@ -116,7 +127,17 @@
         [self.exploitButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.exploitButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.exploitButton.heightAnchor constraintEqualToConstant:46],
-        [self.exploitButton.bottomAnchor constraintEqualToAnchor:self.attackButton.topAnchor constant:-8],
+        [self.exploitButton.bottomAnchor constraintEqualToAnchor:self.e11Button.topAnchor constant:-8],
+
+        [self.e11Button.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.e11Button.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.e11Button.heightAnchor constraintEqualToConstant:46],
+        [self.e11Button.bottomAnchor constraintEqualToAnchor:self.dmaButton.topAnchor constant:-8],
+
+        [self.dmaButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.dmaButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.dmaButton.heightAnchor constraintEqualToConstant:46],
+        [self.dmaButton.bottomAnchor constraintEqualToAnchor:self.attackButton.topAnchor constant:-8],
 
         [self.attackButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.attackButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
@@ -170,6 +191,7 @@
 - (void)updateExperimentButtons {
     BOOL krw = KPRunner.hasKRW && !self.jobRunning;
     [self setExperimentButton:self.exploitButton enabled:!self.jobRunning && !KPRunner.hasKRW];
+    [self setExperimentButton:self.e11Button enabled:krw];
     [self setExperimentButton:self.dumpButton enabled:krw];
     [self setExperimentButton:self.physmapButton enabled:krw];
     [self setExperimentButton:self.geoButton enabled:!self.jobRunning];
@@ -178,6 +200,7 @@
     [self setExperimentButton:self.jpegButton enabled:krw];
     [self setExperimentButton:self.m2oButton enabled:krw];
     [self setExperimentButton:self.dmaButton enabled:krw];
+    [self setExperimentButton:self.attackButton enabled:krw];
 }
 
 - (void)appendLogText:(NSString *)text {
