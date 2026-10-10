@@ -103,6 +103,11 @@ NS_ASSUME_NONNULL_BEGIN
 // underflow = panic.
 + (NSString *)procRoSwapReport;
 
+// C3: alt-PTE hunt for our ucred page (read-only). Scans heap/PT frames for
+// translation entries whose output address matches ucred's PA, marks DART
+// window (physBase+1GB). No kernel writes.
++ (NSString *)c3AltPteReport;
+
 // PHYSMAP-WRITE: пишется ли userland-страница через physmap kernel VA —
 // ключевой тест для подмены данных процессов (камера/сенсоры/геолокация/
 // Ghost). Своя wired-страница (posix_memalign + mlock), маркеры 0xAA…/0xBB…
