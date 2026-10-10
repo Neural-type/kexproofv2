@@ -2424,13 +2424,12 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             // ---- KCALL 2.0.137: clean exception-pipeline test ----
                             {
                                 NSString *kfP = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
-                                NSString *klog(NSString *m) {
+                                void (^klog)(NSString *) = ^(NSString *m) {
                                     NSString *sl = [m stringByAppendingString:@"\n"];
                                     NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP];
                                     if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
                                     kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", m]);
-                                    return m;
-                                }
+                                };
                                 mach_port_t hp = MACH_PORT_NULL;
                                 kern_return_t ckr = thread_create(mach_task_self(), &hp);
                                 klog([NSString stringWithFormat:@"thread_create kr=0x%x port=0x%x", ckr, hp]);
