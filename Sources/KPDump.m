@@ -4444,6 +4444,11 @@ e10fail:
 
     // Предфильтр записи (дисциплина EXP-09): цель — наш proc (proc-зона) —
     // обязана быть heap-типа. proc_ro (RO-зона) НЕ пишется — тип только в лог.
+    if (!gFrameTableVA) {
+        // 2.0.145: field log — E11 died fail-closed with empty oracle while
+        // frame table is resolvable via XPF (kread-only).
+        (void)[self frameTableVAWithLog:r];
+    }
     if (gFrameTableVA) {
         int tProc = -1, tRo = -1;
         uint64_t fpa = kvtophys(selfProc);

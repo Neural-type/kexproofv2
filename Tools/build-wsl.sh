@@ -8,7 +8,7 @@ KP_PROJECT_DIR="$(cd -- "${KP_SCRIPT_DIR}/.." && pwd -P)"
 KP_BUILD_DIR="$(mktemp -d /tmp/KexProofV2-build.XXXXXX)"
 KP_IPA_DIR="$(mktemp -d /tmp/KexProofV2-ipa.XXXXXX)"
 KP_OUTPUT_DIR="${KP_PROJECT_DIR}/packages"
-KP_PACKAGE_VERSION="2.0.144"
+KP_PACKAGE_VERSION="2.0.145"
 KP_PACKAGE_NAME="com.stealth.kexproofv2_${KP_PACKAGE_VERSION}_iphoneos-arm64.deb"
 KP_IPA_NAME="KexProofV2-${KP_PACKAGE_VERSION}.ipa"
 
