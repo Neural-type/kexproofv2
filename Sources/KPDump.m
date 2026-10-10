@@ -45,7 +45,8 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 
 #import "exploit/kexploit_opa334.h" // darksword_*_socket_pcb() (corrupted inpcb VAs) for the zone route
 #import "exploit/kutils.h"          // proc_self() — direct own-proc VA, no allproc walk
-#import "exploit/offsets.h"         // off_proc_ro_pr_task / off_task_map
+#import "exploit/offsets.h"
+#import "TaskRop/pac.h"         // off_proc_ro_pr_task / off_task_map
 
 static BOOL kpLooksLikeKernelPointer(uint64_t v)
 {
