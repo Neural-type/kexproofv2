@@ -2370,7 +2370,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                             mach_port_t savedThPort = MACH_PORT_NULL;
                             if (isT && tkr == KERN_SUCCESS && threads && tcount > 0) {
                                 // берём первый thread-порт и резолвим через isTable
-                                mach_port_t tp = threads[0];
+                                mach_port_t tp = (tcount > 1) ? threads[1] : threads[0];  // НЕ главный поток
                                 uint64_t eVA = isT + (uint64_t)sizeof_ipc_entry * (tp >> 8);
                                 uint64_t ieObj = kp_untag_ptr(early_kread64(eVA + off_ipc_entry_ie_object));
                                 kpNote(r, [NSString stringWithFormat:@"  [BOOT] thread port=0x%x ie_object=%#llx", tp, (unsigned long long)ieObj]);
