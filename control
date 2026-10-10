@@ -1,8 +1,8 @@
 Package: com.stealth.kexproofv2
 Name: KexProofV2
-Description: KexProofV2 — root chain over ClearSword KRW: INPL in-place ucred DMA patch + SCAN-Z2 physmap scan (kexproofv2 2.0.1).
+Description: KexProofV2 — root chain over ClearSword KRW: E11 proc_ro-swap primary + T18 FTE-gated aperture + SCAN-Z2 (kexproofv2 2.0.142).
 Maintainer: YellU
 Author: YellU
 Section: Utilities
 Architecture: iphoneos-arm64
-Version: 2.0.140
+Version: 2.0.142
