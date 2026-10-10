@@ -2485,9 +2485,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
 ", rh->msgh_id, rh->msgh_size]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] exc dump: hdr_id=%u hdr_size=%u", rh->msgh_id, rh->msgh_size]); };
                                             // threadState в raise_state request: @0x40 (после Head+NDR+exc+codeCnt+code[2]+flavor+oldCnt)
                                             uint64_t *st64 = (uint64_t *)(req + 0x40);
-                                            KLOG([NSString stringWithFormat:@"state: x0=%#llx pc=%#llx lr=%#llx sp=%#llx",
-                                                  (unsigned long long)st64[0], (unsigned long long)st64[32],
-                                                  (unsigned long long)st64[30], (unsigned long long)st64[31]]);
+                                            { NSString *sl = [NSString stringWithFormat:@"state: x0=%#llx pc=%#llx lr=%#llx sp=%#llx\n", (unsigned long long)st64[0], (unsigned long long)st64[32], (unsigned long long)st64[30], (unsigned long long)st64[31]]; NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:kfP]; if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", sl]); }
                                         }
                                         // cleanup
                                         early_kwrite64(oVA, o0);
