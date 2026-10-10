@@ -621,15 +621,16 @@
 }
 
 - (void)dmaTapped {
-    [self runDiagnosticWithStatus:@"DMA physwrite: поиск surface → подмена PA → scaler submit…" work:^NSDictionary *{
-        return @{@"report": [KPDump iosurfacePaSwapReport]};
+    // 2.0.144: full iosurfacePaSwapReport is will-panic (field reboots).
+    // Safe root path = E11 only. DMA lab not wired to UI.
+    [self runDiagnosticWithStatus:@"E11 (safe) — DMA lab off" work:^NSDictionary *{
+        return @{@"report": [KPDump procRoSwapReport]};
     } completion:^(NSDictionary *result) {
             NSString *report = result[@"report"];
-            BOOL win = [report containsString:@"PHYSWRITE DMA CONFIRMED"];
-            self.statusLabel.text = win ? @"DMA PHYSWRITE CONFIRMED — защищённые страницы следующие"
-                                        : @"DMA physwrite завершён — см. лог";
+            BOOL pass = [report containsString:@"E11 PASS"];
+            self.statusLabel.text = pass ? @"E11 PASS — см. лог" : @"E11 завершён — см. лог";
             [self appendLogText:report];
-            [self saveExperimentReport:report fileName:@"kexproof-paswap.txt"];
+            [self saveExperimentReport:report fileName:@"kexproof-e11.txt"];
     }];
 }
 
