@@ -2443,11 +2443,13 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     kern_return_t ekr = mach_port_construct(mach_task_self(), &popts, 0, &excport);
                                     klog([NSString stringWithFormat:@"excport kr=0x%x", ekr]);
                                     if (ekr == KERN_SUCCESS && excport) {
-                                        thread_set_exception_ports(hp, EXC_MASK_ALL, excport, EXCEPTION_STATE, ARM_THREAD_STATE64);
+                                        { kern_return_t epr = thread_set_exception_ports(hp, EXC_MASK_ALL, excport, EXCEPTION_STATE, ARM_THREAD_STATE64);
+                                          klog([NSString stringWithFormat:@"set_exc_ports kr=0x%x", epr]); }
                                         arm_thread_state64_t st;
                                         memset(&st, 0, sizeof(st));
                                         st.__opaque_pc = (void *)(uintptr_t)0x301;
                                         st.__opaque_lr = (void *)(uintptr_t)0x401;
+                                        klog(@"calling set_state...");
                                         kern_return_t ssr = thread_set_state(hp, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
                                         klog([NSString stringWithFormat:@"set_state FAKE_PC kr=0x%x resume", ssr]);
                                         thread_resume(hp);
