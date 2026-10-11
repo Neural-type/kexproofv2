@@ -19,7 +19,7 @@ mach_port_t kp_createexcport(void)
 bool kp_waitexc(mach_port_t excport, kp_excmsg *excbuf, int timeout)
 {
     kern_return_t kr = mach_msg(&excbuf->Head, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
-                                KP_EXC_MSG_SIZE, excport, timeout, MACH_PORT_NULL);
+                                0x400, excport, timeout, MACH_PORT_NULL);
     return (kr == KERN_SUCCESS);
 }
 
