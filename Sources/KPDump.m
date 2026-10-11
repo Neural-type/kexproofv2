@@ -3661,6 +3661,7 @@ static void *kpKcParkWorker(void *arg)
     extern bool kp_threadsetstate(mach_port_t, uint64_t, kp_arm_thread_state64_internal *);
     extern mach_port_t kp_createexcport(void);
     extern bool kp_waitexc(mach_port_t, kp_excmsg *, int);
+    extern bool kp_statereply(kp_excmsg *, kp_arm_thread_state64_internal *);
     extern uint64_t thread_get_kstackptr(uint64_t);
 
     uint64_t target = ksymbol(mach_kobj_count);
