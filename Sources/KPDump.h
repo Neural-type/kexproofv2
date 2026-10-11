@@ -108,6 +108,10 @@ NS_ASSUME_NONNULL_BEGIN
 // window (physBase+1GB). No kernel writes.
 + (NSString *)c3AltPteReport;
 
+// C3 write: remap ucred OA via DART-side alt-PTE (type 0x0b/0x15) to a
+// sacrificial heap page with uid=0, then restore. May reboot — one boot.
++ (NSString *)c3AltPteWriteReport;
+
 // PHYSMAP-WRITE: пишется ли userland-страница через physmap kernel VA —
 // ключевой тест для подмены данных процессов (камера/сенсоры/геолокация/
 // Ghost). Своя wired-страница (posix_memalign + mlock), маркеры 0xAA…/0xBB…

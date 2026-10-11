@@ -78,8 +78,8 @@
                                 color:[UIColor colorWithRed:0.20 green:0.45 blue:0.55 alpha:1.0]];
     [self.e11Button addTarget:self action:@selector(e11Tapped) forControlEvents:UIControlEventTouchUpInside];
 
-    self.dmaButton = [self makeButton:@"C3 alt-PTE hunt (read-only)"
-                               color:[UIColor colorWithRed:0.45 green:0.30 blue:0.55 alpha:1.0]];
+    self.dmaButton = [self makeButton:@"C3-WRITE (DART alt-PTE)"
+                               color:[UIColor colorWithRed:0.55 green:0.25 blue:0.35 alpha:1.0]];
     [self.dmaButton addTarget:self action:@selector(dmaTapped) forControlEvents:UIControlEventTouchUpInside];
 
     self.attackButton = [self makeButton:@"Атака (f_cred → root)"
@@ -621,15 +621,16 @@
 }
 
 - (void)dmaTapped {
-    // 2.0.153: C3 alt-PTE hunt (read-only). E11 p_proc_ro swap is dead (field).
-    [self runDiagnosticWithStatus:@"C3: alt-PTE hunt (read-only)…" work:^NSDictionary *{
-        return @{@"report": [KPDump c3AltPteReport]};
+    // 2.0.154: C3-WRITE — DART alt-PTE remap to sacrificial uid=0 page.
+    // Field: may reboot. Read-only hunt is c3AltPteReport if this dies.
+    [self runDiagnosticWithStatus:@"C3-WRITE: DART alt-PTE remap…" work:^NSDictionary *{
+        return @{@"report": [KPDump c3AltPteWriteReport]};
     } completion:^(NSDictionary *result) {
             NSString *report = result[@"report"];
-            BOOL hit = [report containsString:@"ALT-PTE"] && [report containsString:@"inDART=1"];
-            self.statusLabel.text = hit ? @"C3: есть alt-PTE в DART!" : @"C3 завершён — см. лог";
+            BOOL win = [report containsString:@"P1"] && [report containsString:@"GETUID=0"];
+            self.statusLabel.text = win ? @"C3-WRITE P1!" : @"C3-WRITE завершён — см. лог";
             [self appendLogText:report];
-            [self saveExperimentReport:report fileName:@"kexproof-c3.txt"];
+            [self saveExperimentReport:report fileName:@"kexproof-c3write.txt"];
     }];
 }
 

