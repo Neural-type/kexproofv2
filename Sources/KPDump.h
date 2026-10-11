@@ -112,6 +112,11 @@ NS_ASSUME_NONNULL_BEGIN
 // sacrificial heap page with uid=0, then restore. May reboot — one boot.
 + (NSString *)c3AltPteWriteReport;
 
+// Kcall test: TH_IN_MACH_EXCEPTION + raw PC (TaskRop). Calls mach_kobj_count
+// on a dedicated parked thread. READ-ONLY from our side. May reboot if
+// thread_set_state/PC path is wrong — one boot.
++ (NSString *)kcallTestReport;
+
 // PHYSMAP-WRITE: пишется ли userland-страница через physmap kernel VA —
 // ключевой тест для подмены данных процессов (камера/сенсоры/геолокация/
 // Ghost). Своя wired-страница (posix_memalign + mlock), маркеры 0xAA…/0xBB…

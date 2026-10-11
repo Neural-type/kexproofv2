@@ -74,7 +74,7 @@
 
     // 2.0.142: E11 primary (proc_ro-swap) + DMA/T18 gated. Audit: methods existed
     // without UI buttons — wire them here.
-    self.e11Button = [self makeButton:@"E11 root (proc_ro-swap)"
+    self.e11Button = [self makeButton:@"KCALL test (mach_kobj_count)"
                                 color:[UIColor colorWithRed:0.20 green:0.45 blue:0.55 alpha:1.0]];
     [self.e11Button addTarget:self action:@selector(e11Tapped) forControlEvents:UIControlEventTouchUpInside];
 
@@ -507,15 +507,15 @@
 
 // E11: только по кнопке, тот же гейт hasKRW внутри runDiagnosticWithStatus.
 - (void)e11Tapped {
-    [self runDiagnosticWithStatus:@"E11: proc_ro-swap…" work:^NSDictionary *{
-        return @{@"report": [KPDump procRoSwapReport]};
+    // 2.0.158: E11 swap is dead (field). Button = kcall test.
+    [self runDiagnosticWithStatus:@"KCALL test: TH_IN_MACH_EXCEPTION…" work:^NSDictionary *{
+        return @{@"report": [KPDump kcallTestReport]};
     } completion:^(NSDictionary *result) {
             NSString *report = result[@"report"];
-            BOOL pass = [report containsString:@"E11 PASS"];
-            self.statusLabel.text = pass ? @"E11 PASS: root + unsandbox — см. лог"
-                                         : @"E11 завершён — см. лог";
+            BOOL pass = [report containsString:@"KCALL VALID"];
+            self.statusLabel.text = pass ? @"KCALL VALID ★★" : @"KCALL test — см. лог";
             [self appendLogText:report];
-            [self saveExperimentReport:report fileName:@"kexproof-e11.txt"];
+            [self saveExperimentReport:report fileName:@"kexproof-kcall.txt"];
     }];
 }
 
