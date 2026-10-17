@@ -2,6 +2,7 @@
 #import "KPLog.h"
 #import "KPRunner.h"
 #import "KPDump.h"
+#import "KPMapScope.h"
 
 #import <unistd.h>
 #import <sys/sysctl.h>
@@ -436,13 +437,18 @@
         // Refresh the main dump too: it now embeds the fixed allproc (EXP-01)
         // and the harvested SPTM/TXM bases (EXP-02).
         NSString *dump = [KPDump buildReport];
-        return @{@"survey": survey, @"dump": dump};
+        // R5e: scope recon for the retype path (read-only).
+        NSString *scope = [KPMapScope kernelPmapScopeReport];
+        return @{@"survey": survey, @"dump": dump, @"scope": scope};
     } completion:^(NSDictionary *result) {
             NSString *survey = result[@"survey"];
             NSString *dump = result[@"dump"];
+            NSString *scope = result[@"scope"];
             self.statusLabel.text = @"E1–E3 завершены — см. лог";
             [self appendLogText:survey];
+            if (scope.length) [self appendLogText:scope];
             [self saveExperimentReport:survey fileName:@"kexproof-e1e3-survey.txt"];
+            if (scope.length) [self saveExperimentReport:scope fileName:@"kexproof-r5e-scope.txt"];
             NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
             NSError *error = nil;
             if (![dump writeToFile:[docs stringByAppendingPathComponent:@"kexproof-dump.txt"]
@@ -450,6 +456,18 @@
                 self.statusLabel.text = @"Не удалось сохранить дамп — см. журнал";
                 [[KPLog shared] appendFormat:@"Ошибка сохранения дампа: %@", error];
             }
+    }];
+}
+
+// R5e: standalone scope recon — read-only. Same gate as other diagnostics.
+- (void)scopeTapped {
+    [self runDiagnosticWithStatus:@"R5e: kernel_pmap scope… (read-only)" work:^NSDictionary *{
+        return @{@"report": [KPMapScope kernelPmapScopeReport]};
+    } completion:^(NSDictionary *result) {
+        NSString *report = result[@"report"];
+        self.statusLabel.text = @"R5e завершён — см. лог";
+        [self appendLogText:report];
+        [self saveExperimentReport:report fileName:@"kexproof-r5e-scope.txt"];
     }];
 }
 
