@@ -28,6 +28,7 @@
 @property (nonatomic, strong) UIButton *jpegButton;
 @property (nonatomic, strong) UIButton *m2oButton;
 @property (nonatomic, strong) UIButton *dmaButton;
+@property (nonatomic, strong) UIButton *scopeButton;
 @property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, copy, nullable) NSString *reportPath;
@@ -83,6 +84,11 @@
                                color:[UIColor colorWithRed:0.55 green:0.25 blue:0.35 alpha:1.0]];
     [self.dmaButton addTarget:self action:@selector(dmaTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    // R5e: read-only kernel_pmap scope recon (KPMapScope).
+    self.scopeButton = [self makeButton:@"R5e Scope (kernel_pmap, read-only)"
+                                  color:[UIColor colorWithRed:0.25 green:0.50 blue:0.60 alpha:1.0]];
+    [self.scopeButton addTarget:self action:@selector(scopeTapped) forControlEvents:UIControlEventTouchUpInside];
+
     self.attackButton = [self makeButton:@"Атака (f_cred → root)"
                                    color:[UIColor colorWithRed:0.65 green:0.20 blue:0.20 alpha:1.0]];
     [self.attackButton addTarget:self action:@selector(attackTapped) forControlEvents:UIControlEventTouchUpInside];
@@ -103,6 +109,7 @@
     [self.view addSubview:self.exploitButton];
     [self.view addSubview:self.e11Button];
     [self.view addSubview:self.dmaButton];
+    [self.view addSubview:self.scopeButton];
     [self.view addSubview:self.attackButton];
     [self.view addSubview:self.shareButton];
 
@@ -127,27 +134,32 @@
 
         [self.exploitButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.exploitButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.exploitButton.heightAnchor constraintEqualToConstant:46],
-        [self.exploitButton.bottomAnchor constraintEqualToAnchor:self.e11Button.topAnchor constant:-8],
+        [self.exploitButton.heightAnchor constraintEqualToConstant:42],
+        [self.exploitButton.bottomAnchor constraintEqualToAnchor:self.e11Button.topAnchor constant:-6],
 
         [self.e11Button.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.e11Button.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.e11Button.heightAnchor constraintEqualToConstant:46],
-        [self.e11Button.bottomAnchor constraintEqualToAnchor:self.dmaButton.topAnchor constant:-8],
+        [self.e11Button.heightAnchor constraintEqualToConstant:42],
+        [self.e11Button.bottomAnchor constraintEqualToAnchor:self.dmaButton.topAnchor constant:-6],
 
         [self.dmaButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.dmaButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.dmaButton.heightAnchor constraintEqualToConstant:46],
-        [self.dmaButton.bottomAnchor constraintEqualToAnchor:self.attackButton.topAnchor constant:-8],
+        [self.dmaButton.heightAnchor constraintEqualToConstant:42],
+        [self.dmaButton.bottomAnchor constraintEqualToAnchor:self.scopeButton.topAnchor constant:-6],
+
+        [self.scopeButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.scopeButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.scopeButton.heightAnchor constraintEqualToConstant:42],
+        [self.scopeButton.bottomAnchor constraintEqualToAnchor:self.attackButton.topAnchor constant:-6],
 
         [self.attackButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.attackButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.attackButton.heightAnchor constraintEqualToConstant:46],
-        [self.attackButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-8],
+        [self.attackButton.heightAnchor constraintEqualToConstant:42],
+        [self.attackButton.bottomAnchor constraintEqualToAnchor:self.shareButton.topAnchor constant:-6],
 
         [self.shareButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.shareButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
-        [self.shareButton.heightAnchor constraintEqualToConstant:40],
+        [self.shareButton.heightAnchor constraintEqualToConstant:38],
         [self.shareButton.bottomAnchor constraintEqualToAnchor:safe.bottomAnchor constant:-10],
     ]];
 
@@ -201,6 +213,7 @@
     [self setExperimentButton:self.jpegButton enabled:krw];
     [self setExperimentButton:self.m2oButton enabled:krw];
     [self setExperimentButton:self.dmaButton enabled:krw];
+    [self setExperimentButton:self.scopeButton enabled:krw];
     [self setExperimentButton:self.attackButton enabled:krw];
 }
 
