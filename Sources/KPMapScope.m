@@ -14,9 +14,10 @@
 #import <libjailbreak/primitives.h>
 #import <libjailbreak/translation.h>
 
-#import "exploit/krw.h"
 #import "exploit/kutils.h"
 #import "exploit/offsets.h"
+
+// gPrimitives.kreadbuf is the live KRW entry (int-returning). Call it directly.
 
 // ---------------------------------------------------------------------------
 // Static VAs from kernelcache-18.6-iphone16 (unslid). Slide is applied at runtime.
@@ -58,6 +59,10 @@ static void scopeNote(NSMutableString *r, NSString *line) {
 }
 
 static BOOL scopeRead(uint64_t addr, void *out, size_t size, const char *what, NSMutableString *r) {
+    if (!gPrimitives.kreadbuf) {
+        scopeNote(r, [NSString stringWithFormat:@"  [skip] %s: KRW not live", what]);
+        return NO;
+    }
     if (!addr) {
         scopeNote(r, [NSString stringWithFormat:@"  [skip] %s: null addr", what]);
         return NO;
@@ -80,7 +85,7 @@ static BOOL scopeRead(uint64_t addr, void *out, size_t size, const char *what, N
         return NO;
     }
     memset(out, 0, size);
-    kreadbuf(addr, out, size);   // ds_kreadbuf — void, same as KPDump's kpRead
+    gPrimitives.kreadbuf(addr, out, size);
     return YES;
 }
 
