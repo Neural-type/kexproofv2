@@ -84,6 +84,22 @@ static BOOL scopeRead(uint64_t addr, void *out, size_t size, const char *what, N
         scopeNote(r, [NSString stringWithFormat:@"  [skip] %s: EL2 TXM domain 0x%016llx", what, (unsigned long long)addr]);
         return NO;
     }
+    // Unmapped-read gate (same reason as KPDump 1.7.3): a garbage pointee
+    // inside the kernel-looking range but outside the image panics the
+    // physical aperture. Skip reads whose endpoints do not resolve to a PA.
+    // Kernel image itself is always mapped — don't gate those.
+    uint64_t kb = kconstant(base);
+    BOOL inKernelImage = kb && addr >= kb && addr + size <= kb + 0x5000000ULL;
+    if (!inKernelImage) {
+        uint64_t pa0 = kvtophys(addr);
+        uint64_t pa1 = kvtophys(addr + size - 1);
+        if (!pa0 || !pa1) {
+            scopeNote(r, [NSString stringWithFormat:
+                          @"  [skip] %s: unmapped VA 0x%016llx (kvtophys=0/0x%llx) — пропуск",
+                          what, (unsigned long long)addr, (unsigned long long)pa0]);
+            return NO;
+        }
+    }
     memset(out, 0, size);
     gPrimitives.kreadbuf(addr, out, size);
     return YES;
@@ -245,10 +261,13 @@ static const char *scopeTypeName(uint8_t t) {
     }
 
     uint64_t ucredPA = 0;
-    if (ucred && ttep) {
+    if (ucred && ttep && (ttep & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
         ucredPA = vtophys(ttep, ucred);
         scopeNote(r, [NSString stringWithFormat:@"  ucred PA    = 0x%016llx (via own pmap.ttep)",
                       (unsigned long long)ucredPA]);
+    } else if (ucred && ttep) {
+        scopeNote(r, [NSString stringWithFormat:@"  [skip] vtophys: ttep 0x%016llx не kernel ptr",
+                      (unsigned long long)ttep]);
     } else if (ucred) {
         ucredPA = kvtophys(ucred);
         scopeNote(r, [NSString stringWithFormat:@"  ucred PA    = 0x%016llx (kvtophys fallback)",
