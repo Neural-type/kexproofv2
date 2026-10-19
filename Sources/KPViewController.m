@@ -423,6 +423,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runGlyphGrift];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Glyph + heap spray (R5j)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runGlyphSpray];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -558,6 +563,23 @@
 }
 
 
+
+
+- (void)runGlyphSpray {
+    if (!KPRunner.hasKRW || ![self beginJob]) return;
+    self.statusLabel.text = @"R5j: спрей + glyph… (один выстрел на бут)";
+    [[KPLog shared] append:@"[RESULT] R5j: Glyph+spray — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPMapScope glyphSprayReport];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            self.statusLabel.text = @"R5j завершён — см. лог";
+            [self saveExperimentReport:report fileName:@"kexproof-r5j-glyphspray.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
 
 - (void)runGlyphGrift {
     // Glyph Grift needs NO KRW / no exploit — pure ImageIO. Run it any time,

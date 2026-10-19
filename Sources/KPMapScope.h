@@ -21,6 +21,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSString *)kernelPmapScopeReport;
 + (NSString *)necpCalibReport;
 + (NSString *)glyphGriftProbeReport;
++ (NSString *)glyphSprayReport;
 
 @end
 
