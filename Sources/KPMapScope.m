@@ -614,13 +614,26 @@ static long kpncAction(int fd, int action, void *u, uint32_t ul, void *d, uint32
     return syscall(KPNC_ACTION, fd, action, u, ul, d, dl);
 }
 
+typedef struct __attribute__((packed)) {
+    uint8_t  out_uuid[16];
+    uint8_t  in_uuid[16];
+    uint16_t flags;
+    uint16_t nexus_count;
+    uint32_t pad;
+} kpnc_flow_req_t;
+
 static int kpncAddFlow(int fd, const uint8_t *client, uint8_t *flowOut) {
-    uint8_t req[16] = {0};
-    req[4] = 2;
-    long rc = kpncAction(fd, KPNC_ADD_FLOW, (void *)client, 16, req, sizeof(req));
+    kpnc_flow_req_t req;
+    memset(&req, 0, sizeof(req));
+    memcpy(req.in_uuid, client, 16);
+    req.flags = 0x0040;
+    req.nexus_count = 0;
+    long rc = kpncAction(fd, KPNC_ADD_FLOW, (void *)client, 16, &req, sizeof(req));
     if (rc != 0) return -1;
-    // flow uuid comes back in req[0..15] on some impls; fall back to readback
-    memcpy(flowOut, req, 16);
+    memcpy(flowOut, req.out_uuid, 16);
+    int allz = 1;
+    for (int j = 0; j < 16; j++) if (flowOut[j]) { allz = 0; break; }
+    if (allz) memcpy(flowOut, req.in_uuid, 16);
     return 0;
 }
 
