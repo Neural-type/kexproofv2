@@ -134,6 +134,25 @@ static const char *scopeTypeName(uint8_t t) {
     }
 }
 
+
+// Gated read: kernel-shape + kvtophys proof both ends. Same reason as
+// KPDump 1.7.3 — a raw kreadbuf into an unmapped kernel-looking hole panics.
+static BOOL scopeGatedRead(uint64_t addr, void *out, size_t size, const char *what, NSMutableString *r) {
+    if (!addr || !gPrimitives.kreadbuf) return NO;
+    if ((addr & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) return NO;
+    uint64_t kb = kconstant(base);
+    BOOL inImage = kb && addr >= kb && addr + size <= kb + 0x5000000ULL;
+    if (!inImage) {
+        if (kvtophys(addr) == 0 || kvtophys(addr + size - 1) == 0) {
+            scopeNote(r, [NSString stringWithFormat:@"  [gate] %s unmapped 0x%016llx", what, (unsigned long long)addr]);
+            return NO;
+        }
+    }
+    memset(out, 0, size);
+    gPrimitives.kreadbuf(addr, out, size);
+    return YES;
+}
+
 // ---------------------------------------------------------------------------
 // The report — SAFE MODE
 // Only reads bytes inside the kernel image (always mapped) + gSystemInfo
@@ -304,6 +323,62 @@ static const char *scopeTypeName(uint8_t t) {
                     }
                 }
                 mach_port_deallocate(mach_task_self(), mt);
+            }
+            // ---- Alternate 3: SAFE allproc walk (gated reads, 128 nodes) ----
+            // findProcByCommName uses raw kreadbuf per node = panic class.
+            // This walk gates every read with kvtophys and stops hard on junk.
+            {
+                uint64_t sym = ksymbol(allproc);
+                scopeNote(r, [NSString stringWithFormat:@"  alt3: allproc slot @ 0x%016llx",
+                              (unsigned long long)sym]);
+                uint64_t head = 0;
+                if (sym && scopeGatedRead(sym, &head, 8, "allproc head", r)) {
+                    head = kp_untag_ptr(head);
+                    scopeNote(r, [NSString stringWithFormat:@"  alt3: allproc head = 0x%016llx",
+                                  (unsigned long long)head]);
+                    uint64_t node = head, prev = 0;
+                    pid_t want = getpid();
+                    for (int n = 0; n < 128; n++) {
+                        if (!node || node == prev) break;
+                        if ((node & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) {
+                            scopeNote(r, [NSString stringWithFormat:@"  alt3: junk node @ %d", n]);
+                            break;
+                        }
+                        uint32_t pid = 0;
+                        uint64_t nextRaw = 0;
+                        if (!scopeGatedRead(node + off_proc_p_pid, &pid, 4, "p_pid", r)) break;
+                        if (pid == (uint32_t)want) {
+                            scopeNote(r, [NSString stringWithFormat:
+                                          @"  alt3: FOUND our proc @ 0x%016llx (pid=%d, nodes=%d)",
+                                          (unsigned long long)node, (int)pid, n]);
+                            uint64_t procRo = 0, ucred = 0, raw = 0;
+                            if (scopeGatedRead(node + off_proc_p_proc_ro, &raw, 8, "p_proc_ro", r)) {
+                                procRo = kp_untag_ptr(raw);
+                                scopeNote(r, [NSString stringWithFormat:@"  alt3: p_proc_ro = 0x%016llx",
+                                              (unsigned long long)procRo]);
+                            }
+                            if ((procRo & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                raw = 0;
+                                if (scopeGatedRead(procRo + off_proc_ro_p_ucred, &raw, 8, "p_ucred", r)) {
+                                    ucred = kp_untag_ptr(raw);
+                                    scopeNote(r, [NSString stringWithFormat:@"  alt3: p_ucred = 0x%016llx",
+                                                  (unsigned long long)ucred]);
+                                }
+                            }
+                            if ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                uint64_t uid = 0;
+                                if (scopeGatedRead(ucred + 0x18, &uid, 8, "uid", r)) {
+                                    scopeNote(r, [NSString stringWithFormat:@"  alt3: ucred+0x18 = 0x%016llx",
+                                                  (unsigned long long)uid]);
+                                }
+                            }
+                            break;
+                        }
+                        if (!scopeGatedRead(node, &nextRaw, 8, "p_list.next", r)) break;
+                        prev = node;
+                        node = kp_untag_ptr(nextRaw);
+                    }
+                }
             }
                 } else {
                     // hop 3: thread -> thread_ro
