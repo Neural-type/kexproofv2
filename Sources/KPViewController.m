@@ -390,7 +390,9 @@
 }
 
 - (void)attackTapped {
-    if (!KPRunner.hasKRW || self.jobRunning) return;
+    // Root menu is always open — Glyph Grift needs no KRW. Each path inside
+    // checks its own prerequisites.
+    if (self.jobRunning) return;
     UIAlertController *sheet = [UIAlertController
         alertControllerWithTitle:@"Root paths"
         message:@"E11 = proc_ro swap (временный root, восстановление обязательно)"
