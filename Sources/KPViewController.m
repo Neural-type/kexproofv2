@@ -411,6 +411,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runRootSwap];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"NECP UAF calib (R5g)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runNecpCalib];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -543,6 +548,18 @@
         [weakSelf runRootSwap];
     }]];
     [self presentViewController:confirm animated:YES completion:nil];
+}
+
+
+- (void)runNecpCalib {
+    [self runDiagnosticWithStatus:@"R5g: NECP UAF calib…" work:^NSDictionary *{
+        return @{@"report": [KPMapScope necpCalibReport]};
+    } completion:^(NSDictionary *result) {
+        NSString *report = result[@"report"];
+        self.statusLabel.text = @"R5g завершён — см. лог";
+        [self appendLogText:report];
+        [self saveExperimentReport:report fileName:@"kexproof-r5g-necp-calib.txt"];
+    }];
 }
 
 - (void)runRootSwap {

@@ -19,6 +19,7 @@ NS_ASSUME_NONNULL_BEGIN
 //  3. our ucred VA/PA + FTE type/refcount oracle
 //  4. verdict: does any walked range cover ucred's VA?
 + (NSString *)kernelPmapScopeReport;
++ (NSString *)necpCalibReport;
 
 @end
 
