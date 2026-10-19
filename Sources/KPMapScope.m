@@ -458,10 +458,15 @@ static BOOL scopeGatedRead(uint64_t addr, void *out, size_t size, const char *wh
                                     }
 
                                     // ---- R5f2: sample other ROZONE (0x18) frames ----
-                                    scopeNote(r, @"  alt3: --- ROZONE (0x18) sample scan ---");
+                                    scopeNote(r, [NSString stringWithFormat:@"  alt3: --- ROZONE scan around pfn=%llu (±256) ---",
+                                          (unsigned long long)((ucPA - pB) >> 14)]);
                                     {
                                         int seen = 0, ro_nonzero = 0;
-                                        for (uint32_t k = 0; k < 4096 && seen < 16; k++) {
+                                        uint64_t ucPfn = (ucPA - pB) >> 14;
+                                        int64_t lo = (int64_t)ucPfn - 256;
+                                        if (lo < 0) lo = 0;
+                                        int64_t hi = (int64_t)ucPfn + 256;
+                                        for (int64_t k = lo; k <= hi && seen < 24; k++) {
                                             uint64_t pa2 = pB + ((uint64_t)k << 14);
                                             if (pa2 == ucPA) continue;
                                             uint64_t fte2 = tableVA + (uint64_t)k * 16;
