@@ -414,6 +414,84 @@ static BOOL scopeGatedRead(uint64_t addr, void *out, size_t size, const char *wh
                                             scopeNote(r, @"  >> ucred page is XNU_GENERIC (0x0b) — hop 1 done.");
                                         }
                                     }
+
+                                    // ---- R5f: FTE census — is +8 always 1 on ROZONE? ----
+                                    scopeNote(r, @"  alt3: --- FTE census (compare +8/+12) ---");
+                                    {
+                                        uint64_t pfn = (ucPA - pB) >> 14;
+                                        int64_t deltas[6] = { -3, -2, -1, 1, 2, 3 };
+                                        for (int k = 0; k < 6; k++) {
+                                            int64_t pfn2 = (int64_t)pfn + deltas[k];
+                                            if (pfn2 < 0) continue;
+                                            uint64_t pa2 = pB + ((uint64_t)pfn2 << 14);
+                                            uint64_t fte2 = tableVA + ((uint64_t)pfn2) * 16;
+                                            uint8_t e[16];
+                                            if (scopeGatedRead(fte2, e, 16, "FTE neigh", r)) {
+                                                uint32_t r8 = 0, r12 = 0;
+                                                memcpy(&r8, e + 8, 4);
+                                                memcpy(&r12, e + 12, 4);
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  alt3: neigh pfn=%lld pa=0x%llx type=0x%02x +8=%u +12=%u  raw %02x%02x%02x%02x %02x%02x%02x%02x",
+                                                    (long long)pfn2, (unsigned long long)pa2,
+                                                    e[2], r8, r12,
+                                                    e[0],e[1],e[2],e[3],e[4],e[5],e[6],e[7]]);
+                                            }
+                                        }
+                                        // Also dump kernel-image page FTE for comparison
+                                        uint64_t kb2 = kconstant(base);
+                                        if (kb2) {
+                                            uint64_t kpa = kvtophys(kb2);
+                                            if (kpa >= pB) {
+                                                uint64_t kpfn = (kpa - pB) >> 14;
+                                                uint64_t fte3 = tableVA + kpfn * 16;
+                                                uint8_t e[16];
+                                                if (scopeGatedRead(fte3, e, 16, "FTE kernel-img", r)) {
+                                                    uint32_t r8 = 0, r12 = 0;
+                                                    memcpy(&r8, e + 8, 4);
+                                                    memcpy(&r12, e + 12, 4);
+                                                    scopeNote(r, [NSString stringWithFormat:
+                                                        @"  alt3: kernel-img pfn=%llu type=0x%02x +8=%u +12=%u",
+                                                        (unsigned long long)kpfn, e[2], r8, r12]);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ---- R5f: frame_type_params[0x18] descriptor ----
+                                    scopeNote(r, @"  alt3: --- frame_type_params[0x18] ---");
+                                    {
+                                        uint64_t pSlot = ksymbol(libsptm_frame_type_params);
+                                        uint64_t pVA = 0, raw = 0;
+                                        if (pSlot && scopeGatedRead(pSlot, &raw, 8, "params slot", r)) {
+                                            pVA = kp_untag_ptr(raw);
+                                        }
+                                        if (!pVA && pSlot) pVA = pSlot;
+                                        scopeNote(r, [NSString stringWithFormat:@"  alt3: params VA = 0x%016llx",
+                                                      (unsigned long long)pVA]);
+                                        if (pVA) {
+                                            uint8_t d[0x60];
+                                            if (scopeGatedRead(pVA + 0x18 * 0x60, d, 0x60, "params[0x18]", r)) {
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  alt3: params[0x18] domain=%u class=%u flags=0x%02x%02x",
+                                                    d[0], d[1], d[0x41], d[0x40]]);
+                                                uint64_t allowed = 0;
+                                                memcpy(&allowed, d + 0x20, 8);
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  alt3: allowed_new = 0x%016llx  (bit0x0b=%d bit0x21=%d)",
+                                                    (unsigned long long)allowed,
+                                                    (int)((allowed >> 0x0b) & 1),
+                                                    (int)((allowed >> 0x21) & 1)]);
+                                            }
+                                            // also params[0x0b] for comparison
+                                            if (scopeGatedRead(pVA + 0x0b * 0x60, d, 0x60, "params[0x0b]", r)) {
+                                                uint64_t allowed = 0;
+                                                memcpy(&allowed, d + 0x20, 8);
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  alt3: params[0x0b] domain=%u class=%u allowed_new=0x%016llx",
+                                                    d[0], d[1], (unsigned long long)allowed]);
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             break;
