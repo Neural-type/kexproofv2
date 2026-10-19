@@ -807,14 +807,14 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
     }
     const char *names[8] = { "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8" };
     const char *desc[8] = {
-        "tx32000 dx31 n9  STACK (width_px 992)",
-        "tx32000 dx32 n9  HEAP  (width_px 1024)",
-        "tx32000 dx64 n9  HEAP  (width_px 2047)",
-        "tx32000 dx32 n8  HEAP  (width_px 512, half dev_x)",
-        "tx32000 dx32 n10 HEAP  (width_px 2047, double dev_x)",
-        "tx16000 dx32 n9  HEAP  (half trigger_x)",
-        "tx24000 dx32 n9  HEAP  (mid trigger_x)",
-        "tx32000 dx16 n9  STACK (small buffer)",
+        "tx32000 dx31 n9  STACK 992   (known crash, alloca)",
+        "tx32000 dx32 n9  HEAP  1024  (threshold)",
+        "tx32000 dx33 n9  HEAP  1056  (THE original crash)",
+        "tx32000 dx34 n9  HEAP  1088",
+        "tx32000 dx36 n9  HEAP  1152",
+        "tx32000 dx40 n9  HEAP  1280",
+        "tx32000 dx33 n10 HEAP  2111  (double dev_x)",
+        "tx32000 dx33 n8  STACK 528   (half dev_x)",
     };
     int idx = gGlyphIdx % 8;
     {
@@ -857,6 +857,11 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
         &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 
     CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+    {
+        NSString *res = [NSString stringWithFormat:@"SURVIVED %d %s\n", idx, desc[idx]];
+        NSFileHandle *fh2 = [NSFileHandle fileHandleForWritingAtPath:logPath];
+        if (fh2) { [fh2 seekToEndOfFile]; [fh2 writeData:[res dataUsingEncoding:NSUTF8StringEncoding]]; [fh2 closeFile]; }
+    }
     scopeNote(r, [NSString stringWithFormat:@"  SURVIVED variant %d (%s). img=%p",
                   idx, desc[idx], (void *)img]);
     if (img) CGImageRelease(img);
