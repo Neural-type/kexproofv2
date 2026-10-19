@@ -10,6 +10,7 @@
 #import "KPDump.h"
 
 #import <string.h>
+#import <mach/mach.h>
 
 #import <libjailbreak/info.h>
 #import <libjailbreak/primitives.h>
@@ -241,7 +242,69 @@ static const char *scopeTypeName(uint8_t t) {
                 scopeNote(r, [NSString stringWithFormat:@"  hop2 sock.bg_thread = 0x%016llx  (raw 0x%016llx)",
                               (unsigned long long)h2, (unsigned long long)raw]);
                 if ((h2 & 0xFFFFFF0000000000ULL) != 0xFFFFFF0000000000ULL) {
-                    scopeNote(r, @"  hop2 не kernel ptr — стоп (thread может быть не наш).");
+                    scopeNote(r, @"  hop2 bg_thread = 0 — this socket has no background thread.");
+            // ---- Alternate: control socket ----
+            {
+                uint64_t cpcb = darksword_control_socket_pcb();
+                scopeNote(r, [NSString stringWithFormat:@"  alt: controlSocketPcb = 0x%016llx",
+                              (unsigned long long)cpcb]);
+                if (cpcb && ((cpcb & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL)) {
+                    uint64_t craw = 0, csock = 0, cthr = 0;
+                    gPrimitives.kreadbuf(cpcb + off_inpcb_inp_socket, &craw, 8);
+                    csock = kp_untag_ptr(craw);
+                    scopeNote(r, [NSString stringWithFormat:@"  alt: ctrl.socket = 0x%016llx",
+                                  (unsigned long long)csock]);
+                    if ((csock & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                        craw = 0;
+                        gPrimitives.kreadbuf(csock + off_socket_so_background_thread, &craw, 8);
+                        cthr = kp_untag_ptr(craw);
+                        scopeNote(r, [NSString stringWithFormat:@"  alt: ctrl.bg_thread = 0x%016llx",
+                                      (unsigned long long)cthr]);
+                    }
+                }
+            }
+            // ---- Alternate: our own mach thread port -> thread_t (TaskRop) ----
+            {
+                mach_port_t mt = mach_thread_self();
+                uint64_t thrKVA = [KPDump rcResolveThreadKVA:mt];
+                scopeNote(r, [NSString stringWithFormat:@"  alt: mach_thread_self port=%u -> thread_t = 0x%016llx",
+                              (unsigned)mt, (unsigned long long)thrKVA]);
+                if (thrKVA && ((thrKVA & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL)) {
+                    uint64_t raw = 0, tro = 0, proc = 0;
+                    gPrimitives.kreadbuf(thrKVA + off_thread_t_tro, &raw, 8);
+                    tro = kp_untag_ptr(raw);
+                    scopeNote(r, [NSString stringWithFormat:@"  alt: thread.tro = 0x%016llx",
+                                  (unsigned long long)tro]);
+                    if ((tro & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                        raw = 0;
+                        gPrimitives.kreadbuf(tro + off_thread_ro_tro_proc, &raw, 8);
+                        proc = kp_untag_ptr(raw);
+                        scopeNote(r, [NSString stringWithFormat:@"  alt: tro.proc = 0x%016llx",
+                                      (unsigned long long)proc]);
+                    }
+                    if ((proc & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                        uint64_t procRo = 0, ucred = 0, raw2 = 0;
+                        gPrimitives.kreadbuf(proc + off_proc_p_proc_ro, &raw2, 8);
+                        procRo = kp_untag_ptr(raw2);
+                        scopeNote(r, [NSString stringWithFormat:@"  alt: p_proc_ro = 0x%016llx",
+                                      (unsigned long long)procRo]);
+                        if ((procRo & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            raw2 = 0;
+                            gPrimitives.kreadbuf(procRo + off_proc_ro_p_ucred, &raw2, 8);
+                            ucred = kp_untag_ptr(raw2);
+                            scopeNote(r, [NSString stringWithFormat:@"  alt: p_ucred = 0x%016llx",
+                                          (unsigned long long)ucred]);
+                        }
+                        if ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                            uint64_t uid = 0;
+                            gPrimitives.kreadbuf(ucred + 0x18, &uid, 8);
+                            scopeNote(r, [NSString stringWithFormat:@"  alt: ucred+0x18 uid = 0x%016llx",
+                                          (unsigned long long)uid]);
+                        }
+                    }
+                }
+                mach_port_deallocate(mach_task_self(), mt);
+            }
                 } else {
                     // hop 3: thread -> thread_ro
                     raw = 0;
