@@ -416,6 +416,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runNecpCalib];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Glyph Grift test (R5h)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runGlyphGrift];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -550,6 +555,24 @@
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
+
+
+- (void)runGlyphGrift {
+    if (!KPRunner.hasKRW || ![self beginJob]) return;
+    self.statusLabel.text = @"R5h: Glyph Grift test… (паника = баг жив)";
+    [[KPLog shared] append:@"[RESULT] R5h: Glyph Grift — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPMapScope glyphGriftProbeReport];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            self.statusLabel.text = @"R5h выжил — бага нет (или не достигнут)";
+            [[KPLog shared] append:@"[RESULT] R5h: SURVIVED — sat/trunc mismatch не сработал"];
+            [self saveExperimentReport:report fileName:@"kexproof-r5h-glyphgrift.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
 
 - (void)runNecpCalib {
     [self runDiagnosticWithStatus:@"R5g: NECP UAF calib…" work:^NSDictionary *{

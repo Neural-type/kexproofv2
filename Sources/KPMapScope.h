@@ -20,6 +20,7 @@ NS_ASSUME_NONNULL_BEGIN
 //  4. verdict: does any walked range cover ucred's VA?
 + (NSString *)kernelPmapScopeReport;
 + (NSString *)necpCalibReport;
++ (NSString *)glyphGriftProbeReport;
 
 @end
 

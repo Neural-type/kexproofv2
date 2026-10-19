@@ -11,6 +11,8 @@
 
 #import <string.h>
 #import <mach/mach.h>
+#import <ImageIO/ImageIO.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 #import <libjailbreak/info.h>
 #import <libjailbreak/primitives.h>
@@ -779,6 +781,60 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
 
     close(fd);
     scopeNote(r, @"  calib done (no kernel writes except pipe spray into user pipe).");
+    return r;
+}
+
+
+// ---------------------------------------------------------------------------
+// R5h: Glyph Grift empirical test (CVE-2026-86950 class).
+// Renders the Calif trigger PDF through ImageIO thumbnail — the same path
+// as WhatsApp/iMessage. If CoreGraphics on this iOS still has the aa_*
+// sat/trunc mismatch, the process panics. The panic IS the confirmation.
+// If we return, the bug is absent (or compiled away).
+// ---------------------------------------------------------------------------
+
++ (NSString *)glyphGriftProbeReport {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== R5h: Glyph Grift empirical test (CVE-2026-86950 class) ===\n"];
+    scopeNote(r, @"  trigger: trigger.pdf (Calif PoC, DX=33 heap-OOB variant)");
+    scopeNote(r, @"  path: ImageIO thumbnail (WhatsApp/iMessage)");
+    scopeNote(r, @"  !!! если баг жив — процесс паникует. Паника = ПОДТВЕРЖДЕНИЕ !!!");
+
+    NSString *path = [[NSBundle mainBundle] pathForResource:@"trigger" ofType:@"pdf"];
+    if (!path) {
+        scopeNote(r, @"  trigger.pdf не найден в bundle — skip");
+        return r;
+    }
+    scopeNote(r, [NSString stringWithFormat:@"  file: %@", path]);
+
+    NSURL *url = [NSURL fileURLWithPath:path];
+    CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+    if (!src) {
+        scopeNote(r, @"  CGImageSourceCreateWithURL failed");
+        return r;
+    }
+    scopeNote(r, @"  image source created — starting thumbnail render…");
+
+    int sz = 256;
+    CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+    const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                           kCGImageSourceThumbnailMaxPixelSize };
+    const void *vals[] = { kCFBooleanTrue, szRef };
+    CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+    CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+    // If we get here, no panic — the vulnerable path did not fire.
+    scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p (null? %d)",
+                  (void *)img, img == NULL]);
+    if (img) CGImageRelease(img);
+    CFRelease(opts);
+    CFRelease(szRef);
+    CFRelease(src);
+
+    [r appendString:@"\n--- verdict ---\n"];
+    scopeNote(r, @"  No panic → aa_* sat/trunc mismatch NOT present (or not reached).");
+    scopeNote(r, @"  Если паникнуло — смотри panic log: aa_cache_render = баг жив на 18.6.");
     return r;
 }
 
