@@ -457,6 +457,36 @@ static BOOL scopeGatedRead(uint64_t addr, void *out, size_t size, const char *wh
                                         }
                                     }
 
+                                    // ---- R5f2: sample other ROZONE (0x18) frames ----
+                                    scopeNote(r, @"  alt3: --- ROZONE (0x18) sample scan ---");
+                                    {
+                                        int seen = 0, ro_nonzero = 0;
+                                        for (uint32_t k = 0; k < 4096 && seen < 16; k++) {
+                                            uint64_t pa2 = pB + ((uint64_t)k << 14);
+                                            if (pa2 == ucPA) continue;
+                                            uint64_t fte2 = tableVA + (uint64_t)k * 16;
+                                            uint8_t e[16];
+                                            if (!scopeGatedRead(fte2, e, 16, "FTE scan", r)) continue;
+                                            if (e[2] != 0x18) continue;
+                                            seen++;
+                                            uint32_t r8 = 0, r12 = 0;
+                                            memcpy(&r8, e + 8, 4);
+                                            memcpy(&r12, e + 12, 4);
+                                            if (r8) ro_nonzero++;
+                                            scopeNote(r, [NSString stringWithFormat:
+                                                @"  alt3: ROZONE pfn=%u pa=0x%llx ro_ref=%u wx_ref=%u",
+                                                k, (unsigned long long)pa2, r8, r12]);
+                                        }
+                                        scopeNote(r, [NSString stringWithFormat:
+                                            @"  alt3: ROZONE sampled=%d  ro_ref!=0 : %d / %d",
+                                            seen, ro_nonzero, seen]);
+                                        if (seen && ro_nonzero == 0) {
+                                            scopeNote(r, @"  >> наша страница — исключение: кто-то держит именно её.");
+                                        } else if (seen && ro_nonzero == seen) {
+                                            scopeNote(r, @"  >> ro_ref=1 у всех ROZONE — структурное, не наш держатель.");
+                                        }
+                                    }
+
                                     // ---- R5f: frame_type_params[0x18] descriptor ----
                                     scopeNote(r, @"  alt3: --- frame_type_params[0x18] ---");
                                     {
