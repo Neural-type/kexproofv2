@@ -793,12 +793,13 @@
     // OOL port-array UAF detection. Trigger is pure mach_msg; KRW snapshot
     // is best-effort (live srights calibration).
     [self runDiagnosticWithStatus:@"OOL-port-array UAF: duplicate-name MOVE_SEND…" work:^NSDictionary *{
-        NSString *report = [KPDump oolPortArrayProbeReport];
+        return @{@"report": [KPDump oolPortArrayProbeReport]};
+    } completion:^(NSDictionary *result) {
+        NSString *report = result[@"report"];
         BOOL win = [report containsString:@"UNDERFLOW=1"];
         self.statusLabel.text = win ? @"OOL: UNDERFLOW — см. лог" : @"OOL завершён — см. лог";
         [self appendLogText:report];
         [self saveExperimentReport:report fileName:@"kexproof-ool.txt"];
-        return @{@"report": report};
     }];
 }
 
