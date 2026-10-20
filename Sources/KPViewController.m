@@ -28,6 +28,7 @@
 @property (nonatomic, strong) UIButton *jpegButton;
 @property (nonatomic, strong) UIButton *m2oButton;
 @property (nonatomic, strong) UIButton *dmaButton;
+@property (nonatomic, strong) UIButton *oolButton;
 @property (nonatomic, strong) UIButton *scopeButton;
 @property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -84,6 +85,10 @@
                                color:[UIColor colorWithRed:0.55 green:0.25 blue:0.35 alpha:1.0]];
     [self.dmaButton addTarget:self action:@selector(dmaTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    self.oolButton = [self makeButton:@"OOL-port-array UAF (detection)"
+                               color:[UIColor colorWithRed:0.85 green:0.35 blue:0.1 alpha:1.0]];
+    [self.oolButton addTarget:self action:@selector(oolTapped) forControlEvents:UIControlEventTouchUpInside];
+
     // R5e: read-only kernel_pmap scope recon (KPMapScope).
     self.scopeButton = [self makeButton:@"R5e Scope (kernel_pmap, read-only)"
                                   color:[UIColor colorWithRed:0.25 green:0.50 blue:0.60 alpha:1.0]];
@@ -109,6 +114,7 @@
     [self.view addSubview:self.exploitButton];
     [self.view addSubview:self.e11Button];
     [self.view addSubview:self.dmaButton];
+    [self.view addSubview:self.oolButton];
     [self.view addSubview:self.scopeButton];
     [self.view addSubview:self.attackButton];
     [self.view addSubview:self.shareButton];
@@ -145,7 +151,11 @@
         [self.dmaButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.dmaButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.dmaButton.heightAnchor constraintEqualToConstant:42],
-        [self.dmaButton.bottomAnchor constraintEqualToAnchor:self.scopeButton.topAnchor constant:-6],
+        [self.dmaButton.bottomAnchor constraintEqualToAnchor:self.oolButton.topAnchor constant:-6],
+        [self.oolButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.oolButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.oolButton.heightAnchor constraintEqualToConstant:42],
+        [self.oolButton.bottomAnchor constraintEqualToAnchor:self.scopeButton.topAnchor constant:-6],
 
         [self.scopeButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.scopeButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
@@ -213,6 +223,7 @@
     [self setExperimentButton:self.jpegButton enabled:krw];
     [self setExperimentButton:self.m2oButton enabled:krw];
     [self setExperimentButton:self.dmaButton enabled:krw];
+    [self setExperimentButton:self.oolButton enabled:!self.jobRunning]; // no KRW needed
     [self setExperimentButton:self.scopeButton enabled:krw];
     [self setExperimentButton:self.attackButton enabled:!self.jobRunning]; // Root menu incl. Glyph Grift (no KRW needed)
 }
@@ -775,6 +786,19 @@
             self.statusLabel.text = win ? @"C3-WRITE P1!" : @"C3-WRITE завершён — см. лог";
             [self appendLogText:report];
             [self saveExperimentReport:report fileName:@"kexproof-c3write.txt"];
+    }];
+}
+
+- (void)oolTapped {
+    // OOL port-array UAF detection. Trigger is pure mach_msg; KRW snapshot
+    // is best-effort (live srights calibration).
+    [self runDiagnosticWithStatus:@"OOL-port-array UAF: duplicate-name MOVE_SEND…" work:^NSDictionary *{
+        NSString *report = [KPDump oolPortArrayProbeReport];
+        BOOL win = [report containsString:@"UNDERFLOW=1"];
+        self.statusLabel.text = win ? @"OOL: UNDERFLOW — см. лог" : @"OOL завершён — см. лог";
+        [self appendLogText:report];
+        [self saveExperimentReport:report fileName:@"kexproof-ool.txt"];
+        return @{@"report": report};
     }];
 }
 

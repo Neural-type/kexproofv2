@@ -112,6 +112,11 @@ NS_ASSUME_NONNULL_BEGIN
 // sacrificial heap page with uid=0, then restore. May reboot — one boot.
 + (NSString *)c3AltPteWriteReport;
 
+// OOL port-array UAF detection (iOS 18.6 lacks ool_port_array_enforced).
+// Duplicate-name MOVE_SEND/MAKE_SEND → ip_srights underflow hunt.
+// Detection only — no kernel writes. Returns report with [VERIFY] line.
++ (NSString *)oolPortArrayProbeReport;
+
 // Kcall test: TH_IN_MACH_EXCEPTION + raw PC (TaskRop). Calls mach_kobj_count
 // on a dedicated parked thread. READ-ONLY from our side. May reboot if
 // thread_set_state/PC path is wrong — one boot.
