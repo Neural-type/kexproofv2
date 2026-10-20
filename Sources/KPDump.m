@@ -3683,8 +3683,8 @@ static uint64_t ool_smr(uint64_t v) { return kpSMRDecode(v); }
         krw.off_ipc_entry_ie_object = off_ipc_entry_ie_object;
         krw.off_ipc_port_ip_kobject = off_ipc_port_ip_kobject;
         krw.sizeof_ipc_entry        = 0x18; /* ipc_entry on 18.x */
-        krw.off_ipc_port_ip_srights = 0;    /* calibrated live */
-        krw.off_ipc_port_ip_mscount = 0;
+        krw.off_ipc_port_ip_srights = 0x7c; /* from raw dump 2026-10-20 */
+        krw.off_ipc_port_ip_mscount = 0x78; /* adjacent, 0 = no send-once */
     }
 
     static char cbuf[256 * 1024];
