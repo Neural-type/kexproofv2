@@ -3662,8 +3662,10 @@ static uint64_t ool_smr(uint64_t v) { return kpSMRDecode(v); }
     krw.smr_decode = ool_smr;
 
     uint64_t selfProc = proc_self();
+    if (!kpLooksLikeKernelPointer(selfProc)) selfProc = [self findSelfProcByPidFast:(uint32_t)getpid() log:r];
+    if (!selfProc) selfProc = [self findSelfProcByComm:r];
     if (!selfProc) {
-        [r appendString:@"FAIL: proc_self() returned 0 — probe runs without KRW snapshot\n"];
+        [r appendString:@"FAIL: self proc не найден — probe runs without KRW snapshot\n"];
     } else {
         uint64_t procRo = 0, task = 0;
         if (kpRead(selfProc + koffsetof(proc, proc_ro), &procRo, sizeof(procRo), "proc.proc_ro", r)) {
