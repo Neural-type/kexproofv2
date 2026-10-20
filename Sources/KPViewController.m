@@ -29,6 +29,7 @@
 @property (nonatomic, strong) UIButton *m2oButton;
 @property (nonatomic, strong) UIButton *dmaButton;
 @property (nonatomic, strong) UIButton *oolButton;
+@property (nonatomic, strong) UIButton *agxTcButton;
 @property (nonatomic, strong) UIButton *scopeButton;
 @property (nonatomic, strong) UIButton *shareButton;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -89,6 +90,10 @@
                                color:[UIColor colorWithRed:0.85 green:0.35 blue:0.1 alpha:1.0]];
     [self.oolButton addTarget:self action:@selector(oolTapped) forControlEvents:UIControlEventTouchUpInside];
 
+    self.agxTcButton = [self makeButton:@"AGX type-confusion (detection)"
+                                 color:[UIColor colorWithRed:0.1 green:0.5 blue:0.7 alpha:1.0]];
+    [self.agxTcButton addTarget:self action:@selector(agxTcTapped) forControlEvents:UIControlEventTouchUpInside];
+
     // R5e: read-only kernel_pmap scope recon (KPMapScope).
     self.scopeButton = [self makeButton:@"R5e Scope (kernel_pmap, read-only)"
                                   color:[UIColor colorWithRed:0.25 green:0.50 blue:0.60 alpha:1.0]];
@@ -115,6 +120,7 @@
     [self.view addSubview:self.e11Button];
     [self.view addSubview:self.dmaButton];
     [self.view addSubview:self.oolButton];
+    [self.view addSubview:self.agxTcButton];
     [self.view addSubview:self.scopeButton];
     [self.view addSubview:self.attackButton];
     [self.view addSubview:self.shareButton];
@@ -155,7 +161,11 @@
         [self.oolButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.oolButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
         [self.oolButton.heightAnchor constraintEqualToConstant:42],
-        [self.oolButton.bottomAnchor constraintEqualToAnchor:self.scopeButton.topAnchor constant:-6],
+        [self.oolButton.bottomAnchor constraintEqualToAnchor:self.agxTcButton.topAnchor constant:-6],
+        [self.agxTcButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
+        [self.agxTcButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
+        [self.agxTcButton.heightAnchor constraintEqualToConstant:42],
+        [self.agxTcButton.bottomAnchor constraintEqualToAnchor:self.scopeButton.topAnchor constant:-6],
 
         [self.scopeButton.leadingAnchor constraintEqualToAnchor:safe.leadingAnchor constant:12],
         [self.scopeButton.trailingAnchor constraintEqualToAnchor:safe.trailingAnchor constant:-12],
@@ -224,6 +234,7 @@
     [self setExperimentButton:self.m2oButton enabled:krw];
     [self setExperimentButton:self.dmaButton enabled:krw];
     [self setExperimentButton:self.oolButton enabled:!self.jobRunning]; // no KRW needed
+    [self setExperimentButton:self.agxTcButton enabled:!self.jobRunning]; // no KRW needed
     [self setExperimentButton:self.scopeButton enabled:krw];
     [self setExperimentButton:self.attackButton enabled:!self.jobRunning]; // Root menu incl. Glyph Grift (no KRW needed)
 }
@@ -800,6 +811,18 @@
         self.statusLabel.text = win ? @"OOL: UNDERFLOW — см. лог" : @"OOL завершён — см. лог";
         [self appendLogText:report];
         [self saveExperimentReport:report fileName:@"kexproof-ool.txt"];
+    }];
+}
+
+- (void)agxTcTapped {
+    [self runDiagnosticWithStatus:@"AGX type-confusion: stamp-slot reuse…" work:^NSDictionary *{
+        return @{@"report": [KPDump agxTypeConfProbeReport]};
+    } completion:^(NSDictionary *result) {
+        NSString *report = result[@"report"];
+        BOOL win = [report containsString:@"CORRUPT=1"];
+        self.statusLabel.text = win ? @"AGX: CORRUPT — см. лог" : @"AGX завершён — см. лог";
+        [self appendLogText:report];
+        [self saveExperimentReport:report fileName:@"kexproof-agx-tc.txt"];
     }];
 }
 

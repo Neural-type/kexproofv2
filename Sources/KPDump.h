@@ -117,6 +117,10 @@ NS_ASSUME_NONNULL_BEGIN
 // Detection only — no kernel writes. Returns report with [VERIFY] line.
 + (NSString *)oolPortArrayProbeReport;
 
+// AGX stamp-slot type confusion (18.6: handleChannelErrorEvent has no
+// OSMetaClass::safeMetaCast check). Detection only — no kernel writes.
++ (NSString *)agxTypeConfProbeReport;
+
 // Kcall test: TH_IN_MACH_EXCEPTION + raw PC (TaskRop). Calls mach_kobj_count
 // on a dedicated parked thread. READ-ONLY from our side. May reboot if
 // thread_set_state/PC path is wrong — one boot.

