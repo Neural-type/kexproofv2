@@ -16,6 +16,10 @@
 #import <CoreGraphics/CoreGraphics.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <errno.h>
+#include <unistd.h>
 
 #import <libjailbreak/info.h>
 #import <libjailbreak/primitives.h>
