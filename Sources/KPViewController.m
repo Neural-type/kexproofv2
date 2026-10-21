@@ -485,6 +485,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runTypedSpray:@"w3a"];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Calif PoC + u16 spray (crash-catch)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runTypedSpray:@"calif"];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }

