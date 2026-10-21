@@ -121,6 +121,12 @@ NS_ASSUME_NONNULL_BEGIN
 // OSMetaClass::safeMetaCast check). Detection only — no kernel writes.
 + (NSString *)agxTypeConfProbeReport;
 
+// PEV1-CLEANUP: restore/NULL the live icmp6filt corruption so the KRW control
+// socket is safe to close (soclose → rip6_detach → kfree_type). Call before
+// process teardown or any close of the KRW sockets. Idempotent; no-op if pe_v1
+// never promoted. See kexploit_disarm_for_close() / PEV1-CLEANUP-FIX.md.
++ (void)disarmKrwForClose;
+
 // Kcall test: TH_IN_MACH_EXCEPTION + raw PC (TaskRop). Calls mach_kobj_count
 // on a dedicated parked thread. READ-ONLY from our side. May reboot if
 // thread_set_state/PC path is wrong — one boot.
