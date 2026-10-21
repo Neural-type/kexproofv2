@@ -460,6 +460,16 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runGlyphSprayVariant:@"w4b"];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Typed spray W1a (size@+8)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runTypedSpray:@"w1a"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Typed spray W4b (size@+8)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runTypedSpray:@"w4b"];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -625,6 +635,23 @@
             self.statusLabel.text = [NSString stringWithFormat:@"W-spray %@ завершён — см. лог", vname];
             [self saveExperimentReport:report fileName:
                 [NSString stringWithFormat:@"kexproof-wspray-%@.txt", vname]];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+- (void)runTypedSpray:(NSString *)vname {
+    if (![self beginJob]) return;
+    self.statusLabel.text = [NSString stringWithFormat:@"Typed spray %@… (size@+8)", vname];
+    [[KPLog shared] appendFormat:@"[RESULT] Typed spray %@ — запуск", vname];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPMapScope glyphTypedSprayReport:vname];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            self.statusLabel.text = [NSString stringWithFormat:@"Typed spray %@ завершён — см. лог", vname];
+            [self saveExperimentReport:report fileName:
+                [NSString stringWithFormat:@"kexproof-typed-%@.txt", vname]];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });

