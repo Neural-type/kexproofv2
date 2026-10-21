@@ -22,6 +22,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSString *)necpCalibReport;
 + (NSString *)glyphGriftProbeReport;
 + (NSString *)glyphSprayReport;
++ (NSString *)glyphSprayReportVariant:(nullable NSString *)forceName;
 
 @end
 

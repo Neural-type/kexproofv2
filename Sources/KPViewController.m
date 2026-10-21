@@ -450,6 +450,16 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runGlyphSpray];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"W-spray W1a (4156 next+0)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runGlyphSprayVariant:@"w1a"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"W-spray W4b (8252 next+64)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runGlyphSprayVariant:@"w4b"];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -588,7 +598,7 @@
 
 
 - (void)runGlyphSpray {
-    if (!KPRunner.hasKRW || ![self beginJob]) return;
+    if (![self beginJob]) return;
     self.statusLabel.text = @"R5j: спрей + glyph… (один выстрел на бут)";
     [[KPLog shared] append:@"[RESULT] R5j: Glyph+spray — запуск"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -597,6 +607,24 @@
             [[KPLog shared] append:report];
             self.statusLabel.text = @"R5j завершён — см. лог";
             [self saveExperimentReport:report fileName:@"kexproof-r5j-glyphspray.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+- (void)runGlyphSprayVariant:(NSString *)vname {
+    // W-variant spray: matching size class (4156 / 8252), 2048 live + 2048 holes.
+    if (![self beginJob]) return;
+    self.statusLabel.text = [NSString stringWithFormat:@"W-spray %@… (один выстрел на бут)", vname];
+    [[KPLog shared] appendFormat:@"[RESULT] W-spray %@ — запуск", vname];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPMapScope glyphSprayReportVariant:vname];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            self.statusLabel.text = [NSString stringWithFormat:@"W-spray %@ завершён — см. лог", vname];
+            [self saveExperimentReport:report fileName:
+                [NSString stringWithFormat:@"kexproof-wspray-%@.txt", vname]];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
