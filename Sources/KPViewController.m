@@ -470,6 +470,21 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runTypedSpray:@"w4b"];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"u16±1 W1b (past slack 5180)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runTypedSpray:@"w1b"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"u16±1 W1c (past slack 6204)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runTypedSpray:@"w1c"];
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"u16±1 W3a (STACK past alloca)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runTypedSpray:@"w3a"];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
