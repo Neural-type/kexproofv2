@@ -3712,8 +3712,8 @@ static int agx_kread(uint64_t addr, void *buf, size_t len) {
     // kexploit_disarm_for_close() (atexit + applicationWillTerminate) restores
     // the pointer before the process dies. Do not close the KRW sockets before
     // that runs.
-    kpNote(r, @"  pe_v1/KRW state: %@ (icmp6filt corruption stays live for kread; disarmed on exit)",
-           (darksword_control_socket_pcb() != 0) ? @"LIVE — same process as this probe" : @"not live");
+    kpNote(r, [NSString stringWithFormat:@"  pe_v1/KRW state: %@ (icmp6filt corruption stays live for kread; disarmed on exit)",
+           (darksword_control_socket_pcb() != 0) ? @"LIVE — same process as this probe" : @"not live"]);
 
     agx_tc_krw_t krw;
     memset(&krw, 0, sizeof(krw));
