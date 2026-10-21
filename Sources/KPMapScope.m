@@ -20,12 +20,19 @@
 #include <netinet/in.h>
 #include <errno.h>
 #include <unistd.h>
+#include <string.h>
 // Use numeric constants — netinet/ip.h may not exist in iOS SDK
 #ifndef IP_OPTIONS
 #define IP_OPTIONS 4
 #endif
 #ifndef IPPROTO_IP
 #define IPPROTO_IP 0
+#endif
+#ifndef IPPROTO_IPV6
+#define IPPROTO_IPV6 41
+#endif
+#ifndef IPV6_HOPOPTS
+#define IPV6_HOPOPTS 54
 #endif
 
 #import <libjailbreak/info.h>
