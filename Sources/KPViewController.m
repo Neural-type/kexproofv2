@@ -490,6 +490,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runTypedSpray:@"calif"];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Weaponize u32-len + OOB demo"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runWeaponize];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -672,6 +677,22 @@
             self.statusLabel.text = [NSString stringWithFormat:@"Typed spray %@ завершён — см. лог", vname];
             [self saveExperimentReport:report fileName:
                 [NSString stringWithFormat:@"kexproof-typed-%@.txt", vname]];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+- (void)runWeaponize {
+    if (![self beginJob]) return;
+    self.statusLabel.text = @"Weaponize u32-len + OOB…";
+    [[KPLog shared] append:@"[RESULT] Weaponize — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPMapScope glyphWeaponizeReport:@"calif"];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            self.statusLabel.text = @"Weaponize завершён — см. лог";
+            [self saveExperimentReport:report fileName:@"kexproof-weaponize.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });

