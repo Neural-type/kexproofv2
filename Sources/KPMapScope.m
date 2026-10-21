@@ -41,6 +41,7 @@
 
 #import "exploit/kutils.h"
 #import "exploit/kexploit_opa334.h"  // darksword_rw_socket_pcb()
+#import "exploit/krw_zone_write.h"   // krw_zone_write_qword / krw_zone_verdict
 #import "exploit/offsets.h"
 #import "TaskRop/pac.h"   // off_proc_ro_pr_task / off_task_map
 
