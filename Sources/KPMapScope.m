@@ -18,10 +18,15 @@
 #include <setjmp.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <netinet/ip.h>
 #include <errno.h>
 #include <unistd.h>
+// Use numeric constants — netinet/ip.h may not exist in iOS SDK
+#ifndef IP_OPTIONS
+#define IP_OPTIONS 4
+#endif
+#ifndef IPPROTO_IP
+#define IPPROTO_IP 0
+#endif
 
 #import <libjailbreak/info.h>
 #import <libjailbreak/primitives.h>
