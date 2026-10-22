@@ -1519,16 +1519,17 @@ cleanup:
 
                                     if (kr == MACH_MSG_SUCCESS) {
                                         // Receive with SMALL buffer but LARGE rcv_size
-                                        uint8_t smallBuf[64];  // actual buffer = 64
-                                        memset(smallBuf, 0x55, sizeof(smallBuf));  // 'U' fill (unique)
-                                        // Place canary after smallBuf
-                                        uint8_t *canary = malloc(64);
-                                        memset(canary, 0x66, 64);  // 'F' fill
-                                        *(uint64_t *)canary = 0xCAFEBABEDEADBEEFULL;
+                                        // Canary is INSIDE the same stack struct, right after smallBuf
+                                        struct {
+                                            uint8_t smallBuf[64];
+                                            uint64_t canary;
+                                            uint8_t pad[56];
+                                        } stackZone;
+                                        memset(&stackZone, 0x55, sizeof(stackZone));
+                                        stackZone.canary = 0xCAFEBABEDEADBEEFULL;
 
                                         // Tell kernel rcv_size=256 (larger than 64-byte buffer)
-                                        // Kernel may add trailer, so give extra room
-                                        mach_msg_header_t *rhdr = (mach_msg_header_t *)smallBuf;
+                                        mach_msg_header_t *rhdr = (mach_msg_header_t *)stackZone.smallBuf;
                                         kr = mach_msg(rhdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
                                             0, 256,  // rcv_size = 256 >> 64 = OOB write
                                             wrxPort, 100, MACH_PORT_NULL);
@@ -1536,22 +1537,20 @@ cleanup:
                                             @"  OOB-WRITE recv ret=%d  rcv_size=256  buf=64", (int)kr]);
 
                                         if (kr == MACH_MSG_SUCCESS) {
-                                            // Check if canary was overwritten
-                                            uint64_t canaryVal = *(uint64_t *)canary;
+                                            uint64_t canaryVal = stackZone.canary;
                                             scopeNote(r, [NSString stringWithFormat:
                                                 @"  canary: 0x%016llx (was 0xCAFEBABEDEADBEEF)", (unsigned long long)canaryVal]);
                                             if (canaryVal != 0xCAFEBABEDEADBEEFULL) {
                                                 scopeNote(r, @"  >>> OOB WRITE CONFIRMED — canary overwritten by kernel!");
                                             } else {
-                                                scopeNote(r, @"  canary intact — kernel limited copy to buffer size");
+                                                scopeNote(r, @"  canary intact — kernel limited copy to message size");
                                             }
-                                            // Also check smallBuf content
+                                            // Dump the zone
                                             NSMutableString *hex = [NSMutableString string];
-                                            for (int j = 0; j < 48; j++)
-                                                [hex appendFormat:@"%02x ", smallBuf[j]];
-                                            scopeNote(r, [NSString stringWithFormat:@"  smallBuf: %@", hex]);
+                                            for (int j = 0; j < 96; j++)
+                                                [hex appendFormat:@"%02x ", ((uint8_t *)&stackZone)[j]];
+                                            scopeNote(r, [NSString stringWithFormat:@"  stackZone: %@", hex]);
                                         }
-                                        free(canary);
                                     }
                                     mach_port_destroy(mach_task_self(), wrxPort);
                                 }
