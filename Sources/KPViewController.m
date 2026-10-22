@@ -4,6 +4,7 @@
 #import "KPDump.h"
 #import "KPMapScope.h"
 #import "shim/libjailbreak/primitives_external.h"
+#import "exploit/krw.h"
 
 #import <unistd.h>
 #import <sys/sysctl.h>
