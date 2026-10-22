@@ -759,7 +759,7 @@
         uint64_t rw10 = xpaci(rw10raw);
         [r appendFormat:@"  rw10 raw=0x%016llx → xpaci=0x%016llx\n", rw10raw, rw10];
         // Dump posix_cred at rw10
-        if (rw10 > 0xfffffff000000000ULL) {
+        if (rw10 > 0xffffff0000000000ULL) {  // any kernel VA
             [r appendFormat:@"  posix_cred dump at 0x%016llx:\n", rw10];
             for (uint32_t o = 0; o < 0x100; o += 8) {
                 uint64_t q = early_kread64(rw10 + o);
