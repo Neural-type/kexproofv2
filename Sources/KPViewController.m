@@ -509,6 +509,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runRootViaUcredRw];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"f_cred swap (file root)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runFgAttack];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -707,6 +712,22 @@
             [[KPLog shared] append:report];
             self.statusLabel.text = @"Weaponize завершён — см. лог";
             [self saveExperimentReport:report fileName:@"kexproof-weaponize.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+- (void)runFgAttack {
+    if (![self beginJob]) return;
+    self.statusLabel.text = @"f_cred swap…";
+    [[KPLog shared] append:@"[RESULT] f_cred swap — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPDump fgAttackReport];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            self.statusLabel.text = @"f_cred swap завершён — см. лог";
+            [self saveExperimentReport:report fileName:@"kexproof-fgattack.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
