@@ -7,6 +7,7 @@
 #import "exploit/krw.h"
 #import "exploit/offsets.h"
 #import "exploit/xpaci.h"
+#import "exploit/agx-typeconf-probe.h"
 
 #import <unistd.h>
 #import <sys/sysctl.h>
