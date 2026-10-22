@@ -758,11 +758,16 @@
         uint64_t rw10raw = early_kread64(ucredRw + 0x10);
         uint64_t rw10 = xpaci(rw10raw);
         [r appendFormat:@"  rw10 raw=0x%016llx → xpaci=0x%016llx\n", rw10raw, rw10];
-        // Dump ucred_rw to understand layout
-        [r appendString:@"  ucred_rw dump:\n"];
-        for (uint32_t o = 0; o < 0x80; o += 8) {
-            uint64_t q = early_kread64(ucredRw + o);
-            [r appendFormat:@"    +0x%02x: 0x%016llx\n", o, q];
+        // Dump posix_cred at rw10
+        if (rw10 > 0xfffffff000000000ULL) {
+            [r appendFormat:@"  posix_cred dump at 0x%016llx:\n", rw10];
+            for (uint32_t o = 0; o < 0x100; o += 8) {
+                uint64_t q = early_kread64(rw10 + o);
+                [r appendFormat:@"    +0x%02x: 0x%016llx", o, q];
+                if ((uint32_t)q == 501) [r appendString:@"  ★ 501!"];
+                if ((uint32_t)(q >> 32) == 501) [r appendString:@"  ★ 501 (high)!"];
+                [r appendString:@"\n"];
+            }
         }
         int found501 = 0;
         // Scan the posix_cred object at rw10 for 501
