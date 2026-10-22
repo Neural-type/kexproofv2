@@ -1837,7 +1837,7 @@ cleanup:
     [r appendString:@"\n=== IOSurface handle table OOB probe (26.0+) ===\n"];
 
     // Open IOSurface root user client
-    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+    io_service_t svc = IOServiceGetMatchingService(0,
         IOServiceMatching("IOSurfaceRoot"));
     if (!svc) {
         [r appendString:@"  IOSurfaceRoot not found\n"];
