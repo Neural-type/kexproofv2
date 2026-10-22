@@ -732,23 +732,9 @@
                 testVal, rb, (rb == testVal) ? "VERIFIED" : "FAILED"];
             kwrite_zone_element_qword(chksumAddr, orig, pcb, 0x200);
 
-            // Step 2: find self proc via allproc walk
-            [r appendString:@"  finding self proc via allproc walk...\n"];
-            uint64_t proc = 0;
-            // allproc is resolved by XPF at kernel base
-            extern uint64_t gKernelBase;
-            if (gKernelBase) {
-                // Walk from allproc (symbol resolved earlier)
-                // For now, use a simple approach: find proc by pid
-                // allproc is at a known offset from kernel base
-                // We'll use the existing KPDump finder
-                [r appendFormat:@"  kernel base = 0x%016llx\n", gKernelBase];
-            }
-            // Try using early_kread to find proc from known structure
-            // The simplest: read from the task's proc pointer
-            // For now, just report what we have
-            [r appendString:@"  (proc finding via allproc — implement next)\n"];
+            // Step 2: report current state
             [r appendFormat:@"  getuid() = %d\n", getuid()];
+            [r appendString:@"  (proc write test — next step)\n"];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:r];
