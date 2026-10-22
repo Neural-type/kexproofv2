@@ -641,6 +641,8 @@ static uint32_t gCommOff = 0;
 static uint32_t gPidOff = 0;
 static uint64_t gSelfProcVA = 0;
 
+uint64_t kp_get_self_proc(void) { return gSelfProcVA; }
+
 // A node holds a comm string when its window contains it as a C-string.
 static BOOL kpNodeHasComm(const uint8_t *window, size_t size, const char *comm, uint32_t *offOut)
 {

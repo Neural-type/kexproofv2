@@ -2,6 +2,9 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+// Returns the self proc VA found during KRW setup (0 if not yet found).
+uint64_t kp_get_self_proc(void);
+
 // Builds the kernel dump report as plain text. Requires the ClearSword
 // primitives to be live (gPrimitives.kreadbuf) and gSystemInfo to be
 // populated (XPF dynamic offsets + hardcoded ladders). Every symbol lookup is
