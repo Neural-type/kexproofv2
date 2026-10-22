@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <string.h>
 #import <IOSurface/IOSurfaceRef.h>
+#import <IOKit/IOKitLib.h>
 // Use numeric constants — netinet/ip.h may not exist in iOS SDK
 #ifndef IP_OPTIONS
 #define IP_OPTIONS 4
