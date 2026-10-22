@@ -1396,23 +1396,18 @@ cleanup:
                         // Create IOSurface and try to use corrupted size
                         @try {
                             NSDictionary *props = @{
-                                (id)kIOSurfaceWidth: @256,
-                                (id)kIOSurfaceHeight: @256,
-                                (id)kIOSurfaceBytesPerElement: @4,
-                                (id)kIOSurfacePixelFormat: @(0x42475241), // 'ARGB'
+                                @"IOSurfaceWidth": @256,
+                                @"IOSurfaceHeight": @256,
+                                @"IOSurfaceBytesPerElement": @4,
+                                @"IOSurfacePixelFormat": @(0x42475241),
                             };
                             IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
                             if (surf) {
                                 uint32_t surfID = (uint32_t)IOSurfaceGetID(surf);
-                                size_t surfW = IOSurfaceGetWidth(surf);
-                                size_t surfH = IOSurfaceGetHeight(surf);
-                                scopeNote(r, [NSString stringWithFormat:
-                                    @"  IOSurface created: id=%u %zux%zu", surfID, surfW, surfH]);
-                                // Try to use the corrupted size with IOSurfaceLock
+                                scopeNote(r, [NSString stringWithFormat:@"  IOSurface created: id=%u", surfID]);
                                 IOSurfaceLock(surf, 0, NULL);
                                 void *base = IOSurfaceGetBaseAddress(surf);
-                                scopeNote(r, [NSString stringWithFormat:
-                                    @"  IOSurface base=%p  size=%zu", base, IOSurfaceGetSize(surf)]);
+                                scopeNote(r, [NSString stringWithFormat:@"  IOSurface base=%p", base]);
                                 IOSurfaceUnlock(surf, 0, NULL);
                                 CFRelease(surf);
                             }
