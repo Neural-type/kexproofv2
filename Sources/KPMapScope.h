@@ -25,6 +25,7 @@ NS_ASSUME_NONNULL_BEGIN
 + (NSString *)glyphSprayReportVariant:(nullable NSString *)forceName;
 + (NSString *)glyphTypedSprayReport:(nullable NSString *)forceName;
 + (NSString *)glyphWeaponizeReport:(nullable NSString *)forceName;
++ (NSString *)iosurfaceHandleProbeReport;
 
 @end
 

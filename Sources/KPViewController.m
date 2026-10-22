@@ -450,6 +450,11 @@
                                             handler:^(UIAlertAction *a) {
         [weakSelf runStackAttack];
     }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"IOSurface handle OOB (26.0+)"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runIOSurfaceHandleProbe];
+    }]];
     [sheet addAction:[UIAlertAction actionWithTitle:@"ucred heap swap (E9)"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -624,6 +629,22 @@
             [[KPLog shared] append:r];
             self.statusLabel.text = @"Glyph → AGX deputy завершён — см. лог";
             [self saveExperimentReport:r fileName:@"kexproof-glyph-agx.txt"];
+            self.jobRunning = NO;
+            [self updateExperimentButtons];
+        });
+    });
+}
+
+- (void)runIOSurfaceHandleProbe {
+    if (![self beginJob]) return;
+    self.statusLabel.text = @"IOSurface handle OOB…";
+    [[KPLog shared] append:@"[RESULT] IOSurface handle probe — запуск"];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = [KPMapScope iosurfaceHandleProbeReport];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[KPLog shared] append:report];
+            self.statusLabel.text = @"IOSurface handle probe завершён — см. лог";
+            [self saveExperimentReport:report fileName:@"kexproof-iosurface-handle.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });

