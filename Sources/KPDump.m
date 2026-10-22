@@ -643,6 +643,13 @@ static uint64_t gSelfProcVA = 0;
 
 uint64_t kp_get_self_proc(void) { return gSelfProcVA; }
 
+uint64_t kp_find_self_proc_by_pid(uint32_t pid) {
+    // Use the existing fast walk
+    NSMutableString *tmp = [NSMutableString string];
+    uint64_t result = [KPDump findSelfProcByPidFast:pid log:tmp];
+    return result;
+}
+
 // A node holds a comm string when its window contains it as a C-string.
 static BOOL kpNodeHasComm(const uint8_t *window, size_t size, const char *comm, uint32_t *offOut)
 {

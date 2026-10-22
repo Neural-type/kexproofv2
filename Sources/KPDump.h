@@ -4,6 +4,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 // Returns the self proc VA found during KRW setup (0 if not yet found).
 uint64_t kp_get_self_proc(void);
+uint64_t kp_find_self_proc_by_pid(uint32_t pid);
 
 // Builds the kernel dump report as plain text. Requires the ClearSword
 // primitives to be live (gPrimitives.kreadbuf) and gSystemInfo to be
