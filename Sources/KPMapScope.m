@@ -1573,12 +1573,10 @@ cleanup:
                                     mach_port_destroy(mach_task_self(), wrxPort);
                                 }
                             }
-                        }
-                    }
                 }
                 if (len > 0xFFFF) {
                     scopeNote(r, [NSString stringWithFormat:
-                        @"  >>> MASSIVE OOB: len=0x%x enables write %u bytes past object", len, len - OBJ_LEN]);
+                        @"  >>> MASSIVE OOB: len=0x%x enables write %u bytes past object", len, len - 0x100]);
                 }
                 goto done_oob;
             }
