@@ -6,6 +6,7 @@
 #import "shim/libjailbreak/primitives_external.h"
 #import "exploit/krw.h"
 #import "exploit/offsets.h"
+#import "exploit/xpaci.h"
 
 #import <unistd.h>
 #import <sys/sysctl.h>
