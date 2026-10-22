@@ -1526,13 +1526,14 @@ cleanup:
                                         memset(canary, 0x66, 64);  // 'F' fill
                                         *(uint64_t *)canary = 0xCAFEBABEDEADBEEFULL;
 
-                                        // Tell kernel rcv_size=128 but buffer is only 64!
+                                        // Tell kernel rcv_size=256 (larger than 64-byte buffer)
+                                        // Kernel may add trailer, so give extra room
                                         mach_msg_header_t *rhdr = (mach_msg_header_t *)smallBuf;
                                         kr = mach_msg(rhdr, MACH_RCV_MSG | MACH_RCV_TIMEOUT,
-                                            0, 128,  // rcv_size = 128 > 64 = OOB write
+                                            0, 256,  // rcv_size = 256 >> 64 = OOB write
                                             wrxPort, 100, MACH_PORT_NULL);
                                         scopeNote(r, [NSString stringWithFormat:
-                                            @"  OOB-WRITE recv ret=%d  rcv_size=128  buf=64", (int)kr]);
+                                            @"  OOB-WRITE recv ret=%d  rcv_size=256  buf=64", (int)kr]);
 
                                         if (kr == MACH_MSG_SUCCESS) {
                                             // Check if canary was overwritten
