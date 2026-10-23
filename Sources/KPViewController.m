@@ -653,15 +653,16 @@
 
 - (void)runStackAttack {
     if (![self beginJob]) return;
-    self.statusLabel.text = @"STACK attack (g1 tx=32000 DX=31)…";
-    [[KPLog shared] append:@"[RESULT] STACK attack g1 — запуск"];
+    self.statusLabel.text = @"Glyph trigger test (g1 crash check)…";
+    [[KPLog shared] append:@"[RESULT] Glyph trigger test — запуск"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        // Use g1 variant (tx=32000, DX=31, STACK) — known crash
-        NSString *report = [KPMapScope glyphTypedSprayReport:@"g1"];
+        // g1 = tx=32000, DX=31, STACK — known crash on 18.6
+        // If this crashes on 27.0.1, the bug is alive. If survives, it's patched.
+        NSString *report = [KPMapScope glyphGriftProbeReport];
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:report];
-            self.statusLabel.text = @"STACK attack g1 завершён — см. лог";
-            [self saveExperimentReport:report fileName:@"kexproof-stack-g1.txt"];
+            self.statusLabel.text = @"Glyph trigger test — см. лог";
+            [self saveExperimentReport:report fileName:@"kexproof-glyph-trigger.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
