@@ -1282,7 +1282,21 @@ cleanup:
         bufs[i] = b;
         got++;
     }
+    // Checkerboard: free every other, then fill holes with more spray
     for (int i = 1; i < got; i += 2) { free(bufs[i]); bufs[i] = NULL; holes++; }
+    for (int i = 1; i < got; i += 2) {
+        void *b = malloc(spraySz);
+        if (!b) break;
+        uint8_t *p = (uint8_t *)b;
+        memset(p, 0x41, spraySz);
+        for (size_t o = 0; o + 16 <= spraySz - 8; o += 16) {
+            *(uint64_t *)(p + o) = 0x4346444154410001ULL;
+            *(uint32_t *)(p + o + 8) = 0x00000100;
+            *(uint32_t *)(p + o + 12) = 0x00000200;
+        }
+        *(uint64_t *)(p + spraySz - 8) = (uint64_t)i;
+        bufs[i] = b;
+    }
     int live = got - holes;
     scopeNote(r, [NSString stringWithFormat:
                   @"  sprayed %d typed objs x %zu  [live=%d holes=%d]",
