@@ -1283,8 +1283,8 @@ cleanup:
     for (int i = 1; i < got; i += 2) { free(bufs[i]); bufs[i] = NULL; holes++; }
     int live = got - holes;
     scopeNote(r, [NSString stringWithFormat:
-                  @"  sprayed %d typed objs (len=0x%x tag=CFDA) x %zu  [live=%d holes=%d]",
-                  got, OBJ_LEN, spraySz, live, holes]);
+                  @"  sprayed %d typed objs x %zu  [live=%d holes=%d]",
+                  got, spraySz, live, holes]);
 
     // ---- victim buffers: allocated AFTER spray, same size class ----
     // These are the confused-deputy targets. Fill with distinct magic.
