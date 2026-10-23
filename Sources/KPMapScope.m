@@ -1257,7 +1257,9 @@ cleanup:
 
     NSString *vname = forceName.length ? forceName : @"calif";
     size_t spraySz = 4288;
-    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu", vname.UTF8String, spraySz]);
+    size_t goodSz = malloc_good_size(spraySz);
+    scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu good_size=%zu", vname.UTF8String, spraySz, goodSz]);
+    spraySz = goodSz;  // use actual chunk size for spray
 
     enum { NBUFS = 8192 };  // doubled for 27.0.1 heap layout
     void **bufs = calloc(NBUFS, sizeof(void *));
