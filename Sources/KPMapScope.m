@@ -1865,11 +1865,13 @@ cleanup:
         uint8_t out[64] = {0};
         size_t outSz = sizeof(out);
 
-        // Try selectors around the handle API
-        for (int sel = 0; sel < 80; sel++) {
+        // Try selectors around the handle API — print ALL non-generic results
+        for (int sel = 0; sel < 128; sel++) {
             size_t inSz = sizeof(in);
+            outSz = sizeof(out);
             kr = IOConnectCallMethod(uc, sel, sc, 4, in, inSz, out, &outSz, NULL, NULL);
-            if (kr != KERN_SUCCESS && kr != (kern_return_t)0xe00002c2) {
+            // Print anything that's not the generic "unsupported" error
+            if (kr != (kern_return_t)0xe00002c2) {
                 [r appendFormat:@"  sel %d: kr=0x%x outSz=%zu\n", sel, (int)kr, outSz];
             }
         }
